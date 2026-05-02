@@ -43,3 +43,6 @@ _category_listing.md
 # OS
 .DS_Store
 Thumbs.db
+
+webapp/_phase1d_*
+*.tsbuildinfo
