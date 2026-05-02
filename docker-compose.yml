@@ -1,0 +1,90 @@
+# =====================================================================
+# Local development compose for the Billing Refactoring 2026 web app.
+#
+# Usage:
+#   docker compose up --build           # boot backend + frontend
+#   docker compose down                 # stop and remove containers
+#   docker compose logs -f backend      # tail backend logs
+#
+# Persistence:
+#   - `webapp_data/` is bind-mounted from the host so generated batches
+#     survive container restarts.
+#   - The whole project root is bind-mounted into the backend so code
+#     edits hot-reload through `uvicorn --reload`.
+#   - `.env` (Dropbox creds + DROPBOX_BASE_FOLDER) is loaded via
+#     `env_file:`. It's gitignored — never committed.
+#
+# Ports:
+#   backend  -> http://localhost:8000   (FastAPI + Swagger at /docs)
+#   frontend -> http://localhost:5173   (Vite, proxies /api -> backend:8000)
+# =====================================================================
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: billing_refactoring_2026/backend:dev
+    container_name: billing_refactoring_2026_backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # The Vite dev server hits /api on the same origin (proxied by
+      # Vite). When the frontend runs OUTSIDE the proxy (e.g. a built
+      # static bundle) it should set VITE_API_BASE_URL=http://localhost:8000
+      # before building.
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Hot-reload code from the host. Read-only is intentional — the
+      # backend only needs to WRITE to webapp_data/ (mounted separately
+      # below as read-write).
+      - .:/app:ro
+      - ./webapp_data:/app/webapp_data
+      # Anonymous volume for __pycache__ so the read-only host mount
+      # doesn't get in the way of bytecode writes inside the container.
+      - /app/webapp/backend/__pycache__
+    command:
+      - python
+      - -m
+      - uvicorn
+      - webapp.backend.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  frontend:
+    build:
+      context: ./webapp/frontend
+      dockerfile: Dockerfile
+    image: billing_refactoring_2026/frontend:dev
+    container_name: billing_refactoring_2026_frontend
+    ports:
+      - "5173:5173"
+    environment:
+      # The Vite dev server in the container talks to the backend through
+      # the docker network (service name `backend`). The Vite proxy in
+      # vite.config.ts forwards /api to whichever URL is set here.
+      - VITE_API_BASE_URL=http://backend:8000
+      - HOST=0.0.0.0
+    volumes:
+      - ./webapp/frontend:/app
+      # Anonymous volume so the host's empty node_modules dir doesn't
+      # mask the container's installed deps.
+      - /app/node_modules
+    depends_on:
+      backend:
+        condition: service_healthy
+
+# We deliberately do NOT declare a top-level `volumes:` block — the bind
+# mounts above are enough, and naming volumes would risk hiding host
+# ownership of webapp_data/.

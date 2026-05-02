@@ -1,0 +1,937 @@
+# ============================================================================
+# VENDOR RULES TEMPLATE
+# ----------------------------------------------------------------------------
+# This is the master template for a single vendor's rules file. Copy it to
+# config/vendors/<snake_case_name>.yaml and fill in the values.
+#
+# The Python script that processes this vendor's invoices should be able to
+# answer EVERY business question by reading this file. If it has to make a
+# decision that isn't covered here, that gap is a bug in the YAML, not the
+# Python.
+#
+# CONVENTIONS USED EVERYWHERE BELOW
+#   confidence: high | medium | low
+#       high   = verified by a human or unambiguous in the GL Report
+#       medium = inferred but with some noise
+#       low    = best guess; treat as needs_review
+#
+#   needs_review: true | false
+#       true  = a human should look at this before trusting it in production
+#       false = ok to use as-is
+#
+#   active: true | false
+#       Toggle a rule on or off without deleting it.
+#
+#   null vs. TODO
+#       Use `null` for "not applicable / intentionally empty".
+#       Use `"TODO: <what needs to happen>"` for "we need to come back to this".
+# ============================================================================
+
+
+# ============================================================================
+# 1. VENDOR_IDENTITY
+#    Who is this vendor? How do we recognize them on an invoice?
+# ============================================================================
+vendor_identity:
+
+  # Canonical display name. Use the form most commonly seen on the invoice itself.
+  vendor_name: "Example Vendor LLC"
+
+  # Stable, machine-friendly key. Lowercase snake_case. Used as YAML filename
+  # and as a join key everywhere else. NEVER change after first save.
+  normalized_vendor_key: "example_vendor"
+
+  # High-level category folder name from Training Bills_Invoices/.
+  # Examples: "Electricity - Power", "Water - Sewer", "Plumbing", "HVAC - Heating - Cooling".
+  category: "Electricity - Power"
+
+  # Other names this vendor has been seen under (DBA, abbreviation, legacy spelling).
+  # Used to match invoices and historical GL rows back to this config.
+  aliases:
+    - "Example Vendor"
+    - "EVL"
+
+  # Strings (case-insensitive substrings) the script can use to auto-detect
+  # this vendor on a fresh invoice when no explicit vendor field is parsed.
+  # Be specific — generic words like "energy" will cause false matches.
+  detection_keywords:
+    - "Example Vendor"
+    - "evl-billing.example.com"
+
+  # Short prose explaining anything tricky about the identity.
+  confidence_notes: |
+    The vendor sometimes appears as "Example Vendor LLC" and sometimes
+    as "EVL Energy Services" on the same invoice depending on the bill
+    year. Both should match.
+
+  # Master switch. If false, future scripts skip this vendor entirely.
+  active: true
+
+  # Workflow status. Used by vendor_rules_index.yaml.
+  #   draft                 = file exists but rules are placeholders
+  #   ready                 = trusted and used in production
+  #   needs_training_bills  = vendor was seen in GL Report but no invoices yet
+  #   needs_review          = something changed, human must verify
+  status: "draft"
+
+
+# ============================================================================
+# 2. ACCOUNTING_SOURCE
+#    Where did the accounting rules below come from? This is the most important
+#    section for traceability — every accounting decision should be traceable
+#    back to evidence in the General Ledger Report or a deliberate human
+#    override.
+# ============================================================================
+accounting_source:
+
+  # The CSV file that prefilled the accounting_mapping section below.
+  primary_source: "Gl Codes/General Ledger Report.csv"
+
+  # The CSV used only to validate GL codes exist in the chart.
+  supporting_source: "Gl Codes/Chart Of Accounts.csv"
+
+  # If true, accounting_mapping.default_gl_code was derived from real
+  # transactions. If false, it was set manually or guessed.
+  inferred_from_historical_transactions: true
+
+  # The exact vendor name strings that appeared in the GL Report and were
+  # treated as "this vendor" when computing the patterns below. Helps catch
+  # alias drift later.
+  source_vendor_names_observed:
+    - "Example Vendor LLC"
+    - "Example Vendor"
+
+  # Property codes (from Properties.csv `Property Abbreviation`) where this
+  # vendor was billed. Used to detect property-specific patterns.
+  source_properties_observed:
+    - "AMA"
+    - "OTF"
+
+  # Every distinct GL code seen for this vendor, with row count from the
+  # GL Report (Expense / Non-Operating Expense / Fixed Asset rows only —
+  # the cash/AP/credit-card clearing side is excluded).
+  source_gl_codes_observed:
+    - gl_code: "6920"
+      gl_name: "Electric - Vacant"
+      row_count: 184
+    - gl_code: "6915"
+      gl_name: "Electric - Common Areas"
+      row_count: 121
+
+  # The single most-used GL code across all observed rows for this vendor.
+  # This is what accounting_mapping.default_gl_code is initialized from.
+  most_common_gl_code: "6920"
+
+  confidence: "medium"
+
+  # Plain-English summary of the supporting evidence. Be honest about noise.
+  evidence_summary: |
+    305 expense rows, 60% on GL 6920 (Electric - Vacant) and 40% on
+    GL 6915 (Electric - Common Areas). The split is property-driven:
+    AMA always uses 6920, OTF mostly 6915.
+
+  # If true, a human should verify before relying on this in production.
+  needs_review: true
+
+  # Date a human last looked at this and confirmed everything below is correct.
+  # Format: YYYY-MM-DD.
+  last_reviewed_by_user: null
+
+  # If true, the values below CAN be edited and overwritten by a human.
+  # Set to false only for vendors where the GL mapping is determined by
+  # external policy and shouldn't drift.
+  user_override_allowed: true
+
+
+# ============================================================================
+# 3. INPUT_FILES
+#    Where do invoice files live, and what shape do they take?
+# ============================================================================
+input_files:
+
+  # File types the script should attempt to read.
+  accepted_file_types:
+    - pdf
+    - png
+    - jpg
+    - jpeg
+    - xlsx
+    - csv
+    - docx
+
+  # Folder under Training Bills_Invoices/ that holds sample bills used to
+  # validate the extraction logic. Path relative to the project root.
+  # Set to null if no training folder exists yet.
+  training_folder: "Training Bills_Invoices/Electricity - Power/Example Vendor LLC"
+
+  # "scanned"  = image-based PDF, requires OCR
+  # "digital"  = text-extractable PDF
+  # "mixed"    = both happen
+  scanned_or_digital: "mixed"
+
+  # If true, a single file may contain multiple invoices stacked together
+  # (a billing PDF for a whole property portfolio, for example).
+  multi_page_invoice: true
+
+  # If true, each file = exactly one invoice for one account.
+  one_invoice_per_file: true
+
+  # Free-form description of what to expect.
+  expected_invoice_layout: |
+    First page header has account number top-right.
+    Body has a charges table with Description / Amount columns.
+    Last page is a remittance stub.
+
+  notes: |
+    Some older bills are scanned at low DPI; OCR confidence will be lower.
+
+
+# ============================================================================
+# 4. EXTRACTION_TARGETS
+#    Every field we want the script to pull off the invoice. Each target can
+#    be activated/deactivated, marked required, given multiple aliases for
+#    where the field appears on different bill versions, and given regex /
+#    table-column hints.
+#
+#    A field block looks like:
+#       <field_key>:
+#         active: true
+#         required: true | false
+#         aliases: ["Account #", "Acct No"]
+#         extraction_method: header_label | regex | table_column | ocr_zone | manual
+#         regex_patterns: ["Account\\s*#?\\s*:?\\s*(\\d{6,})"]
+#         table_column_names: ["Description", "Amount"]
+#         fallback_rules: "If header label not found, look for a 6-9 digit number near the top-right corner."
+#         validation_rules: "Must be exactly 9 digits."
+#         notes: "Format changed in 2024 — older bills have 8 digits."
+#
+#    Set `active: false` to skip a field entirely.
+# ============================================================================
+extraction_targets:
+
+  invoice_number:
+    active: true
+    required: true
+    aliases: ["Invoice #", "Bill Number", "Statement Number"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: "Non-empty string."
+    notes: null
+
+  invoice_date:
+    active: true
+    required: true
+    aliases: ["Bill Date", "Statement Date", "Date Issued"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: "Parsable as a date; not in the future."
+    notes: null
+
+  due_date:
+    active: true
+    required: true
+    aliases: ["Payment Due", "Due By"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: "Must be on or after invoice_date."
+    notes: null
+
+  account_number:
+    active: true
+    required: true
+    aliases: ["Account #", "Account Number", "Customer Account"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: null
+
+  customer_number:
+    active: false
+    required: false
+    aliases: ["Customer #", "Customer ID"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: "Often the same as account_number — leave inactive unless distinct."
+
+  property_name:
+    active: true
+    required: false
+    aliases: ["Service Location", "Site Name"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: "Derive from service_address via property_matching rules."
+    validation_rules: null
+    notes: null
+
+  property_code:
+    active: true
+    required: false
+    aliases: []
+    extraction_method: "manual"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: "Resolved by property_matching, not extracted from the bill."
+    validation_rules: null
+    notes: null
+
+  service_address:
+    active: true
+    required: true
+    aliases: ["Service Address", "Premise Address", "Service Location"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: null
+
+  billing_address:
+    active: true
+    required: false
+    aliases: ["Billing Address", "Mailing Address"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: null
+
+  service_period_start:
+    active: true
+    required: false
+    aliases: ["Service From", "Period Start", "Read From"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: "<= service_period_end."
+    notes: null
+
+  service_period_end:
+    active: true
+    required: false
+    aliases: ["Service To", "Period End", "Read To"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: ">= service_period_start."
+    notes: null
+
+  previous_balance:
+    active: true
+    required: false
+    aliases: ["Previous Balance", "Balance Forward", "Prior Balance"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: "See special_charges.balance_forward for treatment."
+
+  payments_received:
+    active: true
+    required: false
+    aliases: ["Payments", "Payments Received", "Less: Payments"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: null
+
+  current_charges:
+    active: true
+    required: true
+    aliases: ["Current Charges", "Current Bill", "New Charges"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: null
+
+  taxes:
+    active: true
+    required: false
+    aliases: ["Tax", "Taxes", "Sales Tax"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: null
+
+  fees:
+    active: true
+    required: false
+    aliases: ["Fees", "Other Fees"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: null
+
+  late_fees:
+    active: true
+    required: false
+    aliases: ["Late Fee", "Late Charge", "Past Due Fee"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: "See special_charges.late_fee."
+
+  reconnection_fees:
+    active: true
+    required: false
+    aliases: ["Reconnect Fee", "Reconnection Charge", "Recon Chg", "Reconnect Charge"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: "See special_charges.reconnection_charge — often coded to GL 6956 Connect Fee."
+
+  total_amount_due:
+    active: true
+    required: true
+    aliases: ["Total Due", "Amount Due", "Total Amount Due", "Please Pay"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: "Should equal current_charges + previous_balance - payments_received within tolerance."
+    notes: null
+
+  amount_to_pay:
+    active: true
+    required: false
+    aliases: ["Amount To Pay", "Pay This Amount", "Pay By Due Date"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: "Default to total_amount_due if not present."
+    validation_rules: null
+    notes: null
+
+  line_items:
+    active: true
+    required: false
+    aliases: ["Charges Detail", "Detail", "Service Detail"]
+    extraction_method: "table_column"
+    regex_patterns: []
+    table_column_names: ["Description", "Amount"]
+    fallback_rules: null
+    validation_rules: "Sum of line items should match current_charges within validation_rules.allowed_amount_tolerance."
+    notes: null
+
+  meter_number:
+    active: true
+    required: false
+    aliases: ["Meter #", "Meter Number", "Meter ID"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: null
+
+  usage:
+    active: true
+    required: false
+    aliases: ["Usage", "Consumption", "kWh Used", "Gallons Used"]
+    extraction_method: "header_label"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: "Numeric, non-negative."
+    notes: null
+
+  usage_unit:
+    active: true
+    required: false
+    aliases: ["Unit", "UOM"]
+    extraction_method: "manual"
+    regex_patterns: []
+    table_column_names: []
+    fallback_rules: null
+    validation_rules: null
+    notes: "kWh / CCF / Gallons / etc. Often vendor-class constant; can be set static here instead of extracted."
+
+
+# ============================================================================
+# 5. ACCOUNTING_MAPPING
+#    The accounting decisions for this vendor. Most fields below were prefilled
+#    from the General Ledger Report — the section above (accounting_source)
+#    documents how. A human can override anything here at any time.
+# ============================================================================
+accounting_mapping:
+
+  # The GL code to apply to this vendor's primary line item.
+  default_gl_code: "6920"
+
+  # Friendly name from the chart of accounts. Just for human readability.
+  default_gl_description: "Electric - Vacant"
+
+  # Did default_gl_code exist in Chart Of Accounts.csv?
+  #   validated                       = yes
+  #   not_found_in_chart_of_accounts  = no, investigate
+  gl_validation_status: "validated"
+
+  # Every GL code historically used for this vendor (with row counts).
+  # Mirrors accounting_source.source_gl_codes_observed; kept here for
+  # quick reference inside the mapping section.
+  historical_gl_codes_observed:
+    - gl_code: "6920"
+      gl_name: "Electric - Vacant"
+      row_count: 184
+    - gl_code: "6915"
+      gl_name: "Electric - Common Areas"
+      row_count: 121
+
+  historical_most_common_gl_code: "6920"
+  historical_confidence: "medium"
+
+  # Free-form expense category. Useful for reporting; doesn't drive logic.
+  expense_category: "utilities"
+
+  # capex | opex
+  capex_or_opex: "opex"
+
+  # Do we pass this charge through to a tenant?
+  #   billable      = yes, charge tenant separately
+  #   non_billable  = no, property absorbs
+  #   mixed         = depends on the line; see line_item_rules
+  billable_or_non_billable: "non_billable"
+
+  # 1 (highest, e.g. utilities at risk of disconnect) to 5 (lowest).
+  payment_priority: 2
+
+  # Format string used when writing the AP memo. {placeholders} are filled
+  # at run time.
+  memo_format: "{vendor_name} - {account_number} - {service_period_start}/{service_period_end}"
+
+  # Format used for the invoice's top-line description in the export.
+  invoice_description_format: "{vendor_name} - {service_address} - {service_period_end}"
+
+  # Format used for each line item's description.
+  line_item_description_format: "{line_description}"
+
+  # Pointer back to the evidence used to set the GL code above. This should
+  # name the file and what to look for so a future reviewer can re-verify.
+  source_evidence: |
+    General Ledger Report.csv: 305 expense rows for this vendor, 60%
+    on GL 6920, 40% on GL 6915. See evidence_summary in
+    accounting_source above.
+
+  # If a human edits any field above, they should write WHY here.
+  user_override_notes: null
+
+
+# ============================================================================
+# 6. LINE_ITEM_RULES
+#    How to slice a single bill into multiple GL lines.
+# ============================================================================
+line_item_rules:
+
+  # If true, a single bill listing many units will be split into one line per unit.
+  split_by_unit: false
+
+  # If true, a single bill listing many meters will be split per meter.
+  split_by_meter: false
+
+  # If true, a bill listing many addresses will be split per address.
+  split_by_service_address: false
+
+  # If true, "common area" lines (corridor lighting, leasing office, etc.)
+  # are coded to a different GL than tenant-attributable lines.
+  split_common_area: false
+
+  # Substrings (case-insensitive) that mark a line as common-area.
+  common_area_keywords:
+    - "common area"
+    - "corridor"
+    - "clubhouse"
+    - "leasing office"
+    - "amenity"
+
+  # Regex patterns that identify a residential unit on a line.
+  residential_unit_patterns:
+    - "Apt\\s+(\\w+)"
+    - "Unit\\s+(\\w+)"
+    - "#\\s*(\\w+)"
+
+  # Lines containing any of these substrings are dropped before posting.
+  ignore_lines_containing:
+    - "Thank you for your business"
+    - "Please pay by"
+
+  # Whitelist — if non-empty, ONLY lines containing one of these are kept.
+  include_lines_containing: []
+
+  # ignore | post_separately | post_to_balance_forward_gl
+  balance_forward_handling: "ignore"
+
+  # See special_charges for per-fee detail; this is the high-level toggle.
+  fee_handling: "include_in_total"
+
+  # include_in_main_line | post_separately | ignore
+  tax_handling: "include_in_main_line"
+
+  # half_up | half_even | bankers
+  rounding_rule: "half_up"
+
+  notes: null
+
+
+# ============================================================================
+# 7. PROPERTY_MATCHING
+#    How to figure out which property an invoice belongs to.
+# ============================================================================
+property_matching:
+
+  match_by_property_name: true
+  match_by_property_code: true
+  match_by_address: true
+  match_by_unit: false
+
+  fuzzy_match_allowed: true
+  # 0.0 = match anything, 1.0 = exact only
+  fuzzy_match_threshold: 0.85
+
+  # What to do when none of the matchers resolve a property.
+  #   skip_invoice          = do not post; flag for manual review
+  #   post_to_default       = post anyway using accounting_mapping.default_gl_code
+  #   route_to_unallocated  = post to a holding account
+  unknown_property_handling: "skip_invoice"
+
+  # Per-property override of any field. Keyed by Property Abbreviation
+  # (see Properties/Properties.csv). See section 14 below for full schema.
+  property_specific_overrides: []
+
+
+# ============================================================================
+# 8. UNIT_DETECTION
+#    Recognize and normalize unit numbers within an invoice.
+# ============================================================================
+unit_detection:
+
+  enabled: true
+
+  unit_patterns:
+    - "Apt\\s+(\\w+)"
+    - "Unit\\s+(\\w+)"
+    - "#\\s*(\\w+)"
+    - "Bldg\\s+(\\w+)\\s+Unit\\s+(\\w+)"
+
+  common_area_labels:
+    - "common area"
+    - "house meter"
+    - "clubhouse"
+    - "leasing office"
+
+  # E.g. "01" -> "1", "A-103" -> "A103", strip leading zeros, etc.
+  unit_normalization_rules:
+    strip_leading_zeros: true
+    upper_case: true
+    remove_separators: ["-", " ", "."]
+
+  # skip | post_to_unallocated | use_default_unit
+  unknown_unit_handling: "post_to_unallocated"
+
+
+# ============================================================================
+# 9. SPECIAL_CHARGES
+#    Charges that aren't the normal monthly service line. Each gets its own
+#    GL code and treatment. The user gave a key example: "Recon Chg" /
+#    "Reconnection Charge" should map to GL 6956 (Connect Fee). That's
+#    expressed below as the reconnection_charge entry.
+# ============================================================================
+special_charges:
+
+  balance_forward:
+    active: true
+    keywords: ["Balance Forward", "Previous Balance", "Prior Balance"]
+    gl_code: null
+    gl_description: null
+    treatment: "subtract_from_current_charges"
+    include_in_export: false
+    source_evidence: null
+    confidence: "medium"
+    needs_review: true
+    notes: "Default behavior is to subtract from current charges so we don't double-post; check vendor before changing."
+
+  late_fee:
+    active: true
+    keywords: ["Late Fee", "Late Charge", "Past Due Fee", "Late Payment Charge"]
+    gl_code: "6627"
+    gl_description: "Late Fees & Penalties"
+    treatment: "post_separately"
+    include_in_export: true
+    source_evidence: "GL Report shows 'Late Payment Charge' entries on GL 6627."
+    confidence: "medium"
+    needs_review: true
+    notes: null
+
+  reconnection_charge:
+    active: true
+    keywords: ["Reconnect Fee", "Reconnection Charge", "Recon Chg", "Reconnect Charge", "Past Due Reconnect Fee"]
+    gl_code: "6956"
+    gl_description: "Connect Fee"
+    treatment: "post_separately"
+    include_in_export: true
+    source_evidence: |
+      Chart Of Accounts: 6956 = "Connect Fee", description "Utility
+      Transfer Fee". GL Report shows reconnection-related descriptions
+      coded to 6956 (e.g. "Past Due Reconnect Fee - 906").
+    confidence: "high"
+    needs_review: false
+    notes: |
+      This rule is the canonical example of a YAML-driven special charge:
+      Python should NEVER hardcode "if 'recon' in description: gl=6956".
+      It must read this block.
+
+  service_fee:
+    active: true
+    keywords: ["Service Fee", "Service Charge", "Trash Service Fee"]
+    gl_code: null
+    gl_description: null
+    treatment: "include_in_main_line"
+    include_in_export: true
+    source_evidence: null
+    confidence: "low"
+    needs_review: true
+    notes: "Trash Service Fee in the GL Report is income (4330), not expense — set vendor-by-vendor."
+
+  deposit:
+    active: true
+    keywords: ["Deposit", "Security Deposit"]
+    gl_code: null
+    gl_description: null
+    treatment: "post_separately"
+    include_in_export: true
+    source_evidence: null
+    confidence: "low"
+    needs_review: true
+    notes: "Many deposit rows in GL Report are tenant-side, not vendor-side. Verify before activating."
+
+  credit:
+    active: true
+    keywords: ["Credit", "Credit Adjustment"]
+    gl_code: null
+    gl_description: null
+    treatment: "subtract_from_current_charges"
+    include_in_export: true
+    source_evidence: null
+    confidence: "medium"
+    needs_review: true
+    notes: null
+
+  adjustment:
+    active: true
+    keywords: ["Adjustment"]
+    gl_code: null
+    gl_description: null
+    treatment: "post_separately"
+    include_in_export: true
+    source_evidence: null
+    confidence: "low"
+    needs_review: true
+    notes: null
+
+
+# ============================================================================
+# 10. EXPORT_BEHAVIOR
+#     How the result of extraction should be written.
+# ============================================================================
+export_behavior:
+
+  # csv | xlsx | json | direct_api
+  output_format: "csv"
+
+  # Free-text label for the AP system this feeds into.
+  target_system: "ResMan AP Import"
+
+  required_columns:
+    - "vendor_name"
+    - "invoice_number"
+    - "invoice_date"
+    - "due_date"
+    - "property_code"
+    - "gl_code"
+    - "amount"
+    - "description"
+    - "memo"
+
+  column_order:
+    - "vendor_name"
+    - "invoice_number"
+    - "invoice_date"
+    - "due_date"
+    - "property_code"
+    - "gl_code"
+    - "amount"
+    - "description"
+    - "memo"
+
+  date_format: "MM/DD/YYYY"
+  amount_format: "0.00"
+  # parentheses | leading_minus
+  negative_amount_format: "leading_minus"
+
+  duplicate_detection_fields:
+    - "vendor_name"
+    - "invoice_number"
+    - "amount"
+
+  # If true, an invoice with $0 total is suppressed from export.
+  skip_if_total_zero: true
+
+  # If true, low-confidence rows go to a manual_review.csv instead of the main export.
+  allow_manual_review: true
+
+  manual_review_triggers:
+    - "low_confidence_ocr"
+    - "amount_mismatch"
+    - "unknown_property"
+
+
+# ============================================================================
+# 11. VALIDATION_RULES
+#     Sanity checks the script must run before posting.
+# ============================================================================
+validation_rules:
+
+  amount_must_equal_sum_of_lines: true
+  due_date_after_invoice_date: true
+  account_number_required: true
+  property_required: true
+  gl_code_required: true
+  total_amount_required: true
+
+  # Penny rounding tolerance, in absolute dollars.
+  allowed_amount_tolerance: 0.02
+
+  # Triggers that produce a warning but allow the export to continue.
+  warning_only_rules:
+    - "service_period_start_missing"
+    - "meter_number_missing"
+
+  # Triggers that block the export. The row is sent to manual review instead.
+  hard_stop_rules:
+    - "total_amount_required"
+    - "gl_code_required"
+    - "amount_must_equal_sum_of_lines"
+
+
+# ============================================================================
+# 12. MANUAL_REVIEW_TRIGGERS
+#     Conditions under which a row should NEVER auto-post.
+# ============================================================================
+manual_review_triggers:
+
+  unknown_vendor: true
+  unknown_property: true
+  unknown_unit: true
+  missing_invoice_date: true
+  missing_total: true
+  extracted_total_mismatch: true
+  duplicate_invoice_possible: true
+  low_confidence_ocr: true
+  unsupported_file_type: true
+  ambiguous_gl_mapping: true
+  gl_code_not_found_in_chart_of_accounts: true
+
+  notes: |
+    Any row matching one or more of the triggers above goes to
+    output/<vendor_key>/manual_review.csv with the trigger reason
+    in a column.
+
+
+# ============================================================================
+# 13. PROPERTY_OVERRIDES
+#     Per-property exceptions to anything in the rest of this file.
+#     Keyed by Property Abbreviation (the value of the GL Report's
+#     Property column, also Properties.csv `Property Abbreviation`).
+#
+#     A property override block can selectively override:
+#       gl_code, gl_description, invoice_description_format,
+#       line_item_description_format, service_address_rules,
+#       unit_detection_rules, export_columns
+#
+#     Anything NOT named in an override block falls back to vendor-level
+#     defaults. So overrides should be SHORT — only the deltas.
+# ============================================================================
+property_overrides:
+
+  # Example: at property OTF the same vendor's bill is for irrigation,
+  # so we want it on a different GL.
+  - property_code: "OTF"
+    gl_code: "6950"
+    gl_description: "Water Bill - Irrigation/Sprinklers"
+    invoice_description_format: "{vendor_name} - OTF Irrigation - {service_period_end}"
+    line_item_description_format: null
+    service_address_rules: null
+    unit_detection_rules: null
+    export_columns: null
+    source_evidence: "GL Report: vendor at property OTF coded to 6950 in 100% of observed rows."
+    confidence: "high"
+    needs_review: false
+    notes: "Irrigation meter; not residential service."
+
+
+# ============================================================================
+# 14. SCRIPT_BEHAVIOR
+#     How the future Python script should run.
+# ============================================================================
+script_behavior:
+
+  # production | dry_run | debug
+  script_mode: "dry_run"
+
+  # If true, no export file is written even when script_mode == production.
+  dry_run_default: true
+
+  # debug | info | warning | error
+  log_level: "info"
+
+  # If true, intermediate files (raw OCR text, parsed JSON) are kept on disk.
+  save_intermediate_files: true
+
+  # If true, full extraction state is dumped per invoice for debugging.
+  save_extraction_debug_json: true
+
+  # If true, every run produces a summary HTML/MD file of what posted vs. flagged.
+  create_review_report: true
+
+  # If true, any unhandled exception aborts the whole run.
+  stop_on_error: false
+
+  # If true, warnings don't halt — they just get logged and emit to manual review.
+  continue_on_warning: true
+
+
+# ============================================================================
+# 15. CHANGE_LOG
+#     Append-only audit trail. Newest entry at the bottom.
+# ============================================================================
+change_log:
+  - date: "2026-05-01"
+    changed_by: "system_inference"
+    change_summary: "Initial draft generated from General Ledger Report.csv."
+    reason: "Initial setup of source-of-truth system."

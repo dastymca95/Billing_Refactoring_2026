@@ -1,0 +1,52 @@
+# Keep the build context lean. Anything not needed inside the image
+# stays out — speeds up `docker build` and shrinks layers.
+
+# --- Secrets and per-developer config ---
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.claude/
+
+# --- Python virtualenvs / caches ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# --- Frontend build output and node_modules ---
+webapp/frontend/node_modules/
+webapp/frontend/dist/
+webapp/frontend/.vite/
+
+# --- Webapp runtime data — bind-mounted at runtime, not baked in ---
+webapp_data/
+
+# --- VCS / OS noise ---
+.git/
+.gitignore
+.gitattributes
+.DS_Store
+Thumbs.db
+
+# --- Local-only ad-hoc files we accumulate ---
+_cat_summary_rows.txt
+_full_mapping_rows.txt
+_unique_vendors.txt
+**/_pdf_inspection.json
+**/_pdf_pages_text.txt
+**/_phase1*_*
+
+# --- Generated outputs — operator regenerates these in-container ---
+**/Processed_Output/
+
+# --- Reports / large reference files (kept out of the image, available
+#     via the bind-mount during `docker compose up`) ---
+*.md
+!README.md
+!webapp/README_WEBAPP.md
+!DOCKER_WEBAPP_README.md

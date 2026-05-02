@@ -1,0 +1,45 @@
+# Python / env
+.venv/
+__pycache__/
+*.pyc
+.env
+
+# Node / frontend
+webapp/frontend/node_modules/
+webapp/frontend/dist/
+node_modules/
+dist/
+
+# Runtime/generated app data
+webapp_data/
+
+# Generated outputs
+**/Processed_Output/
+**/support_documents/
+**/*_debug_rows_*.csv
+**/*_manual_review_*.xlsx
+**/*_processing_log_*.txt
+**/*_resman_import_*.xlsx
+
+# Sensitive/source business data
+Training Bills_Invoices/
+Gl Codes/
+GL Codes/
+Properties/
+Vendors/
+Output/
+Old Scripts/
+
+# Scratch artifacts
+_gl_analysis/
+_build_*.ps1
+_categorize_and_create_folders.ps1
+_vendor_mapping.csv
+_unique_vendors.txt
+_full_mapping_rows.txt
+_cat_summary_rows.txt
+_category_listing.md
+
+# OS
+.DS_Store
+Thumbs.db

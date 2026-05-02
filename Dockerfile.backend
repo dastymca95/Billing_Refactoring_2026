@@ -1,0 +1,55 @@
+# =====================================================================
+# Backend image — FastAPI app + the Richmond Utilities CLI dependencies.
+# Includes Tesseract OCR + Poppler so scanned PDFs work out of the box.
+# Used both by `docker compose up backend` and as a standalone image.
+# =====================================================================
+FROM python:3.11-slim AS base
+
+# --- System packages -------------------------------------------------
+# tesseract-ocr  : OCR engine used by the Richmond PDF parser
+# tesseract-ocr-eng : English language data (the CLI ships base + OSD only)
+# poppler-utils  : provides pdftoppm / pdftocairo, used by pdf2image
+# libgl1, libglib2.0-0 : Pillow / opencv-style runtime deps; small, harmless
+# build-essential : kept *only* in the build layer below for any wheel that
+#                   needs to compile from source (most wheels are prebuilt)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tesseract-ocr \
+        tesseract-ocr-eng \
+        poppler-utils \
+        libgl1 \
+        libglib2.0-0 \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Python dependencies --------------------------------------------
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r /app/requirements.txt
+
+# --- App code -------------------------------------------------------
+# We don't COPY the project here in the dev compose target — the docker-
+# compose.yml bind-mounts the working tree so file changes hot-reload via
+# `uvicorn --reload`. For a baked production image, override the volume
+# mount and the bake will use the COPY layer below.
+COPY . /app
+
+# --- Runtime --------------------------------------------------------
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Tesseract / Poppler are on $PATH inside this image, so the helper's
+# auto-detect (`shutil.which("tesseract")`) just works. No env overrides
+# needed — but we expose them anyway so an operator can pin a different
+# binary path via .env if they swap in a custom build.
+ENV TESSERACT_CMD="" \
+    POPPLER_PATH=""
+
+EXPOSE 8000
+
+# `webapp_data/` is mounted from the host so generated batches survive
+# container restarts. See docker-compose.yml.
+VOLUME ["/app/webapp_data"]
+
+CMD ["python", "-m", "uvicorn", "webapp.backend.main:app", \
+     "--host", "0.0.0.0", "--port", "8000"]

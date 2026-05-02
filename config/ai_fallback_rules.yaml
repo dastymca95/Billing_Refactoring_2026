@@ -1,0 +1,82 @@
+# AI Fallback Rules — Phase 1H foundation
+#
+# These rules govern when (and whether) the optional AI assistance layer
+# fires inside the web app. The Python CLI processors do NOT consult this
+# file; they remain pure-rules. AI fallback only runs when the webapp
+# constructs a `run_context` and wires the AI service into the per-batch
+# processing call.
+#
+# Defaults below ship with AI DISABLED. The app must work end-to-end with
+# no API keys. To enable, set environment variables (see .env.example):
+#   AI_FALLBACK_ENABLED=true
+#   AI_PROVIDER=openai|anthropic|google_gemini|deepseek
+#   <provider>_API_KEY=...
+# and set `enabled: true` here.
+
+ai_fallback:
+  # Master switch. When false, no AI calls are attempted regardless of
+  # provider configuration.
+  enabled: false
+
+  # Provider name used to pick an adapter. Must match an entry in
+  # webapp/backend/services/ai_fallback.py:_PROVIDER_ADAPTERS.
+  provider: disabled
+
+  # When AI fires, relative to rule-based extraction.
+  # - never:                 disable AI even if `enabled: true`
+  # - only_low_confidence:   AI runs when a field is missing or has
+  #                          confidence < threshold
+  # - only_manual_review:    AI runs only on rows already flagged for
+  #                          manual review
+  # - always_assist:         AI always offers a second opinion (most expensive)
+  policy: only_low_confidence
+
+  # Hard ceiling per batch. The skeleton enforces this at the service
+  # boundary so a misconfigured loop can't drain a budget.
+  max_cost_per_batch_usd: 1.00
+
+  # Send only the cropped region drawn by the operator (or detected by
+  # rules) instead of the whole document. Cheaper, less PII surface.
+  send_full_document: false
+  prefer_cropped_regions: true
+
+  # Strip obvious auth-like substrings (token=, api_key=, password=) from
+  # the payload before any provider call.
+  redact_sensitive_tokens: true
+
+  # Every field filled by AI is flagged for human review. Keeps the
+  # operator in the loop even when the suggestion is high-confidence.
+  require_manual_review_for_ai_filled_fields: true
+
+  # Confidence threshold below which AI may suggest a value. Above this,
+  # rule-based extraction is treated as authoritative.
+  rule_confidence_threshold: 0.65
+
+# What the AI is allowed to suggest. Anything not listed here is forbidden.
+allowed_tasks:
+  service_address_extraction: true
+  account_number_extraction: true
+  due_date_extraction: true
+  total_amount_extraction: true
+  notice_boundary_detection: true
+  unit_candidate_suggestion: true
+  manual_review_explanation: true
+
+# Hard prohibitions. These NEVER fire even when "always_assist".
+forbidden_tasks:
+  # AI may not change a GL code that the YAML already mapped.
+  final_gl_mapping_override: true
+  # AI may not write a Location that isn't in Unit Info Clean.
+  unvalidated_location_write: true
+  # AI may not adjust line item amounts to "make the bill reconcile".
+  silent_amount_correction: true
+  # AI may not pick a property abbreviation that isn't in the trusted index.
+  unvalidated_property_abbreviation_write: true
+  # AI may not invent invoice numbers or due dates outside the scan text.
+  hallucinate_dates_or_invoice_numbers: true
+
+# Where audit logs land.
+audit:
+  log_jsonl_relative_path: "logs/ai_fallback.jsonl"
+  log_full_request_body: false   # never log raw payloads by default
+  log_response_summary: true

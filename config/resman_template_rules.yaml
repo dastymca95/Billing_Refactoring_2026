@@ -1,0 +1,49 @@
+# ============================================================================
+# RESMAN AP IMPORT TEMPLATE — column-level rules for the web app preview.
+# ----------------------------------------------------------------------------
+# The official ResMan AP import template lives at `Output/Template.xlsx` and
+# carries the canonical column order that ResMan imports. The web app's
+# ResMan template preview reads the column list from that file at runtime
+# (so renaming a header in the template flows through automatically) and
+# uses this YAML to decide which columns are mandatory, which are
+# recommended, and which are optional/collapsible.
+#
+# Three categories:
+#   * required    — must have a non-empty value for the row to import cleanly.
+#                   Rendered with an orange header background in the UI.
+#   * recommended — useful but not strictly required. Rendered with a subtle
+#                   amber/yellow header background.
+#   * optional    — present in the template for completeness but rarely used
+#                   for utility AP. Hidden by default; one click to show.
+#
+# Anything in `Output/Template.xlsx` that is not listed in `required_columns`
+# or `recommended_columns` is implicitly optional. Names must match the
+# template headers EXACTLY (case-sensitive).
+# ============================================================================
+
+template:
+  path: "Output/Template.xlsx"
+  header_row: 1
+
+required_columns:
+  - "Bill or Credit"
+  - "Invoice Number"
+  - "Invoice Date"
+  - "Vendor"
+  - "Invoice Description"
+  - "Line Item Number"
+  - "Property Abbreviation"
+  - "Location"
+  - "GL Account"
+  - "Amount"
+  - "Expense Type"
+  - "Is Replacement Reserve"
+
+recommended_columns:
+  - "Accounting Date"
+  - "Due Date"
+  - "Document Url"
+
+# Behavior flags read by the frontend.
+optional_columns_collapsible: true
+optional_columns_hidden_by_default: true

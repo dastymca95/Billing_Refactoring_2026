@@ -1,0 +1,25 @@
+# Backend dependencies for the Billing Refactoring 2026 web app + CLI.
+# Frontend dependencies live in webapp/frontend/package.json.
+
+# --- Web framework + multipart upload support ---
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+python-multipart==0.0.27
+
+# --- AP processing core (used by both CLI and webapp) ---
+PyYAML==6.0.3
+openpyxl==3.1.5
+
+# --- PDF support: text extraction + OCR fallback + per-page splitting ---
+pdfplumber==0.11.9
+pypdf==6.10.2
+pytesseract==0.3.13
+pdf2image==1.17.0
+pillow==12.2.0
+
+# --- Dropbox support-document upload (credentials from .env) ---
+dropbox==12.0.2
+python-dotenv==1.2.2
+
+# --- HTTP client used by Dropbox SDK + a few helpers ---
+requests==2.33.1
