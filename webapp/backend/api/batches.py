@@ -6,6 +6,7 @@ names + summary stats without re-reading the result cache."""
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
@@ -14,6 +15,7 @@ from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel, Field
 
 from ..services import batch_store
+from ..services.document_preview import pdf_page_count
 from ..services.vendor_detection import detect_vendor_for_file
 
 
@@ -32,6 +34,7 @@ AI_FALLBACK_POLICIES = (
 )
 DEFAULT_DOCUMENT_MODE = "auto_detect"
 DEFAULT_AI_FALLBACK_POLICY = "only_low_confidence"
+DEFAULT_UNTITLED_BATCH_NAME = "Untitled batch"
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +71,102 @@ def _write_metadata(batch_id: str, **fields) -> dict:
     current["updated_at"] = datetime.now().isoformat(timespec="seconds")
     p.write_text(json.dumps(current, indent=2), encoding="utf-8")
     return current
+
+
+def _display_batch_name(meta: dict) -> str:
+    return str(meta.get("batch_name") or "").strip() or DEFAULT_UNTITLED_BATCH_NAME
+
+
+# ---------------------------------------------------------------------------
+# Phase 1U — cached vendor detection.
+#
+# Vendor detection opens each PDF with pdfplumber to sample text. For a
+# 10-file batch that's ~1–3 s of disk + parser work on EVERY GET
+# /api/batches/<id>. The result is deterministic for an unchanged file
+# (same name + size + mtime), so we cache it inside batch_metadata.json
+# under a `file_detection_cache` key. The cache is keyed by filename and
+# invalidated whenever the file's size or mtime changes.
+# ---------------------------------------------------------------------------
+def _detect_files_cached(batch_id: str, files: list) -> list[dict]:
+    """Return file entries with vendor detection populated.
+
+    Uses the cached detection in `batch_metadata.json` when the file
+    matches the cached `(size, mtime)` tuple; falls back to running
+    detect_vendor_for_file and persisting the result. Persistence is
+    best-effort — a write failure simply means the next call re-detects.
+    """
+    meta = _read_metadata(batch_id)
+    cache = meta.get("file_detection_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+    fresh_cache: dict[str, dict] = {}
+    cache_dirty = False
+    entries: list[dict] = []
+    for p in files:
+        try:
+            stat = p.stat()
+        except FileNotFoundError:
+            continue
+        size_bytes = stat.st_size
+        mtime = int(stat.st_mtime)
+        cache_key = p.name
+        cached = cache.get(cache_key)
+        if (
+            isinstance(cached, dict)
+            and cached.get("size_bytes") == size_bytes
+            and cached.get("mtime") == mtime
+            and "vendor_key" in cached
+        ):
+            det = {
+                "vendor_key": cached["vendor_key"],
+                "confidence": cached.get("confidence", 0.0),
+                "reason": cached.get("reason", ""),
+                "supported_in_phase_1": cached.get("supported_in_phase_1", False),
+            }
+            page_count = cached.get("page_count")
+            if p.suffix.lower() == ".pdf" and page_count is None:
+                page_count = pdf_page_count(p)
+                cache_dirty = True
+        else:
+            det = detect_vendor_for_file(p)
+            page_count = pdf_page_count(p)
+            cache_dirty = True
+        fresh_cache[cache_key] = {
+            "size_bytes": size_bytes,
+            "mtime": mtime,
+            "vendor_key": det["vendor_key"],
+            "confidence": det["confidence"],
+            "reason": det["reason"],
+            "supported_in_phase_1": det["supported_in_phase_1"],
+        }
+        if page_count is not None:
+            fresh_cache[cache_key]["page_count"] = page_count
+        entry = {
+            "filename": p.name,
+            "size_bytes": size_bytes,
+            "extension": p.suffix.lower(),
+            "vendor_key": det["vendor_key"],
+            "vendor_confidence": det["confidence"],
+            "vendor_detection_reason": det["reason"],
+            "supported_in_phase_1": det["supported_in_phase_1"],
+        }
+        if page_count is not None:
+            entry["page_count"] = page_count
+        entries.append(entry)
+
+    # Detect deletions: if any cached filename is no longer present in
+    # `files`, the cache shrunk and we need to persist the smaller view.
+    if set(fresh_cache.keys()) != set(cache.keys()):
+        cache_dirty = True
+
+    if cache_dirty:
+        try:
+            _write_metadata(batch_id, file_detection_cache=fresh_cache)
+        except Exception:
+            # Persistence is non-fatal; we still return the entries we
+            # computed for this request.
+            pass
+    return entries
 
 
 def _summary_for_batch(batch_id: str) -> dict:
@@ -133,6 +232,9 @@ class UpdateBatchBody(BaseModel):
     document_mode: Optional[str] = None
     ai_fallback_enabled: Optional[bool] = None
     ai_fallback_policy: Optional[str] = None
+    # Phase 2C — display name for the export workbook ("Richmond_3.xlsx").
+    # Optional; if not set the UI falls back to a generated default.
+    export_name: Optional[str] = None
 
 
 def _validate_document_mode(value: Optional[str]) -> Optional[str]:
@@ -145,6 +247,35 @@ def _validate_document_mode(value: Optional[str]) -> Optional[str]:
             detail=f"document_mode must be one of {list(DOCUMENT_MODES)}; got {value!r}",
         )
     return v
+
+
+# Phase 2C — characters allowed in an export display name. We strip
+# anything path-traversal-flavored ('/', '\\', '..') and replace it with
+# '_' so the operator can paste loose text without breaking downloads.
+_EXPORT_NAME_ILLEGAL = re.compile(r'[\\/:\*\?"<>\|]+')
+
+
+def _sanitize_export_name(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        raise HTTPException(status_code=400, detail="export_name cannot be empty")
+    # Strip path components defensively.
+    s = Path(s).name
+    s = _EXPORT_NAME_ILLEGAL.sub("_", s)
+    s = s.strip(". ")
+    if not s:
+        raise HTTPException(
+            status_code=400,
+            detail="export_name contains only invalid characters",
+        )
+    if len(s) > 120:
+        raise HTTPException(status_code=400, detail="export_name too long (max 120)")
+    # Ensure .xlsx so downloads are valid Excel files. If the operator
+    # typed another extension, replace it.
+    stem = Path(s).stem or s
+    return f"{stem}.xlsx"
 
 
 def _validate_ai_policy(value: Optional[str]) -> Optional[str]:
@@ -170,8 +301,10 @@ def create_batch_endpoint(body: CreateBatchBody | None = Body(default=None)) -> 
     `ai_fallback_policy`. All have safe defaults; older clients keep
     working unchanged."""
     bid = batch_store.create_batch()
-    name = (body.batch_name if body else None) or \
-        f"Batch {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    supplied_name = (body.batch_name.strip() if body and body.batch_name else "")
+    if len(supplied_name) > 200:
+        raise HTTPException(status_code=400, detail="batch_name too long (max 200)")
+    name = supplied_name or f"Batch {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     document_mode = _validate_document_mode(
         body.document_mode if body else None
     ) or DEFAULT_DOCUMENT_MODE
@@ -207,7 +340,7 @@ def list_batches_endpoint() -> dict:
             continue
         out.append({
             "batch_id": bid,
-            "batch_name": meta.get("batch_name") or bid,
+            "batch_name": _display_batch_name(meta),
             "created_at": live.get("created_at") or meta.get("created_at"),
             "updated_at": meta.get("updated_at"),
             "status": meta.get("status") or "idle",
@@ -245,6 +378,8 @@ def update_batch_endpoint(batch_id: str, body: UpdateBatchBody) -> dict:
         fields["ai_fallback_enabled"] = bool(body.ai_fallback_enabled)
     if body.ai_fallback_policy is not None:
         fields["ai_fallback_policy"] = _validate_ai_policy(body.ai_fallback_policy)
+    if body.export_name is not None:
+        fields["export_name"] = _sanitize_export_name(body.export_name)
     if not fields:
         raise HTTPException(status_code=400, detail="No fields to update")
     meta = _write_metadata(batch_id, **fields)
@@ -262,25 +397,16 @@ def get_batch_endpoint(batch_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
 
     files = batch_store.list_files_in_batch(batch_id)
-    file_entries = []
-    for p in files:
-        det = detect_vendor_for_file(p)
-        file_entries.append({
-            "filename": p.name,
-            "size_bytes": p.stat().st_size,
-            "extension": p.suffix.lower(),
-            "vendor_key": det["vendor_key"],
-            "vendor_confidence": det["confidence"],
-            "vendor_detection_reason": det["reason"],
-            "supported_in_phase_1": det["supported_in_phase_1"],
-        })
+    # Phase 1U — cached vendor detection (was the dominant cost of this
+    # endpoint; 1–3 s for a 10-file batch on every switch).
+    file_entries = _detect_files_cached(batch_id, files)
 
     meta = _read_metadata(batch_id)
     live = _summary_for_batch(batch_id)
 
     return {
         "batch_id": batch_id,
-        "batch_name": meta.get("batch_name") or batch_id,
+        "batch_name": _display_batch_name(meta),
         "created_at": live["created_at"],
         "updated_at": meta.get("updated_at"),
         "files": file_entries,
@@ -299,18 +425,8 @@ def list_files_endpoint(batch_id: str) -> dict:
         files = batch_store.list_files_in_batch(batch_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
-    out = []
-    for p in files:
-        det = detect_vendor_for_file(p)
-        out.append({
-            "filename": p.name,
-            "size_bytes": p.stat().st_size,
-            "extension": p.suffix.lower(),
-            "vendor_key": det["vendor_key"],
-            "vendor_confidence": det["confidence"],
-            "vendor_detection_reason": det["reason"],
-            "supported_in_phase_1": det["supported_in_phase_1"],
-        })
+    # Phase 1U — same cached-detection helper as the main endpoint.
+    out = _detect_files_cached(batch_id, files)
     return {"batch_id": batch_id, "files": out}
 
 
@@ -362,5 +478,8 @@ def get_batch_progress_endpoint(batch_id: str) -> dict:
 
 @router.delete("/{batch_id}")
 def delete_batch_endpoint(batch_id: str) -> dict:
-    batch_store.delete_batch(batch_id)
+    try:
+        batch_store.delete_batch(batch_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
     return {"batch_id": batch_id, "deleted": True}

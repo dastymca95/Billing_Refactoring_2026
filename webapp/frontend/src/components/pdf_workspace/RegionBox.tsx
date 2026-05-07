@@ -5,7 +5,7 @@
 import type { CSSProperties } from "react";
 
 import type { RegionHint } from "../../types";
-import { colorForLabel } from "./types";
+import { colorForLabel, friendlyRegionLabel } from "./types";
 
 type Props = {
   region: RegionHint;
@@ -66,9 +66,9 @@ export function RegionBox({
       <span
         className="region-tag"
         style={{ background: colour }}
-        title={region.label}
+        title={friendlyRegionLabel(region.label)}
       >
-        {region.label.replace(/_/g, " ")}
+        {friendlyRegionLabel(region.label)}
       </span>
       {selected && (
         <>

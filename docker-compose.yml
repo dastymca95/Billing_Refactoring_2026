@@ -31,10 +31,10 @@ services:
     env_file:
       - .env
     environment:
-      # The Vite dev server hits /api on the same origin (proxied by
-      # Vite). When the frontend runs OUTSIDE the proxy (e.g. a built
-      # static bundle) it should set VITE_API_BASE_URL=http://localhost:8000
-      # before building.
+      # Browser requests use relative /api URLs. In local dev, Vite
+      # proxies those requests. A static frontend build needs a reverse
+      # proxy or an api.ts runtime-base-url change; VITE_API_BASE_URL is
+      # only read by vite.config.ts for the dev proxy.
       - PYTHONUNBUFFERED=1
     volumes:
       # Hot-reload code from the host. Read-only is intentional — the

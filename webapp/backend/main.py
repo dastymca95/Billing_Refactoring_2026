@@ -10,11 +10,22 @@ proxy in webapp/frontend/vite.config.ts).
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from .settings import BATCHES_ROOT
-from .api import batches, uploads, preview, processing, export, regions, ai_status
+from .settings import BATCHES_ROOT, InvalidBatchIdError
+from .api import (
+    ai_status,
+    batches,
+    cells,
+    export,
+    preview,
+    processing,
+    regions,
+    uploads,
+    vendor_rules,
+)
 
 
 def create_app() -> FastAPI:
@@ -37,14 +48,31 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.exception_handler(InvalidBatchIdError)
+    async def invalid_batch_id_handler(
+        request: Request,
+        exc: InvalidBatchIdError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Invalid batch id"},
+        )
+
     app.include_router(batches.router)
     app.include_router(uploads.router)
     app.include_router(preview.router)
     app.include_router(processing.router)
+    # Phase 2D — cross-batch processing queue endpoint.
+    app.include_router(processing.queue_router)
     app.include_router(export.router)
     # Phase 1H — region hints + AI status.
     app.include_router(regions.router)
     app.include_router(ai_status.router)
+    # Phase 1Z — Vendor Rules Studio.
+    app.include_router(vendor_rules.router)
+    # Phase 2K — Cell explain / correct / learn.
+    app.include_router(cells.router)
+    app.include_router(cells.learned_router)
 
     @app.get("/api/health")
     def health() -> dict:

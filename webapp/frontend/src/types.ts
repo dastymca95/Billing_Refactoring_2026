@@ -6,6 +6,7 @@ export type FileEntry = {
   filename: string;
   size_bytes: number;
   extension: string;
+  page_count?: number | null;
   vendor_key: string;
   vendor_confidence: number;
   vendor_detection_reason: string;
@@ -32,6 +33,7 @@ export type FilePreview =
       filename: string;
       extension: string;
       size_bytes: number;
+      page_count?: number | null;
       note: string;
     }
   | {
@@ -63,6 +65,70 @@ export type PreviewRowMeta = {
   service_period_source: string;
   service_period_inferred: boolean;
   support_document_status: string;
+  source_file?: string | null;
+  source_page?: number | null;
+  invoice_group_id?: string | null;
+  invoice_number?: string | null;
+  invoice_index?: number;
+  invoice_row_index?: number;
+  row_index?: number;
+  // Phase 2J — opaque ids of the extraction trace items (regions on
+  // the source PDF) that fed this row. Drives the row ↔ overlay
+  // highlight in the document viewer.
+  trace_ids?: string[];
+};
+
+// Phase 2J — Extraction Trace Overlay.
+export type TraceBBox = { x: number; y: number; w: number; h: number };
+export type TraceItem = {
+  trace_id: string;
+  source_file: string;
+  page: number;
+  bbox: TraceBBox;
+  field_key: string;
+  field_label: string;
+  source_type: string;
+  rule_id: string;
+  match_strategy: string;
+  confidence: number;
+  feeds_rows: string[];
+  feeds_columns: string[];
+  detected_text: string;
+};
+export type DocumentTraceResponse = {
+  batch_id: string;
+  source_file: string;
+  trace_count: number;
+  items: TraceItem[];
+};
+
+// Phase 2K — Cell Explain / Correct / Learn.
+export type CellExplain = {
+  batch_id: string;
+  row_index: number;
+  column: string;
+  current_value: unknown;
+  summary: string;
+  cell_kind: string;
+  fallback_used: boolean;
+  missing_components: string[];
+  trace_ids: string[];
+  traces: TraceItem[];
+  source_file: string | null;
+  source_page: number | null;
+  vendor_key: string;
+};
+
+export type LearnedCorrection = {
+  correction_id: string;
+  vendor_key: string;
+  kind: "value_override" | "region_remap";
+  scope: "cell" | "document" | "batch" | "vendor";
+  trigger: Record<string, unknown>;
+  action: Record<string, unknown>;
+  created_at: string;
+  created_from: Record<string, unknown>;
+  note: string;
 };
 
 // PreviewRow now uses an index signature so the row carries every column
@@ -140,6 +206,8 @@ export type ProgressStatus =
   | "idle"
   | "uploading"
   | "processing"
+  | "cancelling"   // Phase 1N — cancel requested, worker still draining
+  | "cancelled"    // Phase 1N — worker stopped after cancel
   | "completed"
   | "failed";
 
@@ -182,6 +250,9 @@ export type BatchProgress = {
   started_at?: string;
   // Phase 1H — declared stages, optional.
   stages?: ProcessingStage[];
+  // Phase 1N — cancel state.
+  cancel_requested?: boolean;
+  cancelled_at?: string;
 };
 
 // Phase 1H — batch document mode + AI fallback policy.
@@ -227,6 +298,31 @@ export const AI_FALLBACK_POLICY_LABELS: Record<AiFallbackPolicy, string> = {
   only_low_confidence: "Only when confidence is low",
   only_manual_review: "Only on manual-review rows",
   always_assist: "Always offer a second opinion",
+};
+
+// Phase 2D — template revisions + cross-batch processing queue.
+export type RevisionEntry = {
+  revision_id: string;
+  created_at: string;
+  status: string;
+  export_name?: string | null;
+  files_count: number;
+  invoices_count: number;
+  rows_count: number;
+  manual_review_count: number;
+  source_batch_id: string;
+  snapshot_filename: string;
+};
+
+export type RevisionListResponse = {
+  batch_id: string;
+  current_revision_id: string | null;
+  revisions: RevisionEntry[];
+};
+
+export type QueueStatus = {
+  running: string | null;
+  queued: string[];
 };
 
 export type AiStatus = {

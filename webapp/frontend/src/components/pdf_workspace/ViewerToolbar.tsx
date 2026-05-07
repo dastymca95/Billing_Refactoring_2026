@@ -50,7 +50,7 @@ export function ViewerToolbar({
         <button
           className={`tool-btn ${tool === "draw" ? "active" : ""}`}
           onClick={() => onToolChange("draw")}
-          title="Draw a new region"
+          title="Mark a field on the page"
         >
           ▭ Draw
         </button>
@@ -72,7 +72,7 @@ export function ViewerToolbar({
 
       <div className="toolbar-group">
         <label className="toolbar-label">
-          Region:
+          Field:
           <select
             className="toolbar-select"
             value={drawLabel}
@@ -127,7 +127,7 @@ export function ViewerToolbar({
 
       <div className="toolbar-spacer" />
       <div className="toolbar-meta">
-        {regionsCount} region{regionsCount === 1 ? "" : "s"} on this page
+        {regionsCount} mark{regionsCount === 1 ? "" : "s"} on this page
       </div>
     </div>
   );

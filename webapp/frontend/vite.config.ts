@@ -1,12 +1,15 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// During dev the React app runs on :5173 and proxies /api/* to the
-// FastAPI backend. Two ways to point it at a different backend:
+// During dev the React app runs on :5173 and proxies browser /api/*
+// requests to the FastAPI backend. This is dev-server behavior only:
+// the static production bundle still fetches relative /api URLs unless
+// api.ts is changed or a reverse proxy serves both frontend and backend.
+// Two ways to point the dev proxy at a different backend:
 //   * VITE_API_BASE_URL=http://backend:8000   (Docker compose case —
 //     containers see each other by service name)
 //   * VITE_BACKEND_PORT=8001                  (local dev case — same host)
-// `VITE_API_BASE_URL` wins when both are set.
+// `VITE_API_BASE_URL` wins when both are set. Restart Vite after edits.
 const explicitBase = process.env.VITE_API_BASE_URL?.trim();
 const backendPort = process.env.VITE_BACKEND_PORT ?? "8000";
 const proxyTarget = explicitBase || `http://localhost:${backendPort}`;

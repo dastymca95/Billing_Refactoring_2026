@@ -50,3 +50,62 @@ async def upload_file_endpoint(batch_id: str, file: UploadFile = File(...)) -> d
         "size_bytes": dest.stat().st_size,
         "extension": dest.suffix.lower(),
     }
+
+
+@router.delete("/{batch_id}/files/{filename}")
+def delete_file_endpoint(batch_id: str, filename: str) -> dict:
+    """Phase 1X — remove a single uploaded file from a batch.
+
+    The web app's file-explorer sidebar offers a per-file trash icon
+    so the operator can clean up individual mistakes without nuking
+    the whole batch. The handler:
+
+      * Resolves the file inside the batch's input directory and
+        rejects any name that would escape that directory (path
+        traversal).
+      * Deletes only the matching upload from `input/`. Any vendor-
+        specific staging copy under `input/<vendor>/` and any
+        processed output stays intact — re-running Process will
+        rebuild from the remaining files.
+      * Returns 404 for a missing batch or a missing filename so the
+        frontend can surface a friendly message.
+    """
+    try:
+        in_dir = batch_store.get_input_dir(batch_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Batch not found: {batch_id}",
+        )
+
+    # Strip any path components defensively — the URL only carries
+    # the basename but we can't trust the wire.
+    safe_name = Path(filename).name
+    if not safe_name or safe_name in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    target = in_dir / safe_name
+    try:
+        target_resolved = target.resolve()
+        in_dir_resolved = in_dir.resolve()
+        # Belt-and-braces traversal guard.
+        target_resolved.relative_to(in_dir_resolved)
+    except (ValueError, OSError):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    if not target_resolved.is_file():
+        raise HTTPException(
+            status_code=404, detail=f"File not found in batch: {safe_name}",
+        )
+
+    try:
+        target_resolved.unlink()
+    except OSError as e:
+        raise HTTPException(
+            status_code=500, detail=f"Could not delete file: {type(e).__name__}",
+        )
+
+    return {
+        "batch_id": batch_id,
+        "filename": safe_name,
+        "deleted": True,
+    }

@@ -20,10 +20,11 @@ export function ProgressBar({ progress, isProcessing }: Props) {
   if (!progress) return null;
 
   const status = progress.status ?? "idle";
-  const isFinal = status === "completed" || status === "failed";
+  const isFinal =
+    status === "completed" || status === "failed" || status === "cancelled";
   // Hide the bar a moment after completion — App.tsx still shows the
   // success/error banner so the operator gets feedback.
-  if (!isProcessing && isFinal && progress.percent >= 100) return null;
+  if (!isProcessing && isFinal) return null;
 
   const pct = Math.max(0, Math.min(100, progress.percent ?? 0));
   const tone =

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +27,12 @@ if str(PROJECT_ROOT) not in sys.path:
 WEBAPP_DATA_ROOT = PROJECT_ROOT / "webapp_data"
 BATCHES_ROOT = WEBAPP_DATA_ROOT / "batches"
 
+BATCH_ID_PATTERN = re.compile(r"^batch_\d{8}_\d{6}_\d{3}$")
+
+
+class InvalidBatchIdError(ValueError):
+    """Raised when a caller supplies a batch id outside the generated format."""
+
 # Existing project assets (read-only)
 RESMAN_TEMPLATE = PROJECT_ROOT / "Output" / "Template.xlsx"
 VENDORS_INDEX_YAML = PROJECT_ROOT / "config" / "vendor_rules_index.yaml"
@@ -44,5 +51,22 @@ def new_batch_id() -> str:
     return "batch_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
+def validate_batch_id(batch_id: str) -> str:
+    if not BATCH_ID_PATTERN.fullmatch(batch_id or ""):
+        raise InvalidBatchIdError("Invalid batch id")
+    return batch_id
+
+
+def is_valid_batch_id(batch_id: str) -> bool:
+    return BATCH_ID_PATTERN.fullmatch(batch_id or "") is not None
+
+
 def batch_dir(batch_id: str) -> Path:
-    return BATCHES_ROOT / batch_id
+    safe_id = validate_batch_id(batch_id)
+    root = BATCHES_ROOT.resolve()
+    candidate = (root / safe_id).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise InvalidBatchIdError("Invalid batch id")
+    return candidate

@@ -1,28 +1,31 @@
-// Phase 1J — pointer-driven panel resize hook with localStorage persistence.
+// Phase 1J → fixed in Phase 1L.
 //
-// Returns the current size + drag handle props. Wire the returned
-// `dragHandleProps` onto a `<div>` divider; the hook handles
-// pointer capture, cursor styling, min/max clamping, and persistence.
+// Pointer-driven panel resize hook with localStorage persistence.
 //
-// Usage:
-//   const { size, dragHandleProps, reset } = useResizablePanel({
-//     storageKey: "billing_refactoring_layout_sidebar_width",
-//     defaultSize: 260,
-//     min: 200,
-//     max: 480,
-//     direction: "horizontal",
-//   });
-//   <aside style={{ width: size }}>…</aside>
-//   <div className="resizer" {...dragHandleProps} />
+// PHASE 1L BUG FIX
+// ----------------
+// Previously: after releasing the mouse on a divider, moving the mouse
+// could continue to resize the panel ("sticky drag"). Root cause: the
+// move/up listeners were registered on `window`, not the divider, AND
+// `onUp` was rebuilt on every state change which created a brief
+// window where the listener wasn't attached when pointerup fired —
+// e.g. when the pointer was released outside the browser viewport.
 //
-// Direction:
-//   "horizontal"  — drag changes width
-//   "vertical"    — drag changes height
-//
-// Drag math:
-//   When dragging, we read the live mouse position from a window-level
-//   listener (NOT the divider's own pointermove) so dragging beyond the
-//   divider into the next pane doesn't lose the grip.
+// Fix:
+//   * Use Pointer Events with `setPointerCapture` on the divider so
+//     all subsequent pointermove / pointerup / pointercancel events
+//     are routed to the same element regardless of where the pointer
+//     ends up.
+//   * Move/up handlers live on the divider, not the window.
+//   * Hard guard: if `e.buttons === 0` while moving (i.e. no button
+//     held down), stop immediately. This catches edge cases where the
+//     OS swallows pointerup (alt-tab, dragging into devtools, etc.).
+//   * Belt-and-braces window-level listeners for `pointerup`,
+//     `pointercancel`, `blur`, `visibilitychange`, and a
+//     `mouseleave` on `document` — any of which terminate the drag.
+//   * `body.style.cursor` and `body.style.userSelect` are restored on
+//     stop AND on hook unmount so a runaway drag can't leave the page
+//     stuck in a col-resize cursor.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -67,20 +70,83 @@ export function useResizablePanel(opts: Options) {
   const [size, setSize] = useState<number>(() =>
     clamp(readStored(storageKey, defaultSize), min, max),
   );
+
+  // Drag state lives in refs (not state) so the move/up handlers see
+  // current values without triggering re-registrations and without
+  // stale closures.
   const draggingRef = useRef(false);
   const startCoordRef = useRef(0);
   const startSizeRef = useRef(size);
+  const sizeRef = useRef(size);
+  const handleElRef = useRef<HTMLElement | null>(null);
+  const pointerIdRef = useRef<number | null>(null);
 
-  const stop = useCallback(() => {
-    if (!draggingRef.current) return;
-    draggingRef.current = false;
-    document.body.style.cursor = "";
-    document.body.style.userSelect = "";
-  }, []);
+  // Keep `sizeRef` in sync so we always persist the latest value on
+  // stop (size dep would otherwise force handler rebuilds).
+  useEffect(() => {
+    sizeRef.current = size;
+  }, [size]);
 
-  const onMove = useCallback(
-    (e: PointerEvent) => {
+  const stopDrag = useCallback(
+    (persist: boolean) => {
       if (!draggingRef.current) return;
+      draggingRef.current = false;
+      if (typeof document !== "undefined") {
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      }
+      // Release pointer capture if we still have it. Wrapping in
+      // try/catch because the element may already be detached or the
+      // pointer id may already be released.
+      const el = handleElRef.current;
+      const pid = pointerIdRef.current;
+      if (el && pid != null) {
+        try {
+          el.releasePointerCapture(pid);
+        } catch {
+          /* no-op */
+        }
+      }
+      pointerIdRef.current = null;
+      if (persist) {
+        writeStored(storageKey, sizeRef.current);
+      }
+    },
+    [storageKey],
+  );
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (e.button !== 0) return; // primary button only
+      draggingRef.current = true;
+      startCoordRef.current =
+        direction === "horizontal" ? e.clientX : e.clientY;
+      startSizeRef.current = sizeRef.current;
+      handleElRef.current = e.currentTarget;
+      pointerIdRef.current = e.pointerId;
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        /* setPointerCapture not supported / already captured */
+      }
+      document.body.style.cursor =
+        direction === "horizontal" ? "col-resize" : "row-resize";
+      document.body.style.userSelect = "none";
+      e.preventDefault();
+    },
+    [direction],
+  );
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      if (!draggingRef.current) return;
+      // HARD GUARD: if no primary button is held, the OS already
+      // delivered a pointerup we may have missed (e.g. focus loss).
+      // Bail and stop the drag.
+      if (e.buttons === 0) {
+        stopDrag(true);
+        return;
+      }
       const coord = direction === "horizontal" ? e.clientX : e.clientY;
       const delta = coord - startCoordRef.current;
       const next = clamp(
@@ -88,58 +154,80 @@ export function useResizablePanel(opts: Options) {
         min,
         max,
       );
-      setSize(next);
+      // Only schedule a re-render when the value actually changed.
+      if (next !== sizeRef.current) {
+        sizeRef.current = next;
+        setSize(next);
+      }
     },
-    [direction, inverted, min, max],
+    [direction, inverted, min, max, stopDrag],
   );
 
-  const onUp = useCallback(() => {
-    if (!draggingRef.current) return;
-    stop();
-    // Persist the final value once on release. Saving on every move
-    // would write to localStorage 60×/sec.
-    writeStored(storageKey, size);
-  }, [size, storageKey, stop]);
+  const onPointerUp = useCallback(() => {
+    stopDrag(true);
+  }, [stopDrag]);
 
-  useEffect(() => {
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onUp);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", onUp);
-    };
-  }, [onMove, onUp]);
-
-  const onPointerDown = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
-      // Only respond to primary mouse / touch / pen.
-      if (e.button !== 0) return;
-      draggingRef.current = true;
-      startCoordRef.current =
-        direction === "horizontal" ? e.clientX : e.clientY;
-      startSizeRef.current = size;
-      document.body.style.cursor =
-        direction === "horizontal" ? "col-resize" : "row-resize";
-      document.body.style.userSelect = "none";
-      e.preventDefault();
-    },
-    [direction, size],
-  );
+  const onPointerCancel = useCallback(() => {
+    stopDrag(false);
+  }, [stopDrag]);
 
   const onDoubleClick = useCallback(() => {
     setSize(defaultSize);
+    sizeRef.current = defaultSize;
     writeStored(storageKey, defaultSize);
   }, [defaultSize, storageKey]);
 
+  // Belt-and-braces: stop a drag if focus or visibility changes (e.g.
+  // alt-tab away while holding the mouse). These never fire during
+  // normal drag because we have the divider's pointermove/up listeners,
+  // but they catch the edge cases the user reported.
+  useEffect(() => {
+    const onWinPointerUp = () => stopDrag(true);
+    const onWinPointerCancel = () => stopDrag(false);
+    const onBlur = () => stopDrag(true);
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") stopDrag(true);
+    };
+    const onDocMouseLeave = () => stopDrag(true);
+    window.addEventListener("pointerup", onWinPointerUp);
+    window.addEventListener("pointercancel", onWinPointerCancel);
+    window.addEventListener("blur", onBlur);
+    document.addEventListener("visibilitychange", onVisibility);
+    document.addEventListener("mouseleave", onDocMouseLeave);
+    return () => {
+      window.removeEventListener("pointerup", onWinPointerUp);
+      window.removeEventListener("pointercancel", onWinPointerCancel);
+      window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", onVisibility);
+      document.removeEventListener("mouseleave", onDocMouseLeave);
+    };
+  }, [stopDrag]);
+
+  // Final cleanup on unmount: never leave the body in col-resize.
+  useEffect(() => {
+    return () => {
+      if (draggingRef.current) {
+        draggingRef.current = false;
+        if (typeof document !== "undefined") {
+          document.body.style.cursor = "";
+          document.body.style.userSelect = "";
+        }
+      }
+    };
+  }, []);
+
   const reset = useCallback(() => {
     setSize(defaultSize);
+    sizeRef.current = defaultSize;
     writeStored(storageKey, defaultSize);
   }, [defaultSize, storageKey]);
 
   const dragHandleProps = {
     onPointerDown,
+    onPointerMove,
+    onPointerUp,
+    onPointerCancel,
+    onLostPointerCapture: () => stopDrag(true),
     onDoubleClick,
     role: "separator",
     "aria-orientation":

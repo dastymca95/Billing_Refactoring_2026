@@ -122,10 +122,21 @@ def _validate_source(source: str) -> str:
 
 @router.get("/{batch_id}/regions")
 def list_regions(batch_id: str) -> dict:
+    """Return the region hints for this batch.
+
+    Phase 1J — return an empty list (200) for ANY non-fatal lookup
+    miss so the frontend never has to render an HTTP 404 to the
+    operator. The only situations that should still surface as a
+    server-side error are filesystem permission failures on a real
+    region_hints.json (which `_read_regions` already swallows).
+    """
     try:
         batch_store.get_batch_dir(batch_id)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
+        # Batch directory is gone (stale localStorage). Return an
+        # empty payload rather than 404 — the workspace shows a clean
+        # empty state instead of a raw error.
+        return {"schema_version": 1, "regions": []}
     return _read_regions(batch_id)
 
 

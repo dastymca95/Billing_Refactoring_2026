@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { PreviewResponse, PreviewRow } from "../types";
+import { useWheelHorizontalScroll } from "../hooks/useWheelHorizontalScroll";
 
-// Small helper — `null` / `undefined` / `""` all count as "missing".
 function isMissing(value: unknown) {
   return value == null || value === "" || value === undefined;
 }
@@ -13,13 +13,33 @@ type Props = {
   preview: PreviewResponse | null;
   edits: CellEdits;
   onCellEdit: (rowIndex: number, columnKey: string, newValue: unknown) => void;
-  /** Phase 1J — restrict which rows are visible. `null` means show all. */
   visibleRowIndexes?: Set<number> | null;
-  /** Phase 1J — currently selected row (drives the inspector panel). */
   selectedRowIndex?: number | null;
-  /** Phase 1J — toggled when an operator clicks any non-editable area
-   *  of a row (e.g. the Document Url cell or whitespace). */
+  activeDocumentRef?: {
+    filename: string;
+    pageNumber: number;
+  } | null;
   onSelectRow?: (rowIndex: number | null) => void;
+  forceShowOptional?: boolean;
+  // Phase 2K — cell-level menu hook. Parent receives the right-click
+  // location (viewport coords), the row index, and the column key,
+  // and decides what to render (typically <CellContextMenu>).
+  onCellContextMenu?: (params: {
+    rowIndex: number;
+    column: string;
+    x: number;
+    y: number;
+  }) => void;
+  // Cell-scoped trace highlight: when both selectedRowIndex AND
+  // selectedColumnKey are set, the parent dims non-cell traces.
+  selectedColumnKey?: string | null;
+  onSelectCell?: (rowIndex: number | null, column: string | null) => void;
+  // Phase 2M — Excel-style per-column filtering. Parent owns the
+  // filter state; the grid only renders the funnel button on each
+  // header and dispatches a click with the column name + the button's
+  // bounding rect so the popover can position itself.
+  onColumnFilterClick?: (column: string, anchorRect: DOMRect) => void;
+  filteredColumns?: Set<string> | null;
 };
 
 type ColumnCategory = "required" | "recommended" | "optional";
@@ -30,18 +50,25 @@ export function ResManTemplatePreview({
   onCellEdit,
   visibleRowIndexes = null,
   selectedRowIndex = null,
+  activeDocumentRef = null,
   onSelectRow,
+  forceShowOptional = false,
+  onCellContextMenu,
+  selectedColumnKey = null,
+  onSelectCell,
+  onColumnFilterClick,
+  filteredColumns = null,
 }: Props) {
-  const [collapsed, setCollapsed] = useState(false);
   const [editing, setEditing] = useState<{ row: number; col: string } | null>(
     null,
   );
   const [draft, setDraft] = useState<string>("");
   const inputRef = useRef<HTMLInputElement>(null);
+  // Phase 2L — wheel-while-hovering-the-bottom-scrollbar redirects to
+  // horizontal scrolling, so the operator can reach off-screen
+  // columns without dragging the scrollbar thumb.
+  const scrollPaneRef = useWheelHorizontalScroll();
 
-  // Phase 1E: the preview now declares its full column list + which are
-  // required / recommended / optional. We build O(1) lookups and a "show
-  // optional" toggle whose default comes from the YAML.
   const columns = preview?.columns ?? [];
   const required = useMemo(
     () => new Set(preview?.required_columns ?? []),
@@ -57,20 +84,10 @@ export function ResManTemplatePreview({
   );
 
   const collapsibleEnabled = preview?.optional_columns_collapsible ?? true;
-  const hideOptionalDefault =
-    preview?.optional_columns_hidden_by_default ?? true;
-
-  // Per-preview default for the "show optional columns" toggle. We reset
-  // when the column set changes (e.g. on first load vs after a process run).
-  const [showOptional, setShowOptional] = useState<boolean>(!hideOptionalDefault);
-  useEffect(() => {
-    setShowOptional(!hideOptionalDefault);
-  }, [hideOptionalDefault, columns.length]);
-
   const visibleColumns = useMemo(() => {
-    if (!collapsibleEnabled || showOptional) return columns;
+    if (forceShowOptional || !collapsibleEnabled) return columns;
     return columns.filter((c) => !optional.has(c));
-  }, [collapsibleEnabled, showOptional, columns, optional]);
+  }, [forceShowOptional, collapsibleEnabled, columns, optional]);
 
   const categoryFor = (col: string): ColumnCategory => {
     if (required.has(col)) return "required";
@@ -87,31 +104,15 @@ export function ResManTemplatePreview({
 
   if (!preview) {
     return (
-      <div className="card">
-        <div className="card-header">ResMan template preview</div>
+      <div className="card template-grid-card" data-testid="template-grid-card">
         <div className="empty-state">
-          No data yet. Click <b>Process Batch</b> to populate the preview.
+          No template rows yet. Click <b>Process</b> to populate the preview.
         </div>
       </div>
     );
   }
 
   const rows = preview.rows as PreviewRow[];
-
-  // Compute totals using the EDITED values where present.
-  const merged = rows.map((r, i) => ({ ...r, ...(edits[i] ?? {}) }));
-  const totalAmount = merged.reduce((s, r) => {
-    const v = (r as any).Amount;
-    const n = typeof v === "number" ? v : Number(v);
-    return s + (Number.isFinite(n) ? n : 0);
-  }, 0);
-  const flaggedCount = rows.filter(
-    (r) => (r._meta?.manual_review_reasons ?? []).length > 0,
-  ).length;
-  const editedCellCount = Object.values(edits).reduce(
-    (s, m) => s + Object.keys(m).length,
-    0,
-  );
 
   const startEdit = (rowIndex: number, col: string, current: unknown) => {
     setEditing({ row: rowIndex, col });
@@ -134,198 +135,230 @@ export function ResManTemplatePreview({
 
   const cancel = () => setEditing(null);
 
-  const optionalCount = optional.size;
-  const hiddenOptionalCount =
-    collapsibleEnabled && !showOptional ? optionalCount : 0;
-
   return (
-    <div className="card">
-      <div className="card-header template-header">
-        <span>
-          ResMan template preview&nbsp;
-          <span className="muted" style={{ fontWeight: 400 }}>
-            · {preview.invoice_count} invoices · {preview.row_count} rows · $
-            {totalAmount.toFixed(2)}
-            {flaggedCount > 0 ? ` · ${flaggedCount} flagged` : ""}
-            {editedCellCount > 0 ? ` · ${editedCellCount} cells edited` : ""}
-            {hiddenOptionalCount > 0
-              ? ` · ${hiddenOptionalCount} optional column${
-                  hiddenOptionalCount > 1 ? "s" : ""
-                } hidden`
-              : ""}
-          </span>
-        </span>
-        <div className="template-header-actions">
-          {collapsibleEnabled && optionalCount > 0 && (
-            <button
-              onClick={() => setShowOptional((v) => !v)}
-              className="icon-button"
-              title={
-                showOptional
-                  ? "Hide optional template columns from view (export still includes them)"
-                  : "Show every column from the official Template.xlsx"
-              }
-            >
-              {showOptional ? "Hide optional cols" : "Show optional cols"}
-            </button>
-          )}
-          <button
-            onClick={() => setCollapsed(!collapsed)}
-            className="icon-button"
-          >
-            {collapsed ? "Expand" : "Collapse"}
-          </button>
-        </div>
-      </div>
-      {!collapsed && (
-        <>
-          {editedCellCount === 0 && (
-            <div className="muted" style={{ padding: "6px 14px" }}>
-              Click any cell to edit. Press Enter to save, Escape to cancel.
-              Required columns have orange headers; optional columns can be
-              hidden via the toggle (export still uses every template column).
-            </div>
-          )}
-          <div className="card-body tight preview-pane">
-            <table className="data-table">
-              <thead>
-                <tr>
+    <div className="card template-grid-card" data-testid="template-grid-card">
+      <div
+        ref={scrollPaneRef}
+        className="card-body tight preview-pane"
+        data-testid="template-grid-scroll"
+      >
+        <table className="data-table">
+          <thead>
+            <tr>
+              {visibleColumns.map((c) => {
+                const cat = categoryFor(c);
+                const hasFilter = !!filteredColumns?.has(c);
+                return (
+                  <th key={c} className={`col-${cat}`} title={categoryTitle(cat)}>
+                    <span className="th-label">{c}</span>
+                    {cat === "required" ? (
+                      <span className="col-marker"> *</span>
+                    ) : null}
+                    {onColumnFilterClick && (
+                      <button
+                        type="button"
+                        className={`th-filter-btn ${hasFilter ? "is-active" : ""}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                          onColumnFilterClick(c, rect);
+                        }}
+                        title={hasFilter ? "Filter applied — click to edit" : `Filter ${c}`}
+                        aria-label={`Filter ${c}`}
+                        data-testid={`th-filter-${c}`}
+                      >
+                        <FunnelIcon active={hasFilter} />
+                      </button>
+                    )}
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => {
+              if (visibleRowIndexes && !visibleRowIndexes.has(i)) return null;
+              const reasons = r._meta?.manual_review_reasons ?? [];
+              const isFlagged = reasons.length > 0;
+              const rowEdits = edits[i] ?? {};
+              const isSelected = selectedRowIndex === i;
+              const isCurrentDocumentPage =
+                !!activeDocumentRef && rowMatchesDocument(r, activeDocumentRef);
+              const rowClasses = [
+                isFlagged ? "review-row" : "",
+                isSelected ? "selected-row" : "",
+                isCurrentDocumentPage ? "document-page-row" : "",
+              ]
+                .filter(Boolean)
+                .join(" ");
+              const handleRowClick = () => {
+                if (onSelectRow) onSelectRow(i);
+              };
+              return (
+                <tr
+                  key={i}
+                  className={rowClasses}
+                  title={reasons.join("; ")}
+                  onClick={handleRowClick}
+                  data-testid="template-row"
+                  data-source-file={
+                    typeof r._meta?.source_file === "string"
+                      ? r._meta.source_file
+                      : undefined
+                  }
+                  data-source-page={r._meta?.source_page ?? undefined}
+                >
                   {visibleColumns.map((c) => {
+                    const original = (r as any)[c];
+                    const overridden = c in rowEdits;
+                    const value = overridden ? (rowEdits as any)[c] : original;
                     const cat = categoryFor(c);
+                    const isRequired = cat === "required";
+                    const cellMissing = isRequired && isMissing(value);
+                    const isAmount = c === "Amount";
+                    const isUrl = c === "Document Url";
+                    const isEditingCell =
+                      editing?.row === i && editing?.col === c;
+
+                    const baseClass = `${isAmount ? "num" : ""} ${
+                      cellMissing ? "error-row" : ""
+                    } cell-${cat}`;
+                    const style: React.CSSProperties = {
+                      ...(cellMissing ? { background: "#ffebe9" } : null),
+                      ...(overridden && !cellMissing
+                        ? {
+                            background: "#dafbe1",
+                            outline: "1px solid #1a7f37",
+                            outlineOffset: "-1px",
+                          }
+                        : null),
+                      cursor: isEditingCell ? "text" : "cell",
+                      maxWidth: 280,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    };
+
+                    const isSelectedCell =
+                      selectedRowIndex === i && selectedColumnKey === c;
                     return (
-                      <th key={c} className={`col-${cat}`} title={categoryTitle(cat)}>
-                        {c}
-                        {cat === "required" ? (
-                          <span className="col-marker"> *</span>
-                        ) : null}
-                      </th>
+                      <td
+                        key={c}
+                        className={`${baseClass} ${isSelectedCell ? "selected-cell" : ""}`}
+                        style={style}
+                        onClick={() => {
+                          // Single click selects the cell so right-click /
+                          // context actions and per-cell trace highlighting
+                          // know which column the user is looking at.
+                          onSelectCell?.(i, c);
+                        }}
+                        onDoubleClick={(e) => {
+                          e.stopPropagation();
+                          if (!isEditingCell) startEdit(i, c, value);
+                        }}
+                        onContextMenu={(e) => {
+                          if (!onCellContextMenu) return;
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onSelectCell?.(i, c);
+                          onCellContextMenu({
+                            rowIndex: i,
+                            column: c,
+                            x: e.clientX,
+                            y: e.clientY,
+                          });
+                        }}
+                        title={
+                          overridden ? `Original: ${original ?? ""}` : undefined
+                        }
+                      >
+                        {isEditingCell ? (
+                          <input
+                            ref={inputRef}
+                            value={draft}
+                            onChange={(e) => setDraft(e.target.value)}
+                            onBlur={commit}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                commit();
+                              } else if (e.key === "Escape") {
+                                cancel();
+                              }
+                            }}
+                            style={{
+                              width: "100%",
+                              border: "1px solid var(--accent)",
+                              outline: "none",
+                              padding: "1px 3px",
+                              font: "inherit",
+                            }}
+                          />
+                        ) : isUrl && typeof value === "string" && value ? (
+                          <a
+                            className="doc-url-icon"
+                            href={value as string}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            title="Open support document"
+                          >
+                            Open
+                          </a>
+                        ) : isUrl ? (
+                          <span className="doc-url-empty">-</span>
+                        ) : isAmount && typeof value === "number" ? (
+                          value.toFixed(2)
+                        ) : value == null ? (
+                          ""
+                        ) : (
+                          String(value)
+                        )}
+                      </td>
                     );
                   })}
                 </tr>
-              </thead>
-              <tbody>
-                {rows.map((r, i) => {
-                  if (visibleRowIndexes && !visibleRowIndexes.has(i)) return null;
-                  const reasons = r._meta?.manual_review_reasons ?? [];
-                  const isFlagged = reasons.length > 0;
-                  const rowEdits = edits[i] ?? {};
-                  const isSelected = selectedRowIndex === i;
-                  const rowClasses = [
-                    isFlagged ? "review-row" : "",
-                    isSelected ? "selected-row" : "",
-                  ]
-                    .filter(Boolean)
-                    .join(" ");
-                  const handleRowClick = () => {
-                    if (onSelectRow) onSelectRow(i);
-                  };
-                  return (
-                    <tr
-                      key={i}
-                      className={rowClasses}
-                      title={reasons.join("; ")}
-                      onClick={handleRowClick}
-                    >
-                      {visibleColumns.map((c) => {
-                        const original = (r as any)[c];
-                        const overridden = c in rowEdits;
-                        const value = overridden ? (rowEdits as any)[c] : original;
-                        const cat = categoryFor(c);
-                        const isRequired = cat === "required";
-                        const cellMissing = isRequired && isMissing(value);
-                        const isAmount = c === "Amount";
-                        const isUrl = c === "Document Url";
-                        const isEditingCell =
-                          editing?.row === i && editing?.col === c;
-
-                        const baseClass = `${isAmount ? "num" : ""} ${
-                          cellMissing ? "error-row" : ""
-                        } cell-${cat}`;
-                        const style: React.CSSProperties = {
-                          ...(cellMissing ? { background: "#ffebe9" } : null),
-                          ...(overridden && !cellMissing
-                            ? {
-                                background: "#dafbe1",
-                                outline: "1px solid #1a7f37",
-                                outlineOffset: "-1px",
-                              }
-                            : null),
-                          cursor: isEditingCell ? "text" : "cell",
-                          maxWidth: 280,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                        };
-
-                        return (
-                          <td
-                            key={c}
-                            className={baseClass}
-                            style={style}
-                            onClick={() => {
-                              if (!isEditingCell) startEdit(i, c, value);
-                            }}
-                            title={
-                              overridden
-                                ? `Original: ${original ?? ""}`
-                                : undefined
-                            }
-                          >
-                            {isEditingCell ? (
-                              <input
-                                ref={inputRef}
-                                value={draft}
-                                onChange={(e) => setDraft(e.target.value)}
-                                onBlur={commit}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter") {
-                                    e.preventDefault();
-                                    commit();
-                                  } else if (e.key === "Escape") {
-                                    cancel();
-                                  }
-                                }}
-                                style={{
-                                  width: "100%",
-                                  border: "1px solid var(--accent)",
-                                  outline: "none",
-                                  padding: "1px 3px",
-                                  font: "inherit",
-                                }}
-                              />
-                            ) : isUrl && typeof value === "string" && value ? (
-                              <a
-                                className="url-cell"
-                                href={value as string}
-                                target="_blank"
-                                rel="noreferrer"
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                {value as string}
-                              </a>
-                            ) : isAmount && typeof value === "number" ? (
-                              value.toFixed(2)
-                            ) : value == null ? (
-                              ""
-                            ) : (
-                              String(value)
-                            )}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </>
-      )}
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
+  );
+}
+
+function FunnelIcon({ active }: { active?: boolean }) {
+  return (
+    <svg
+      width="10"
+      height="10"
+      viewBox="0 0 12 12"
+      fill={active ? "currentColor" : "none"}
+      stroke="currentColor"
+      strokeWidth="1.4"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M1.5 2h9l-3.5 4.5v3.5l-2 1V6.5z" />
+    </svg>
   );
 }
 
 function categoryTitle(cat: ColumnCategory): string {
   if (cat === "required") return "Required column (must have a value)";
   if (cat === "recommended") return "Recommended column";
-  return "Optional column (hidden by default; export still uses it)";
+  return "Optional column";
+}
+
+function rowMatchesDocument(
+  row: PreviewRow,
+  ref: { filename: string; pageNumber: number },
+): boolean {
+  const sourceFile =
+    typeof row._meta?.source_file === "string" ? row._meta.source_file : "";
+  const sourcePage =
+    typeof row._meta?.source_page === "number" && Number.isFinite(row._meta.source_page)
+      ? Math.floor(row._meta.source_page)
+      : 1;
+  return sourceFile === ref.filename && sourcePage === ref.pageNumber;
 }

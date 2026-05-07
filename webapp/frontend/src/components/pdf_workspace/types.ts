@@ -20,6 +20,9 @@ export type WorkspaceMode = "native" | "workspace";
 
 export type RegionWithMeta = RegionHint;
 
+// Phase 1K — friendly display titles. The internal label stays
+// snake_case (used by the backend region store and by AI policy
+// allow-lists); only the rendered text changes.
 export const REGION_LABEL_OPTIONS: { label: RegionLabel; title: string; color: string }[] = [
   { label: "service_address", title: "Service address", color: "#0969da" },
   { label: "account_number",  title: "Account number",  color: "#bf8700" },
@@ -31,6 +34,10 @@ export const REGION_LABEL_OPTIONS: { label: RegionLabel; title: string; color: s
   { label: "ignore_zone",     title: "Ignore zone",     color: "#57606a" },
   { label: "custom",          title: "Custom",          color: "#5a3ca8" },
 ];
+
+export function friendlyRegionLabel(label: RegionLabel): string {
+  return REGION_LABEL_OPTIONS.find((o) => o.label === label)?.title || label;
+}
 
 export function colorForLabel(label: RegionLabel): string {
   return (

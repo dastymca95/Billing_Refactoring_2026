@@ -334,6 +334,11 @@ class DropboxUploader:
                                 error_kind="io",
                                 error_message=f"Unexpected share-link error: {type(e).__name__}")
 
-        # Direct-download form
+        # Legacy share links of the form ".../<file>?dl=0" get rewritten
+        # to "?dl=1" (direct download) — the original convention. The
+        # newer SCL/RLkey share links keep their trailing "&dl=0" so
+        # they open the Dropbox preview page on click; this matches the
+        # behaviour the project already uses for HWEA / Richmond / etc.
+        # and keeps every vendor's links consistent.
         url = url.replace("?dl=0", "?dl=1")
         return UploadResult(success=True, dropbox_path=dropbox_path, shared_link=url)

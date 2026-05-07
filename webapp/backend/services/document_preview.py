@@ -16,6 +16,11 @@ try:
 except ImportError:
     openpyxl = None  # type: ignore
 
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None  # type: ignore
+
 
 _MAX_PREVIEW_ROWS = 200
 _MAX_PREVIEW_COLS = 50
@@ -76,16 +81,36 @@ def preview_xlsx(path: Path) -> dict[str, Any]:
     }
 
 
+def pdf_page_count(path: Path) -> int | None:
+    """Return a PDF page count when the optional parser is available.
+
+    This is metadata only for UI navigation. Failures are non-fatal so a
+    damaged or unusually encoded PDF still uploads/renders through the normal
+    preview path instead of blocking the operator.
+    """
+    if path.suffix.lower() != ".pdf" or PdfReader is None:
+        return None
+    try:
+        reader = PdfReader(str(path))
+        return max(1, len(reader.pages))
+    except Exception:
+        return None
+
+
 def preview_metadata(path: Path) -> dict[str, Any]:
     """Fallback for binary files (PDF / image / docx). Frontend will use the
     /raw endpoint to actually render these."""
-    return {
+    out = {
         "kind": "binary",
         "filename": path.name,
         "extension": path.suffix.lower(),
         "size_bytes": path.stat().st_size,
         "note": "Preview is rendered by frontend via the /raw endpoint.",
     }
+    page_count = pdf_page_count(path)
+    if page_count is not None:
+        out["page_count"] = page_count
+    return out
 
 
 def preview_file(path: Path) -> dict[str, Any]:

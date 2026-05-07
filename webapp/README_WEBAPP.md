@@ -10,7 +10,7 @@ A simple local web UI on top of the existing Python/YAML billing logic. Drag bil
 >
 > Phase 1D rewires the workspace into a **3-column layout** (compact sidebar · collapsible document preview · ResMan template + bottom drawer for manual review), fixes the **PDF preview** (inline iframe via a new `/content` endpoint), fixes the **drag/drop bug** that caused Chrome to navigate to a dropped PDF, and adds **per-bill PDF splitting** so each ResMan row from a multi-bill PDF gets its own Dropbox link.
 >
-> Phase 1E adds **batch persistence across browser refreshes** (active `batch_id` cached in `localStorage`, restored via `GET /api/batches/{id}`), wires up a **one-click Export & Download** button, makes the preview show **every column from `Output/Template.xlsx`** (with required-column orange headers and collapsible optional columns driven by `config/resman_template_rules.yaml`), and ships a **Docker setup** (`Dockerfile.backend`, `webapp/frontend/Dockerfile`, `docker-compose.yml`, `.dockerignore`, `requirements.txt`) so the whole app boots with `docker compose up --build`. See [DOCKER_WEBAPP_README.md](../DOCKER_WEBAPP_README.md) and [WEBAPP_PHASE_1E_DOCKER_EXPORT_TEMPLATE_REPORT.md](../WEBAPP_PHASE_1E_DOCKER_EXPORT_TEMPLATE_REPORT.md).
+> Phase 1E adds **batch persistence across browser refreshes** (active `batch_id` cached in `localStorage`, restored via `GET /api/batches/{id}`), wires up a **one-click Export & Download** button, makes the preview show **every column from `Output/Template.xlsx`** (with required-column orange headers and collapsible optional columns driven by `config/resman_template_rules.yaml`), and ships a **Docker setup** (`Dockerfile.backend`, `webapp/frontend/Dockerfile`, `docker-compose.yml`, `.dockerignore`, `requirements.txt`) so the whole app boots with `docker compose up --build`. See [DOCKER_WEBAPP_README.md](../docs/DOCKER_WEBAPP_README.md) and [WEBAPP_PHASE_1E_DOCKER_EXPORT_TEMPLATE_REPORT.md](../WEBAPP_PHASE_1E_DOCKER_EXPORT_TEMPLATE_REPORT.md).
 >
 > Phase 1F onboards a **second supported vendor — Hopkinsville Water Environment Authority** — and adds a **real-time progress bar** in the sidebar. The progress bar polls `GET /api/batches/{id}/progress` every 750 ms while a batch is processing and shows the current step ("OCR page 7 of 14", "Uploading to Dropbox…", "Building ResMan preview", etc.) plus counts (files done, pages done, invoices created, rows created, warnings). See [HOPKINSVILLE_WATER_IMPLEMENTATION_REPORT.md](../HOPKINSVILLE_WATER_IMPLEMENTATION_REPORT.md).
 >
@@ -100,6 +100,80 @@ npm run dev
 ```
 
 Open http://localhost:5173 in your browser. Vite proxies `/api/*` to the backend on port 8000.
+
+### API base URL behavior
+
+- Local backend: http://localhost:8000
+- Local frontend: http://localhost:5173
+- Frontend fetch calls use relative `/api/...` URLs.
+- In Vite dev mode, `webapp/frontend/vite.config.ts` proxies `/api` to the backend. `VITE_API_BASE_URL` changes only that dev proxy target; it is not a browser runtime setting for a static build.
+- `VITE_BACKEND_PORT=8001 npm run dev` points the dev proxy at a different local backend port.
+- If you change `VITE_API_BASE_URL` or `VITE_BACKEND_PORT`, restart the Vite dev server.
+
+### Stale backend reset runbook
+
+Use this if the browser shows route errors such as `Method Not Allowed`, or if `/openapi.json` does not list current routes like `PATCH /api/batches/{batch_id}`.
+
+```powershell
+# Find backend/frontend listeners
+netstat -ano | findstr :8000
+netstat -ano | findstr :5173
+
+# Stop a stale process by PID
+taskkill /F /PID <PID>
+
+# Restart backend from the current working tree
+".\.venv\Scripts\python.exe" -m uvicorn webapp.backend.main:app --reload --port 8000
+
+# Restart frontend from webapp/frontend
+npm run dev
+
+# Back in the project root, verify health and route contract
+Invoke-RestMethod http://localhost:8000/api/health
+python scripts/verify_backend_routes.py
+
+# Inspect live OpenAPI route paths
+$o = Invoke-RestMethod http://localhost:8000/openapi.json
+$o.paths.PSObject.Properties.Name | Sort-Object
+```
+
+### Operator QA checklist
+
+Known-good local QA ports for the current web console:
+
+- Backend: http://localhost:8001
+- Frontend: http://localhost:5174
+
+Before testing UI flows, verify the running backend is current source:
+
+```powershell
+python scripts/verify_backend_routes.py
+Invoke-RestMethod http://localhost:8001/api/health
+$o = Invoke-RestMethod http://localhost:8001/openapi.json
+$o.paths.PSObject.Properties.Name | Sort-Object
+Invoke-RestMethod http://localhost:5174/api/health
+```
+
+Operator smoke checklist:
+
+| Area | Check |
+| --- | --- |
+| Batch management | Create a named QA batch, create an unnamed QA batch, rename it, switch batches from the dropdown, refresh, and delete only QA-created batches. |
+| Upload/files | Upload one PDF and one unsupported test file; confirm file cards update, unsupported files are labeled cleanly, and dropped files do not navigate the browser. |
+| Document workspace | Open a PDF, change pages, zoom, select the marking tool, choose a field label, add/delete a mark, collapse and expand the document pane. |
+| Processing | Process an unsupported-only QA batch; confirm timeline stages skip cleanly and the run completes without raw errors. Use supported vendor batches only when Dropbox side effects are intended. |
+| Template workspace | Verify Required, Issues, and All column views differ; search/filter rows; single-click selects a row; double-click edits a cell; Enter saves; Escape cancels; export uses edited rows. |
+| Issues drawer | Open/close the drawer, select an issue, show the row, open its document, mark reviewed, switch batches, and confirm stale issues do not remain. |
+| AI status | Confirm the pill says AI Off/Not Configured as appropriate, no keys are shown, and Configure AI remains a disabled placeholder. |
+| Errors/toasts | Confirm success, warning, and error states are friendly and no operator-facing message contains raw JSON such as `{"detail":"..."}`. |
+
+How to report UI bugs:
+
+1. Note the clean backend/frontend ports being used.
+2. Capture the batch id, visible action, expected result, and actual result.
+3. Check whether the issue reproduces after restarting backend and frontend.
+4. Include any browser console warning, but redact file paths, tokens, and customer-sensitive values.
+5. Run `python scripts/verify_backend_routes.py` and mention whether it passed.
 
 ### Health check (without the frontend)
 
@@ -214,7 +288,7 @@ docker compose up --build
 # frontend → http://localhost:5173   (Vite proxy → backend:8000)
 ```
 
-`webapp_data/` is bind-mounted from the host so generated batches survive container restarts. The backend image ships with Tesseract + Poppler so scanned PDFs work out of the box. See [DOCKER_WEBAPP_README.md](../DOCKER_WEBAPP_README.md) for the full guide (ports, environment, troubleshooting, production-style serving).
+`webapp_data/` is bind-mounted from the host so generated batches survive container restarts. The backend image ships with Tesseract + Poppler so scanned PDFs work out of the box. See [DOCKER_WEBAPP_README.md](../docs/DOCKER_WEBAPP_README.md) for the full guide (ports, environment, troubleshooting, production-style serving).
 
 ## Supported vendors
 
@@ -314,6 +388,297 @@ AI_PROVIDER=disabled                 # disabled | openai | anthropic | google_ge
 - Vendor processors don't yet consume `run_context["region_hints"]` — the data is wired through but Richmond / Hopkinsville don't use it yet. (Foundation only.)
 
 For full architecture details see [WEBAPP_PREMIUM_AI_PDF_WORKSPACE_PLAN.md](../WEBAPP_PREMIUM_AI_PDF_WORKSPACE_PLAN.md). For the implementation report and test results see [WEBAPP_PHASE_1H_PREMIUM_AI_WORKSPACE_REPORT.md](../WEBAPP_PHASE_1H_PREMIUM_AI_WORKSPACE_REPORT.md).
+
+## Phase 1J — Premium workspace UX
+
+Phase 1J is a UX/layout overhaul. Vendor processing logic is unchanged; CLI / Dropbox / export behave exactly as before. AI remains disabled by default. The visible product changes:
+
+### New layout
+
+```
+┌─ Topbar (52 px) ───────────────────────────────────────────────────────────┐
+│ Brand  │  Upload → Process → Review → Export    │  AI pill   Batch picker │
+├─ Nav rail ┬─ File sidebar ┬─ Document pane ┬─ Template area · Inspector ─┤
+│  📦 active │  Actions      │  Document /   │  Summary bar                 │
+│  ✅ Soon   │  Progress     │   Mark Fields │  Required / Review / Full   │
+│  📐 Soon   │  Timeline     │  PDF / CSV    │  Search · Row filter        │
+│  ↓  Soon   │  Drop zone    │   preview     │  Editable grid              │
+│  ⚙ Soon    │  File list    │               │  Issues / Selected row tabs │
+└────────────┴───────────────┴───────────────┴─────────────────────────────┘
+```
+
+### Resizable panels
+Three vertical splitters (file sidebar / document pane / inspector pane) drag-to-resize via [`useResizablePanel`](frontend/src/hooks/useResizablePanel.ts). Sizes persist per browser:
+
+| localStorage key | Default | Min – Max |
+| --- | ---: | --- |
+| `billing_refactoring_layout_sidebar_width` | 280 px | 220–460 |
+| `billing_refactoring_layout_document_width` | 480 px | 320–720 |
+| `billing_refactoring_layout_inspector_width` | 360 px | 260–560 |
+
+Double-click any divider to reset to default. Document and inspector panes can also be collapsed to a 36 px rail with a click.
+
+### Compact action bar
+Replaces the older stacked-button column. Lives at the top of the file sidebar:
+
+- **▶ Process** — primary action, disabled until files are uploaded; shows an inline spinner during processing.
+- **↓ Export** — emphasised once a preview exists; includes the unsaved edit count when relevant.
+- **More ⋯** — dropdown for Refresh preview · Reset edits · Re-download last export · Delete batch.
+
+### Workflow steps (topbar)
+A 4-step indicator: Upload → Process → Review → Export. Each step shows live state ("3 files", "12 invoices", "3 issues", "Ready") and a status colour (pending / active / complete / warning).
+
+### AI status pill
+Click the pill to open a popover. Possible labels: **AI Off** (default), **AI Not Configured**, **AI Ready**, **AI Error**, **AI…** (loading). The popover shows provider, policy, cost ceiling, what AI would help with, and a hint to configure `.env`. **No API keys are ever displayed.** No real provider call happens in this phase.
+
+### Field region workflow
+The mode toggle in the document panel header reads **Document / Mark Fields** (the implementation-detail labels "Native" and "Field regions" are gone). Switch to **Mark Fields** to draw labelled rectangles on a PDF page; coordinates are normalized 0–1 and persist via `PUT /api/batches/{id}/regions`. The PDF.js workspace lazy-loads only when this mode is opened, so the **Document** view stays cheap.
+
+If `region_hints.json` doesn't exist yet, the workspace shows a clean empty state — no more raw `404 Not Found` errors. Real server errors render a one-line message + **Retry** button.
+
+### Template review workspace
+The grid now lives inside [`TemplateWorkspace`](frontend/src/components/TemplateWorkspace.tsx) with:
+
+- **Summary bar**: Files / Invoices / Rows / Flagged / Edited / Missing link / Total.
+- **View presets**: *Required* (required + recommended only) · *Review* (adds Document Url + Reference + Description) · *Full template* (every column).
+- **Search**: matches Invoice Number / Vendor / Property / Location / Service address / Description.
+- **Row filters**: Needs review · Edited · Missing property · Missing location · Amount mismatch · Missing link.
+- **Row selection**: clicking any row highlights it and switches the inspector to **Selected row**.
+
+### Review / Inspector panel
+Replaces the old bottom-of-screen Manual Review table. Two tabs:
+
+- **Issues** — issue cards grouped by source file, each card with a severity dot, human explanation, meta pills (property / amount), and **Show row** / **Open document** actions.
+- **Selected row** — property-list view of every important field, an **Open support document** button (when `Document Url` is present), a **Provenance** section (match strategy / confidence / period source), and a **Manual review** section with help text per reason.
+
+### Export workflow
+Unchanged backend. The compact bar's Export button drives the same `/api/batches/{id}/export` flow with the editable preview state. Document Url, full Template.xlsx column set, and Dropbox links are all preserved.
+
+### Backend metadata
+Single change in this phase: `GET /api/batches/{id}/regions` returns 200 + empty list when the batch directory is missing (instead of 404). Eliminates the noisy region error in the workspace when localStorage points to a deleted batch.
+
+For full details and tests, see [WEBAPP_PHASE_1J_PREMIUM_WORKSPACE_UX_REPORT.md](../WEBAPP_PHASE_1J_PREMIUM_WORKSPACE_UX_REPORT.md).
+
+## Phase 1K — Visual system + workspace refinement
+
+Phase 1K refines the look and feel without changing the workflow Phase 1J introduced. Vendor processing, CLI, Dropbox, export, and AI safety guarantees are unchanged. Highlights:
+
+### Toasts replace persistent banners
+Status messages (batch restored, processed N files, exported, renamed, switched, etc.) now appear as compact bottom-right **toasts** instead of a column-eating green panel. They auto-dismiss after 4 s (6 s for processing summaries) and stack so back-to-back events aren't lost.
+
+### View presets (in topbar)
+Three workspace presets, persisted to `localStorage["billing_refactoring_layout_view_preset"]`:
+
+| Preset | Effect |
+| --- | --- |
+| **Review** *(default)* | Document + Template + Inspector all visible |
+| **Template** | Doc and Inspector collapsed; the template grid takes the whole screen |
+| **Document** | Document marking — wider PDF workspace |
+
+The actual collapsing flows through the same collapse states the Phase 1J rail buttons control; resizable widths still persist independently.
+
+### Mark reviewed (browser-session)
+Each issue card in the Review / Inspector panel now has a **Mark reviewed** action. Reviewed cards are visibly de-emphasised so the operator can see what they've already worked through. **The state is browser-session only** — reloading clears it, and the underlying `manual_review_reasons` value is never modified.
+
+### Friendlier copy
+- Region tags display **Service address / Account number / Total amount / …** (snake_case stays internally).
+- Vendor pills show **Richmond / Hopkinsville** instead of full snake_case keys.
+- Disabled nav rail items lost their visible "Soon" badge — they're still present (slightly muted) and the tooltip explains "coming later".
+- The verbose "Click any cell to edit…" banner above the grid is gone.
+
+### File-type badges
+Each file row in the sidebar now carries a small per-type badge (PDF / CSV / XLSX / Image) with a soft tone matching the type. Selected file gets a 2-px accent stripe on the inner left edge.
+
+### Document Url
+Long URLs no longer steal column width. Each row shows a compact **↗ Open** chip (or a muted `—` when no URL is present).
+
+### AI status meanings
+The AI pill never says **AI Error** unless the `/api/ai/status` request actually fails. Possible labels (and what they mean):
+
+| Label | Meaning |
+| --- | --- |
+| **AI Off** | `provider=disabled` (default). App runs rules + OCR + YAML only. |
+| **AI Not Configured** | Provider chosen, but no API key. |
+| **AI Ready** | Master switch on, key present. AI may suggest values when rules confidence is low. |
+| **AI Error** | The status fetch itself failed. |
+| **AI…** | Loading. |
+
+Click the pill to open a popover with provider, policy, cost ceiling, and what AI would help with. **No API keys are ever returned or displayed.** No real provider call happens in this phase.
+
+### Visual system at a glance
+Refined CSS variables (warmer neutral background `#f3f5f8`, softer borders `#d8dee4` / `#eef0f3`, slightly cooler accent `#2563eb`), declared spacing scale (`--space-1` through `--space-5`), declared radius scale (`--radius-sm` through `--radius-lg`), three shadow tiers, antialiased fonts at 13 px base.
+
+For full details and tests, see [WEBAPP_PHASE_1K_VISUAL_SYSTEM_REFINEMENT_REPORT.md](../WEBAPP_PHASE_1K_VISUAL_SYSTEM_REFINEMENT_REPORT.md).
+
+## Phase 1L — Product UI simplification
+
+Phase 1L removes visual noise so the app stops feeling like an admin console. Backend, processors, CLI, and AI safety guarantees are unchanged. Highlights:
+
+### Issues drawer (replaces the fixed right inspector pane)
+The right-side review panel that used to claim a permanent column is gone. In its place:
+
+- A small **Issues** pill in the topbar shows the current count: **N issues** (warn/error tone) or **No issues** (clean, green).
+- Clicking the pill slides a right-side **drawer** in over the workspace. The drawer reuses the same issue cards and per-issue **Mark reviewed** behaviour from Phase 1K.
+- The drawer closes via the X icon, **Escape**, or clicking the dimmed backdrop. It overlays — never steals width from — the template grid.
+
+### No more visible "Collapse" / "Expand" labels
+Every panel collapse button is now a **chevron icon button** with a `title=` tooltip ("Collapse panel" / "Expand panel"). The text labels are gone.
+
+### Compact workflow strip
+The 1-2-3-4 numbered circles were replaced with a single rounded **status strip**:
+
+```
+●  Upload · 4 files  ›  ●  Process · 12 invoices  ›  ▲  Review · 3 issues  ›  ●  Export · Ready
+```
+
+Each step has a coloured dot, a label, and a small detail. The whole strip is informational — clicks don't navigate.
+
+### View presets
+The topbar segmented switcher dropped its "VIEW" prefix and renamed the presets:
+
+| Preset | Effect |
+| --- | --- |
+| **Review** *(default)* | Document and Template both visible |
+| **Template focus** | Document collapsed; Template fills the screen |
+| **Document focus** | Wider document workspace for marking |
+
+The Issues drawer is a separate explicit action — opening / closing it is no longer tied to the preset.
+
+### AI status meanings
+The AI pill now distinguishes deployment-config issues from runtime failures so the operator never sees a misleading "AI Error":
+
+| Pill | Meaning |
+| --- | --- |
+| **AI Off** *(default)* | `provider=disabled`, OR the `/api/ai/status` request itself didn't reach the backend. App runs rules + OCR + YAML only. |
+| **AI Not Configured** | A provider is selected but no API key is set yet. |
+| **AI Ready** | Master switch on, key present. AI may suggest values when rules confidence is low. |
+| **AI Error** | A real provider runtime error occurred. *(Currently unreachable — no real provider calls fire in this phase.)* |
+| **AI…** | Loading. |
+
+The popover keeps a friendly first sentence ("AI assist is currently off…"); `.env` configuration details live in a collapsed `Configuration` section so they don't dominate the popover.
+
+### Document marks terminology
+Region labels (Service address / Account number / Total amount / etc.) display in friendly form throughout the UI; backend keys remain snake_case. The mode toggle reads **Document / Mark** (no more "Native" / "Field regions").
+
+### Resizable splitter bug fix
+Dragging the divider between the document and template panes used to occasionally keep resizing after the mouse was released. Phase 1L rewrites the resize hook to use Pointer Events + `setPointerCapture` + an `e.buttons === 0` hard guard + window-level safety nets for `blur` / `visibilitychange` / `mouseleave`. See [WEBAPP_PHASE_1L_RESIZER_BUGFIX_REPORT.md](../WEBAPP_PHASE_1L_RESIZER_BUGFIX_REPORT.md) for full root cause and tests.
+
+### Mouse / keyboard / pointer behaviour summary
+- **Drag a divider:** hold left mouse button down, move pointer, release to commit. Double-click a divider to reset its panel to the default size.
+- **Open Issues:** click the topbar pill. Escape closes.
+- **Mark an issue reviewed:** click **Mark reviewed** inside an issue card (browser-session only — refresh clears it).
+- **Switch view preset:** click Review / Template focus / Document focus in the topbar.
+
+For full details and tests, see [WEBAPP_PHASE_1L_PRODUCT_UI_SIMPLIFICATION_REPORT.md](../WEBAPP_PHASE_1L_PRODUCT_UI_SIMPLIFICATION_REPORT.md).
+
+## Phase 1N — Processing Control + Interaction Cleanup
+
+Phase 1N adds Stop / Cancel for active runs, fixes click-to-edit, simplifies the topbar, and refines AI / column-view copy. The CLI and vendor processors stay byte-identical when invoked without the new optional kwargs.
+
+### Stopping a running batch
+- Click **Process** to kick off a run.
+- While processing, a **Stop** button appears next to the Process button (`btn-danger` style).
+- Clicking Stop confirms ("Stop processing this batch?") and posts to `POST /api/batches/{id}/cancel`.
+- The vendor processor checks for cancellation **between files**. The current file finishes, then the run halts. No threads are killed forcibly; partial output stays consistent.
+- The button label switches to **Cancelling…** while the worker drains. Once stopped, status flips to `cancelled` and the operator can re-run.
+- A "Processing cancelled" toast surfaces; partial preview (if any) is loaded so the operator can inspect what completed.
+
+### Table edit behaviour
+- **Single click** on a row selects it (highlights in accent-soft, drives the inspector if open).
+- **Double click** on a cell opens its editor.
+- Edit shortcuts unchanged: **Enter** commits, **Escape** cancels, **blur** commits.
+- Edited cells keep the green outline; export still uses edited values.
+
+### Loading & batch switching
+- Switching batches from the sidebar surfaces a brief **"Loading batch…"** toast so the operator sees something is happening before the new payload paints.
+- Document preview loading still uses the lazy-loaded PDF.js workspace; render tasks are cancelled when the file changes (Phase 1H carry-over).
+- Polling status terminal states now include `cancelled` alongside `completed` / `failed`.
+
+### Column views
+| Button | What it shows | Tooltip |
+| --- | --- | --- |
+| **Required** | Required + recommended columns only | "The core fields needed for ResMan import." |
+| **Issues** | Required + recommended + Document Url + Reference + Description | "Most useful for fixing flagged rows." |
+| **All** | Every column from `Output/Template.xlsx` | "Every column from the official ResMan Template.xlsx." |
+
+The label `Columns:` sits in front of the segmented buttons so the affordance is obvious.
+
+### AI status (refined copy)
+The popover leads with a friendly message — *"AI assist is currently off. The app is using rules, OCR, YAML, and validation only."* — followed by `Status / Provider / Mode` rows, the allowed-tasks list, a disabled **Configure AI** button (placeholder for a future Settings menu), and a collapsed *Developer setup* `<details>` block with the `.env` instructions for the technical user. **No API keys** are returned by `/api/ai/status` or shown anywhere in the UI.
+
+### Topbar simplification
+The "Review · Template focus · Document focus" segmented switcher was removed from the topbar. Panel collapse buttons + Process/Stop/Export/Issues already cover the same ground. The internal preset state is preserved so a future Settings menu can resurrect the switcher.
+
+### Brand mark
+The `BR` text block in the nav rail was replaced with a small **bill** icon (document outline + lines). Reads as "billing app" without needing wordmark text.
+
+### New backend endpoint
+`POST /api/batches/{batch_id}/cancel` →
+
+| Result | Status |
+| --- | --- |
+| Tracker registered (active run) | 200 + `{status: "cancelling"}` |
+| No active run for this batch | 200 + `{status: "no_active_run"}` |
+| Batch directory missing | 404 |
+
+For full details and tests, see [`docs/reports/phases/WEBAPP_PHASE_1N_PROCESSING_CONTROL_RENDERING_STABILITY_REPORT.md`](../docs/reports/phases/WEBAPP_PHASE_1N_PROCESSING_CONTROL_RENDERING_STABILITY_REPORT.md).
+
+## Phase 1O — Smooth progress + stable document rendering
+
+Phase 1O fixes two perceived-performance bugs:
+
+### Progress bar no longer freezes at 5 %
+The OCR loop in `utils/pdf_text_extractor.py` now emits a per-page progress callback. The Hopkinsville processor wires this into a `_ocr_progress` closure that maps `(done, total, label)` into the first half of the file's percent slice; the per-page parser claims the second half. A 14-page scanned PDF that previously sat at 5 % until OCR finished now moves smoothly through OCR (≈3–5 s per page → one bar update per page) into parse → into completion. The progress label reads:
+
+```
+2629 KENWOOD DR.pdf — Rasterising for OCR…
+2629 KENWOOD DR.pdf — OCR page 4 of 14…
+2629 KENWOOD DR.pdf — OCR page 4 of 14 done
+…
+Parsing 2629 KENWOOD DR.pdf — page 4 of 14
+```
+
+The frontend's progress polling cadence dropped from 750 ms to 500 ms so the visible bar moves with each backend tick.
+
+### Document workspace no longer flickers
+`PdfPageCanvas` was rewritten:
+
+- **Stable callback ref**: `onPageRendered` is held in a `useRef` instead of a dependency, so unrelated parent re-renders (toasts, progress polls, issue updates) never restart the canvas effect.
+- **Per-tab document cache**: opening different pages of the same PDF reuses the parsed pdf.js document. Cap: 4 most-recent documents.
+- **Offscreen render + atomic blit**: each new frame paints into a hidden canvas first; only when it's fully painted is the visible canvas resized and the buffer drawn onto it. No white flash.
+- **Delayed polished overlay**: the loading state appears only after a 250 ms threshold (so fast page navs never flash) and uses a translucent + backdrop-blur layer with a dot-pulse animation and the friendly label *"Loading document…"*. The raw `Rendering…` text is gone.
+- **Cancelled renders are honored**: switching files / pages mid-render cleanly stops the in-flight pdf.js task without painting stale output.
+
+For full root cause and tests, see [`docs/reports/phases/WEBAPP_PHASE_1O_SMOOTH_PROGRESS_AND_RENDERING_REPORT.md`](../docs/reports/phases/WEBAPP_PHASE_1O_SMOOTH_PROGRESS_AND_RENDERING_REPORT.md).
+
+## Phase 1P — Batch management UX + action placement
+
+### Creating a batch
+Click **+ New batch** in the file sidebar. The modal asks for an optional name and the document mode (Auto-detect / Digital / Scanned / Mixed / CSV-Excel). The supplied name is persisted in `webapp_data/batches/<batch_id>/batch_metadata.json` and surfaces immediately in the sidebar header and the recent-batches dropdown.
+
+### Renaming a batch
+Click the dots menu in the file sidebar's batch header → **Rename batch**. An app-native modal prefills with the current name; **Enter** saves, **Escape** cancels. Empty / over-80-character names show an inline red error in the field. Backend errors (404 / 400) surface in the same inline error label — no `window.prompt`, no giant red workspace banner.
+
+The backend endpoint is `PATCH /api/batches/{batch_id}` with body `{"batch_name": "..."}`. If you ever see an HTTP 405 in the dev console, restart the FastAPI backend — the PATCH route was added in Phase 1H, and a stale running backend won't have it.
+
+### Where actions live
+- **Process** + **Stop** + **More** menu (Refresh preview / Reset edits / Re-download last export / Delete batch): file sidebar action bar.
+- **Export**: template workspace summary bar (right edge, next to the Total). Visible only once a preview has rows. The button reads `Export` or `Export (N)` when there are unsaved edits.
+
+This split mirrors the conceptual layout: **Process** acts on the uploaded files (file sidebar); **Export** acts on the template (template workspace).
+
+### Error surfacing
+Rename / switch-batch / create-batch / processing failures now surface as **toast notifications** (bottom-right). Detailed error text goes to the browser console for developers. A persistent banner is reserved for two cases — backend unreachable on app start and a preview that couldn't be restored after a refresh.
+
+### Custom names — verified
+Names typed into the modals end up in `batch_metadata.json` and surface in:
+- the file sidebar batch header (primary line)
+- the batch dropdown (primary line)
+- toast confirmations after rename / create
+
+If a metadata file is missing the `batch_name` field (legacy batches from very early phases), the UI falls back to the `batch_id` so nothing is unlabelled.
+
+For full root cause + tests, see [`docs/reports/phases/WEBAPP_PHASE_1P_BATCH_MANAGEMENT_UX_REPORT.md`](../docs/reports/phases/WEBAPP_PHASE_1P_BATCH_MANAGEMENT_UX_REPORT.md).
 
 ## Things this Phase **does NOT** do
 

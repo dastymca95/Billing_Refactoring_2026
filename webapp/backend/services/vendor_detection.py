@@ -103,16 +103,290 @@ def _looks_like_hopkinsville_water(path: Path) -> tuple[bool, float, str]:
     return False, 0.0, ""
 
 
+def _looks_like_columbia_power_and_water(path: Path) -> tuple[bool, float, str]:
+    """Detect Columbia Power and Water System PDFs.
+
+    Strong signals (no OCR — we keep detection cheap):
+      * filename hint: ``columbia`` substring (low signal, since other
+        vendors share the city name).
+      * PDF text-layer scan: page 1 contains "COLUMBIA POWER", "cpws.com",
+        the CPWS phone number, or the literal "(931) 388-4833". Any of
+        these is decisive.
+    """
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    name_lower = path.name.lower()
+    fname_hint = "columbia" in name_lower or "cpws" in name_lower
+    text_sample = ""
+    try:
+        import pdfplumber  # type: ignore
+        with pdfplumber.open(path) as pdf:
+            if pdf.pages:
+                text_sample = (pdf.pages[0].extract_text() or "")[:3000]
+    except Exception:
+        text_sample = ""
+    text_lower = text_sample.lower()
+    has_cpws_kw = (
+        "columbia power" in text_lower
+        or "cpws.com" in text_lower
+        or "(931) 388-4833" in text_sample
+    )
+    if has_cpws_kw:
+        return True, 0.95, "PDF text mentions Columbia Power & Water Systems / cpws.com"
+    if fname_hint and not text_sample:
+        return True, 0.6, "PDF filename hints Columbia (scanned, OCR will confirm)"
+    return False, 0.0, ""
+
+
+def _looks_like_atmos_energy_auto_pay(path: Path) -> tuple[bool, float, str]:
+    """Detect Atmos Energy Auto Pay PDFs.
+
+    Strong signals (cheap, no OCR):
+      * filename hint: ``atmos`` substring (low signal — generic).
+      * PDF text-layer: page 1 mentions "ATMOS ENERGY",
+        "atmosenergy.com", or the customer-service phone number
+        ``1-888-286-6700``. Any one of those is decisive.
+    """
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    name_lower = path.name.lower()
+    fname_hint = "atmos" in name_lower
+    text_sample = ""
+    try:
+        import pdfplumber  # type: ignore
+        with pdfplumber.open(path) as pdf:
+            if pdf.pages:
+                text_sample = (pdf.pages[0].extract_text() or "")[:3000]
+    except Exception:
+        text_sample = ""
+    text_lower = text_sample.lower()
+    has_atmos_kw = (
+        "atmos energy" in text_lower
+        or "atmosenergy.com" in text_lower
+        or "1-888-286-6700" in text_sample
+        or "1-866-322-8667" in text_sample
+    )
+    if has_atmos_kw:
+        return True, 0.95, "PDF text mentions Atmos Energy / atmosenergy.com"
+    if fname_hint and not text_sample:
+        return True, 0.6, "PDF filename hints Atmos (scanned, OCR will confirm)"
+    return False, 0.0, ""
+
+
+def _looks_like_hardin_county_water(path: Path) -> tuple[bool, float, str]:
+    """Detect Hardin County Water District No. 2 PDFs (digital + scanned).
+
+    For digital PDFs the text layer carries "Hardin County Water
+    District No. 2" / "hcwd2.org" / the office phone "270.737.1056".
+    Scanned PDFs return empty text via the cheap pdfplumber probe;
+    those are accepted on a filename hint at lower confidence — OCR
+    will confirm during processing.
+    """
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    name_lower = path.name.lower()
+    # UUID-named scanned bills (e.g. ``57b63f7e-0a96-4029-9976-9f38a9e125ff.pdf``)
+    # are produced by HCWD2's scan-import workflow; they're a reliable
+    # filename-only hint for this vendor.
+    is_uuid_filename = bool(
+        re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.pdf$",
+                 name_lower)
+    )
+    fname_hint = (
+        "hardin" in name_lower
+        or "hcwd2" in name_lower
+        or "billprint" in name_lower
+        or is_uuid_filename
+    )
+    text_sample = ""
+    try:
+        import pdfplumber  # type: ignore
+        with pdfplumber.open(path) as pdf:
+            if pdf.pages:
+                text_sample = (pdf.pages[0].extract_text() or "")[:3000]
+    except Exception:
+        text_sample = ""
+    text_lower = text_sample.lower()
+    has_hcwd2_kw = (
+        "hardin county water" in text_lower
+        or "hcwd2.org" in text_lower
+        or "270.737.1056" in text_sample
+        or "270.737.2301" in text_sample
+    )
+    if has_hcwd2_kw:
+        return True, 0.95, "PDF text mentions Hardin County Water District / hcwd2.org"
+    if fname_hint and not text_sample:
+        return True, 0.7, "PDF filename hints HCWD2 (scanned, OCR will confirm)"
+    return False, 0.0, ""
+
+
+def _looks_like_shelbyville_power(path: Path) -> tuple[bool, float, str]:
+    """Detect Shelbyville Power System PDFs.
+
+    Strong signals (cheap, no OCR):
+      * filename hint: bills are named with the bill sequence number
+        (e.g. ``2903088.pdf``); on its own that's too generic, but
+        when the sibling text-layer probe also returns "Shelbyville
+        Power" we lock it in.
+      * PDF text-layer: page 1 mentions "SHELBYVILLE POWER SYSTEM",
+        "shelbyvillepower.com", or the customer-service phone numbers.
+
+    Note: many Shelbyville PDFs ship with malformed MediaBox metadata
+    that pdfplumber can't open. The shared text extractor falls back
+    to PyPDF2 transparently, but the cheap probe used here also has
+    to be tolerant — we wrap it in try/except and fall through to
+    the filename hint when extraction throws."""
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    name_lower = path.name.lower()
+    fname_hint = "shelbyville" in name_lower
+    text_sample = ""
+    try:
+        import pdfplumber  # type: ignore
+        with pdfplumber.open(path) as pdf:
+            if pdf.pages:
+                text_sample = (pdf.pages[0].extract_text() or "")[:3000]
+    except Exception:
+        # Malformed MediaBox; try PyPDF2 directly for the probe.
+        try:
+            import PyPDF2  # type: ignore
+            with open(path, "rb") as fh:
+                reader = PyPDF2.PdfReader(fh)
+                if reader.pages:
+                    text_sample = (reader.pages[0].extract_text() or "")[:3000]
+        except Exception:
+            text_sample = ""
+    text_lower = text_sample.lower()
+    has_kw = (
+        "shelbyville power system" in text_lower
+        or "shelbyvillepower.com" in text_lower
+        or "931-684-7171" in text_sample
+        or "(866)-784-0063" in text_sample
+    )
+    if has_kw:
+        return True, 0.95, "PDF text mentions Shelbyville Power System / shelbyvillepower.com"
+    if fname_hint and not text_sample:
+        return True, 0.6, "PDF filename hints Shelbyville (probe failed, processor will retry)"
+    return False, 0.0, ""
+
+
 # Order matters: first detector to claim ownership wins.
+def _looks_like_zillow_rentals(path: Path) -> tuple[bool, float, str]:
+    """Detect Zillow Rentals invoices.
+
+    Strong signals:
+      * filename hint: Zillow's e-mailed invoices are named
+        ``INV<digits>.pdf``.
+      * PDF text-layer: page 1 mentions "Zillow Rentals" / "Zillow,
+        Inc." / "zillow.com/rental-manager".
+    """
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    name_lower = path.name.lower()
+    fname_hint = bool(re.match(r"^inv\d{6,12}\.pdf$", name_lower)) or "zillow" in name_lower
+    text_sample = ""
+    try:
+        import pdfplumber  # type: ignore
+        with pdfplumber.open(path) as pdf:
+            if pdf.pages:
+                text_sample = (pdf.pages[0].extract_text() or "")[:3000]
+    except Exception:
+        text_sample = ""
+    text_lower = text_sample.lower()
+    has_kw = (
+        "zillow rentals" in text_lower
+        or "zillow, inc" in text_lower
+        or "zillow.com/rental-manager" in text_lower
+        or "rentalpartners@zillowgroup.com" in text_lower
+    )
+    if has_kw:
+        return True, 0.95, "PDF text mentions Zillow Rentals / Zillow, Inc."
+    if fname_hint and not text_sample:
+        return True, 0.6, "PDF filename hints Zillow (probe failed)"
+    return False, 0.0, ""
+
+
+def _looks_like_pennyrile_electric(path: Path) -> tuple[bool, float, str]:
+    """Detect Pennyrile Rural Electric Coop Corp (PRECC) PDFs.
+
+    Strong signals from the PDF text layer:
+      * "PENNYRILE RURAL ELECTRIC COOP CORP" anywhere in the body or
+        the receipt strip.
+      * "precc.com" / "outage.precc.com" links.
+      * Hopkinsville KY 42241 PO Box 2900 office address.
+    """
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    text_sample = ""
+    try:
+        import pdfplumber  # type: ignore
+        with pdfplumber.open(path) as pdf:
+            if pdf.pages:
+                text_sample = (pdf.pages[0].extract_text() or "")[:3000]
+    except Exception:
+        text_sample = ""
+    if not text_sample:
+        return False, 0.0, ""
+    compact = re.sub(r"\s+", "", text_sample).upper()
+    if "PENNYRILERURALELECTRICCOOPCORP" in compact:
+        return True, 0.95, "PDF text mentions Pennyrile Rural Electric Coop Corp"
+    if "PRECC.COM" in compact and "POBOX2900" in compact and "HOPKINSVILLE" in compact:
+        return True, 0.9, "PDF text matches PRECC office signature"
+    return False, 0.0, ""
+
+
+def _looks_like_mcminnville_electric(path: Path) -> tuple[bool, float, str]:
+    """Detect McMinnville Electric System (MES) PDFs.
+
+    Strong signals from the PDF text layer:
+      * "MCMINNVILLE ELECTRIC SYSTEM" header (case-insensitive after
+        whitespace stripping — pdfplumber sometimes joins letters).
+      * Address line "200 W. Morford Street" / "MCMINNVILLE TN".
+      * Phone (931) 473-3144.
+    """
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    text_sample = ""
+    try:
+        import pdfplumber  # type: ignore
+        with pdfplumber.open(path) as pdf:
+            if pdf.pages:
+                text_sample = (pdf.pages[0].extract_text() or "")[:3000]
+    except Exception:
+        text_sample = ""
+    if not text_sample:
+        return False, 0.0, ""
+    compact = re.sub(r"\s+", "", text_sample).upper()
+    if "MCMINNVILLEELECTRICSYSTEM" in compact:
+        return True, 0.95, "PDF text mentions McMinnville Electric System"
+    if "(931)473-3144" in compact and "MORFORDSTREET" in compact:
+        return True, 0.9, "PDF text matches MES office address + phone"
+    return False, 0.0, ""
+
+
 _DETECTORS: list[tuple[str, Callable[[Path], tuple[bool, float, str]]]] = [
     ("richmond_utilities", _looks_like_richmond_utilities),
     ("hopkinsville_water_environment_authority", _looks_like_hopkinsville_water),
+    ("columbia_power_and_water_system", _looks_like_columbia_power_and_water),
+    ("atmos_energy_auto_pay", _looks_like_atmos_energy_auto_pay),
+    ("hardin_county_water_district_no_2", _looks_like_hardin_county_water),
+    ("shelbyville_power_system", _looks_like_shelbyville_power),
+    ("zillow_rentals", _looks_like_zillow_rentals),
+    ("mcminnville_electric_system", _looks_like_mcminnville_electric),
+    ("pennyrile_electric", _looks_like_pennyrile_electric),
 ]
 
 
 SUPPORTED_VENDOR_KEYS = {
     "richmond_utilities",
     "hopkinsville_water_environment_authority",
+    "columbia_power_and_water_system",
+    "atmos_energy_auto_pay",
+    "hardin_county_water_district_no_2",
+    "shelbyville_power_system",
+    "zillow_rentals",
+    "mcminnville_electric_system",
+    "pennyrile_electric",
 }
 
 

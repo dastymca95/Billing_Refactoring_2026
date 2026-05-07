@@ -98,6 +98,69 @@ def _import_hopkinsville_processor():
     return importlib.import_module("process_hopkinsville_water_environment_authority")
 
 
+def _import_columbia_processor():
+    """Import the Columbia Power and Water System processor module."""
+    vendor_folder = (PROJECT_ROOT / "Training Bills_Invoices" / "Electricity - Power"
+                     / "Columbia Power and Water System").resolve()
+    if str(vendor_folder) not in sys.path:
+        sys.path.insert(0, str(vendor_folder))
+    return importlib.import_module("process_columbia_power_and_water_system")
+
+
+def _import_atmos_processor():
+    """Import the Atmos Energy Auto Pay processor module."""
+    vendor_folder = (PROJECT_ROOT / "Training Bills_Invoices" / "Gas"
+                     / "Atmos Energy Auto Pay").resolve()
+    if str(vendor_folder) not in sys.path:
+        sys.path.insert(0, str(vendor_folder))
+    return importlib.import_module("process_atmos_energy_auto_pay")
+
+
+def _import_hardin_processor():
+    """Import the Hardin County Water District No. 2 processor module."""
+    vendor_folder = (PROJECT_ROOT / "Training Bills_Invoices" / "Water - Sewer"
+                     / "Hardin County Water District No. 2").resolve()
+    if str(vendor_folder) not in sys.path:
+        sys.path.insert(0, str(vendor_folder))
+    return importlib.import_module("process_hardin_county_water_district_no_2")
+
+
+def _import_shelbyville_processor():
+    """Import the Shelbyville Power System processor module."""
+    vendor_folder = (PROJECT_ROOT / "Training Bills_Invoices" / "Electricity - Power"
+                     / "Shelbyville Power System").resolve()
+    if str(vendor_folder) not in sys.path:
+        sys.path.insert(0, str(vendor_folder))
+    return importlib.import_module("process_shelbyville_power_system")
+
+
+def _import_zillow_processor():
+    """Import the Zillow Rentals processor module."""
+    vendor_folder = (PROJECT_ROOT / "Training Bills_Invoices" / "Marketing - Advertising"
+                     / "Zillow Rentals").resolve()
+    if str(vendor_folder) not in sys.path:
+        sys.path.insert(0, str(vendor_folder))
+    return importlib.import_module("process_zillow_rentals")
+
+
+def _import_mcminnville_processor():
+    """Import the McMinnville Electric System processor module."""
+    vendor_folder = (PROJECT_ROOT / "Training Bills_Invoices" / "Electricity - Power"
+                     / "McMinnville Electric System").resolve()
+    if str(vendor_folder) not in sys.path:
+        sys.path.insert(0, str(vendor_folder))
+    return importlib.import_module("process_mcminnville_electric_system")
+
+
+def _import_pennyrile_processor():
+    """Import the Pennyrile Electric processor module."""
+    vendor_folder = (PROJECT_ROOT / "Training Bills_Invoices" / "Electricity - Power"
+                     / "Pennyrile Electric").resolve()
+    if str(vendor_folder) not in sys.path:
+        sys.path.insert(0, str(vendor_folder))
+    return importlib.import_module("process_pennyrile_electric")
+
+
 # vendor_key → (loader, entrypoint_name)
 _PROCESSOR_LOADERS: dict[str, tuple[Any, str]] = {
     "richmond_utilities": (_import_richmond_processor,
@@ -106,14 +169,63 @@ _PROCESSOR_LOADERS: dict[str, tuple[Any, str]] = {
         _import_hopkinsville_processor,
         "process_hopkinsville_water_environment_authority_batch",
     ),
+    "columbia_power_and_water_system": (
+        _import_columbia_processor,
+        "process_columbia_power_and_water_system_batch",
+    ),
+    "atmos_energy_auto_pay": (
+        _import_atmos_processor,
+        "process_atmos_energy_auto_pay_batch",
+    ),
+    "hardin_county_water_district_no_2": (
+        _import_hardin_processor,
+        "process_hardin_county_water_district_no_2_batch",
+    ),
+    "shelbyville_power_system": (
+        _import_shelbyville_processor,
+        "process_shelbyville_power_system_batch",
+    ),
+    "zillow_rentals": (
+        _import_zillow_processor,
+        "process_zillow_rentals_batch",
+    ),
+    "mcminnville_electric_system": (
+        _import_mcminnville_processor,
+        "process_mcminnville_electric_system_batch",
+    ),
+    "pennyrile_electric": (
+        _import_pennyrile_processor,
+        "process_pennyrile_electric_batch",
+    ),
 }
 
 
 # ---------------------------------------------------------------------------
 # Per-batch processing entrypoint
 # ---------------------------------------------------------------------------
-def process_batch(batch_id: str) -> dict[str, Any]:
+def process_batch(
+    batch_id: str,
+    *,
+    dry_run: bool = False,
+    rules_override_paths: dict[str, "Path"] | None = None,
+) -> dict[str, Any]:
     """Run the appropriate vendor processor over every file in the batch.
+
+    Phase 2A — adds two opt-in flags for the Vendor Rules Studio's
+    "Test against batch" feature:
+
+      * ``dry_run=True``   — propagated into ``run_context["dry_run"]``.
+        Vendor processors that honour the flag skip Dropbox uploads and
+        ResMan workbook writes; everything else runs identically. The
+        webapp's preview cache (``_webapp_result.json``) is the caller's
+        responsibility — this function never writes it (the API layer
+        does, and skips it for dry-run calls).
+      * ``rules_override_paths``  — ``{vendor_key: Path}`` mapping. When a
+        vendor has an entry, that path is used as ``config_path`` instead
+        of ``config/vendors/<vendor_key>.yaml``. The processor still calls
+        ``yaml.safe_load()`` exactly the way the CLI does, so the rule
+        loader is unchanged. Caller is responsible for cleaning up the
+        temp files.
 
     Returns a dict shaped roughly like:
         {
@@ -127,8 +239,10 @@ def process_batch(batch_id: str) -> dict[str, Any]:
 
     Side-effect: writes a per-batch progress snapshot at
     `webapp_data/batches/<id>/progress.json` so the frontend can poll
-    `GET /api/batches/<id>/progress` while the batch runs.
+    `GET /api/batches/<id>/progress` while the batch runs. (The progress
+    file is written even on dry-run calls; nothing else on disk changes.)
     """
+    rules_override_paths = rules_override_paths or {}
     bdir = batch_store.get_batch_dir(batch_id)
     in_dir = batch_store.get_input_dir(batch_id)
     processed_dir = batch_store.get_processed_dir(batch_id)
@@ -161,6 +275,13 @@ def process_batch(batch_id: str) -> dict[str, Any]:
         tracker.declare_stages(_DEFAULT_STAGES)
         tracker.update(status="processing", files_total=len(files),
                        current_step="Detecting vendors…", percent=1.0)
+        # Phase 1N — register the tracker so the /cancel endpoint can
+        # flag it without round-tripping through the filesystem.
+        try:
+            from . import cancel_registry
+            cancel_registry.register(batch_id, tracker)
+        except Exception:
+            pass
         # Upload stage was actually completed before we got here (the
         # files are already on disk), so flip it green right away.
         tracker.complete_stage("upload", detail=f"{len(files)} file(s)")
@@ -169,6 +290,13 @@ def process_batch(batch_id: str) -> dict[str, Any]:
     except Exception:
         tracker = None
         progress_callback = None
+
+    # Phase 1N — cooperative cancellation hook. Vendor processors that
+    # accept `should_cancel_callback` poll this between files / pages.
+    # CLI runs (no tracker) get a no-op that always returns False so
+    # behaviour is identical to today.
+    def should_cancel() -> bool:
+        return tracker is not None and tracker.is_cancel_requested()
 
     # Group files by detected vendor.
     grouped: dict[str, list[Path]] = {}
@@ -193,6 +321,10 @@ def process_batch(batch_id: str) -> dict[str, Any]:
         tracker.update(current_step=f"Routing files to {len(grouped)} vendor(s)…", percent=3.0)
 
     for vendor_key, vfiles in grouped.items():
+        # Phase 1N — bail before each vendor if cancellation was requested
+        # while a previous vendor was running.
+        if should_cancel():
+            break
         if vendor_key not in _PROCESSOR_LOADERS:
             for f in vfiles:
                 unsupported.append({
@@ -239,7 +371,12 @@ def process_batch(batch_id: str) -> dict[str, Any]:
             tracker.update(current_step=f"Processing {len(vfiles)} {vendor_key} file(s)…",
                            percent=5.0)
 
-        config_path = VENDORS_DIR / f"{vendor_key}.yaml"
+        # Phase 2A — Rules Studio impact preview: caller can pass an
+        # alternate YAML path per vendor so we test draft rules without
+        # touching the on-disk file.
+        config_path = rules_override_paths.get(vendor_key) or (
+            VENDORS_DIR / f"{vendor_key}.yaml"
+        )
         # Pass progress_callback when the processor accepts it. Older
         # processors that don't will get a TypeError at call time — we
         # introspect the signature to stay backwards compatible.
@@ -264,6 +401,10 @@ def process_batch(batch_id: str) -> dict[str, Any]:
                 r for r in region_hints
                 if (r.get("file_id") or "") in {f.name for f in vfiles}
             ],
+            # Phase 2A — vendor processors that honour this skip Dropbox
+            # uploads and Excel writes. Default False keeps CLI + normal
+            # webapp runs identical to today.
+            "dry_run": dry_run,
         }
         kwargs: dict[str, Any] = {
             "input_folder": vendor_in,
@@ -276,8 +417,15 @@ def process_batch(batch_id: str) -> dict[str, Any]:
             sig = inspect.signature(process_func)
             if "progress_callback" in sig.parameters and progress_callback is not None:
                 kwargs["progress_callback"] = progress_callback
+            # Phase 1N — pass should_cancel_callback when supported.
+            if "should_cancel_callback" in sig.parameters:
+                kwargs["should_cancel_callback"] = should_cancel
         except (TypeError, ValueError):
             pass
+
+        # Phase 1N — also expose the cancel callable inside run_context
+        # so processors that read `run_context` directly can poll it.
+        run_context["should_cancel"] = should_cancel
 
         if tracker is not None:
             # The vendor processor is going to read text, optionally OCR,
@@ -327,18 +475,53 @@ def process_batch(batch_id: str) -> dict[str, Any]:
     }
 
     if tracker is not None:
-        tracker.start_stage("ready")
-        tracker.complete_stage(
-            "ready",
-            detail=f"{len(overall_invoices)} invoice(s), {len(overall_review)} flagged",
-        )
-        tracker.complete(
-            files_total=len(files),
-            files_done=len(files),
-            invoices_created=len(overall_invoices),
-            rows_created=sum(len(inv.get("rows", [])) for inv in overall_invoices),
-            warnings_count=len(overall_review),
-        )
+        if should_cancel():
+            # Phase 1N — finalise as cancelled rather than completed.
+            tracker.cancelled(
+                files_total=len(files),
+                files_done=sum(len(v) for k, v in grouped.items() if k in by_vendor),
+                invoices_created=len(overall_invoices),
+                rows_created=sum(
+                    len(inv.get("rows", [])) for inv in overall_invoices
+                ),
+                warnings_count=len(overall_review),
+            )
+            summary["cancelled"] = True
+        else:
+            if not by_vendor:
+                for k in (
+                    "read_pdf",
+                    "ocr",
+                    "yaml_rules",
+                    "address_match",
+                    "unit_match",
+                    "gl_evidence",
+                    "ai_fallback",
+                    "reconcile",
+                    "split_pdf",
+                    "dropbox",
+                    "template",
+                ):
+                    tracker.skip_stage(k, detail="No supported files in batch")
+            tracker.start_stage("ready")
+            tracker.complete_stage(
+                "ready",
+                detail=f"{len(overall_invoices)} invoice(s), {len(overall_review)} flagged",
+            )
+            tracker.complete(
+                files_total=len(files),
+                files_done=len(files),
+                invoices_created=len(overall_invoices),
+                rows_created=sum(len(inv.get("rows", [])) for inv in overall_invoices),
+                warnings_count=len(overall_review),
+            )
+        # Phase 1N — release the registry entry whether we completed
+        # normally or cancelled.
+        try:
+            from . import cancel_registry
+            cancel_registry.unregister(batch_id)
+        except Exception:
+            pass
 
     return {
         "batch_id": batch_id,
@@ -378,6 +561,13 @@ def _write_edited_rows_to_template(template_path: Path, dest: Path,
         if key:
             header_to_col[key] = i
 
+    # Phase 2L — Date columns are written as real Excel dates so
+    # ResMan accepts them as date cells, not text.
+    try:
+        from utils.excel_helpers import set_cell as _set_cell
+    except Exception:  # pragma: no cover
+        _set_cell = None  # type: ignore
+
     written = 0
     for r_idx, row in enumerate(rows, start=2):
         for key, value in row.items():
@@ -386,7 +576,11 @@ def _write_edited_rows_to_template(template_path: Path, dest: Path,
             col = header_to_col.get(key)
             if not col:
                 continue
-            ws.cell(row=r_idx, column=col).value = _coerce_cell_value(value)
+            cell = ws.cell(row=r_idx, column=col)
+            if _set_cell is not None:
+                _set_cell(cell, _coerce_cell_value(value), key)
+            else:
+                cell.value = _coerce_cell_value(value)
         written += 1
     wb.save(dest)
     return written

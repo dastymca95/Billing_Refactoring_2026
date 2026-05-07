@@ -7,7 +7,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { api } from "../api";
+import { api, getFriendlyErrorMessage } from "../api";
 import type { AiStatus } from "../types";
 
 type Props = {
@@ -38,7 +38,7 @@ export function AiFallbackStatusBadge({ className }: Props) {
         if (!cancelled) setStatus(s);
       } catch (e) {
         if (!cancelled) {
-          setError(String(e));
+          setError(getFriendlyErrorMessage(e, "AI status"));
           // eslint-disable-next-line no-console
           console.warn("AI status fetch failed:", e);
         }
@@ -78,6 +78,7 @@ export function AiFallbackStatusBadge({ className }: Props) {
       </button>
       {open && (
         <div className="ai-pill-popover" role="dialog" aria-label="AI status">
+          <div className="ai-pop-message">{labelInfo.message}</div>
           <div className="ai-pop-row">
             <span className="ai-pop-key">Status</span>
             <span className="ai-pop-val">{labelInfo.label}</span>
@@ -85,40 +86,40 @@ export function AiFallbackStatusBadge({ className }: Props) {
           <div className="ai-pop-row">
             <span className="ai-pop-key">Provider</span>
             <span className="ai-pop-val">
-              {prettyProvider(status?.provider)}
+              {status?.provider === "disabled"
+                ? "Not configured"
+                : prettyProvider(status?.provider)}
             </span>
           </div>
           <div className="ai-pop-row">
-            <span className="ai-pop-key">Policy</span>
+            <span className="ai-pop-key">Mode</span>
             <span className="ai-pop-val">
-              {status?.policy
-                ? prettyPolicy(status.policy)
-                : "—"}
+              {status?.enabled ? "Rules + OCR + AI" : "Rules + OCR"}
             </span>
           </div>
-          {status?.max_cost_per_batch_usd ? (
-            <div className="ai-pop-row">
-              <span className="ai-pop-key">Cost ceiling</span>
-              <span className="ai-pop-val">
-                ${status.max_cost_per_batch_usd.toFixed(2)} / batch
-              </span>
-            </div>
-          ) : null}
-          <div className="ai-pop-message">{labelInfo.message}</div>
-          <div className="ai-pop-section-title">What AI would help with</div>
+          <div className="ai-pop-section-title">What AI assist can help with</div>
           <ul className="ai-pop-tasks">
             {AI_HELP_TASKS.map((t) => (
               <li key={t}>{t}</li>
             ))}
           </ul>
-          {!status?.enabled && (
+          <button
+            type="button"
+            className="ai-pop-cta"
+            disabled
+            title="Coming later — for now, configure provider credentials in .env"
+          >
+            Configure AI
+          </button>
+          <details className="ai-pop-details">
+            <summary>Developer setup</summary>
             <div className="ai-pop-hint">
-              Configure a provider in <code>.env</code>
-              {" "}(<code>AI_FALLBACK_ENABLED=true</code> +
-              <code> AI_PROVIDER=…</code> + the matching API key) to enable
-              fallback suggestions.
+              Set <code>AI_FALLBACK_ENABLED=true</code>,{" "}
+              <code>AI_PROVIDER</code>, and the matching API key in{" "}
+              <code>.env</code>. See <code>docs/architecture/</code> for the
+              full provider list.
             </div>
-          )}
+          </details>
         </div>
       )}
     </span>
@@ -130,13 +131,18 @@ type Tone = "tone-loading" | "tone-off" | "tone-configured" | "tone-ready" | "to
 function labelFor(
   status: AiStatus | null,
   error: string | null,
-): { label: string; tone: Tone; message: string } {
+): { label: string; tone: Tone; message: string; hint?: string } {
+  // Phase 1L — only call this an "error" when the backend exists and
+  // actually reports a runtime/provider failure. A failed fetch (404,
+  // network blip) is a deployment/config issue, not a runtime AI
+  // failure — show "AI Off" with a friendly message instead.
   if (error) {
     return {
-      label: "AI Error",
-      tone: "tone-error",
+      label: "AI Off",
+      tone: "tone-off",
       message:
-        "AI status check failed. The app continues with rules and OCR only.",
+        "AI assist is currently off. The app is using rules, OCR, YAML, and validation only.",
+      hint: "Configure provider credentials in .env to enable AI fallback.",
     };
   }
   if (!status) {
@@ -151,7 +157,7 @@ function labelFor(
       label: "AI Ready",
       tone: "tone-ready",
       message:
-        "AI fallback is configured and may suggest values when rules + OCR confidence is low. Every AI-filled field is flagged for manual review.",
+        "AI assist is ready. It will suggest values only when rules and OCR confidence is low. Every AI-filled field is flagged for manual review.",
     };
   }
   if (status.provider === "disabled") {
@@ -159,7 +165,8 @@ function labelFor(
       label: "AI Off",
       tone: "tone-off",
       message:
-        "AI fallback is intentionally off. The app is running rules, OCR, YAML, and validation only.",
+        "AI assist is currently off. The app is using rules, OCR, YAML, and validation only.",
+      hint: "Configure provider credentials in .env to enable AI fallback.",
     };
   }
   if (!status.configured) {
@@ -167,14 +174,15 @@ function labelFor(
       label: "AI Not Configured",
       tone: "tone-configured",
       message:
-        "A provider is selected but no API key is set. Add the key to .env to activate.",
+        "A provider is selected but no API key is set yet.",
+      hint: "Configure provider credentials in .env to enable AI fallback.",
     };
   }
   return {
     label: "AI Off",
     tone: "tone-off",
     message:
-      "AI fallback is currently off. The app is running rules, OCR, YAML, and validation only.",
+      "AI assist is currently off. The app is using rules, OCR, YAML, and validation only.",
   };
 }
 

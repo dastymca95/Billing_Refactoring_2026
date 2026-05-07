@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from ..settings import BATCHES_ROOT, batch_dir, new_batch_id
+from ..settings import BATCHES_ROOT, batch_dir, is_valid_batch_id, new_batch_id
 
 
 SUBFOLDERS = ["input", "processed", "export", "logs", "manual_review"]
@@ -24,7 +24,7 @@ def list_batches() -> list[dict]:
         return []
     out: list[dict] = []
     for p in sorted(BATCHES_ROOT.iterdir(), reverse=True):
-        if p.is_dir() and p.name.startswith("batch_"):
+        if p.is_dir() and is_valid_batch_id(p.name):
             out.append({"batch_id": p.name, "path": str(p)})
     return out
 
@@ -60,6 +60,5 @@ def list_files_in_batch(batch_id: str) -> list[Path]:
 
 
 def delete_batch(batch_id: str) -> None:
-    d = batch_dir(batch_id)
-    if d.is_dir():
-        shutil.rmtree(d, ignore_errors=True)
+    d = get_batch_dir(batch_id)
+    shutil.rmtree(d, ignore_errors=True)

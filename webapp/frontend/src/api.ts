@@ -13,16 +13,123 @@ import type {
   ManualReviewResponse,
   PreviewResponse,
   ProcessResult,
+  QueueStatus,
   RegionHint,
   RegionHintsResponse,
+  RevisionListResponse,
 } from "./types";
+
+export class ApiError extends Error {
+  status: number;
+  statusText: string;
+  detail: unknown;
+  rawBody: string;
+
+  constructor(
+    message: string,
+    opts: {
+      status: number;
+      statusText: string;
+      detail: unknown;
+      rawBody: string;
+    },
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = opts.status;
+    this.statusText = opts.statusText;
+    this.detail = opts.detail;
+    this.rawBody = opts.rawBody;
+  }
+}
+
+export function isApiError(error: unknown): error is ApiError {
+  return error instanceof ApiError;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function detailMessage(detail: unknown): string | null {
+  if (typeof detail === "string") return detail;
+  if (isRecord(detail)) {
+    const message = detail.message;
+    if (typeof message === "string") return message;
+  }
+  return null;
+}
+
+function parseErrorBody(rawBody: string): { parsed: unknown; detail: unknown } {
+  if (!rawBody) return { parsed: null, detail: null };
+  try {
+    const parsed = JSON.parse(rawBody) as unknown;
+    if (isRecord(parsed) && "detail" in parsed) {
+      return { parsed, detail: parsed.detail };
+    }
+    return { parsed, detail: parsed };
+  } catch {
+    return { parsed: null, detail: rawBody };
+  }
+}
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`HTTP ${res.status} ${res.statusText}: ${detail}`);
+    let rawBody = "";
+    try {
+      rawBody = await res.text();
+    } catch {
+      rawBody = "";
+    }
+    const { detail } = parseErrorBody(rawBody);
+    const message =
+      detailMessage(detail) ||
+      (res.status === 422
+        ? "Some information is invalid. Please review and try again."
+        : res.statusText || "Request failed.");
+    throw new ApiError(message, {
+      status: res.status,
+      statusText: res.statusText,
+      detail,
+      rawBody,
+    });
   }
   return (await res.json()) as T;
+}
+
+export function getFriendlyErrorMessage(error: unknown, context?: string): string {
+  if (isApiError(error)) {
+    const detailText =
+      typeof error.detail === "string" ? error.detail : error.message;
+
+    if (error.status === 400 && /invalid batch id/i.test(detailText)) {
+      return "Invalid batch. Please refresh and try again.";
+    }
+    if (error.status === 404) {
+      return "Batch not found. It may have been deleted.";
+    }
+    if (error.status === 405) {
+      return "This action is not available on the running backend. Restart the backend and refresh the app.";
+    }
+    if (error.status === 422) {
+      return "Some information is invalid. Please review and try again.";
+    }
+    return detailMessage(error.detail) || error.message || "Request failed. Please try again.";
+  }
+
+  if (error instanceof TypeError) {
+    return "Could not reach the backend. Make sure the backend is running.";
+  }
+  if (error instanceof Error && error.message) {
+    if (/failed to fetch|networkerror|load failed/i.test(error.message)) {
+      return "Could not reach the backend. Make sure the backend is running.";
+    }
+    return error.message;
+  }
+
+  return context
+    ? `${context} failed. Please try again.`
+    : "Request failed. Please try again.";
 }
 
 export const api = {
@@ -61,6 +168,8 @@ export const api = {
       documentMode?: DocumentMode;
       aiFallbackEnabled?: boolean;
       aiFallbackPolicy?: AiFallbackPolicy;
+      // Phase 2C — display name for the export workbook.
+      exportName?: string;
     },
   ) {
     const body: Record<string, unknown> = {};
@@ -70,6 +179,7 @@ export const api = {
       body.ai_fallback_enabled = updates.aiFallbackEnabled;
     if (updates.aiFallbackPolicy !== undefined)
       body.ai_fallback_policy = updates.aiFallbackPolicy;
+    if (updates.exportName !== undefined) body.export_name = updates.exportName;
     const res = await fetch(`/api/batches/${batchId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -121,6 +231,15 @@ export const api = {
     return jsonOrThrow<FilesResponse>(res);
   },
 
+  // Phase 1X — delete one file from a batch.
+  async deleteFile(batchId: string, filename: string) {
+    const res = await fetch(
+      `/api/batches/${batchId}/files/${encodeURIComponent(filename)}`,
+      { method: "DELETE" },
+    );
+    return jsonOrThrow<{ batch_id: string; filename: string; deleted: boolean }>(res);
+  },
+
   async filePreview(batchId: string, filename: string) {
     const res = await fetch(
       `/api/batches/${batchId}/files/${encodeURIComponent(filename)}/preview`,
@@ -150,6 +269,16 @@ export const api = {
       : `/api/batches/${batchId}/process`;
     const res = await fetch(url, { method: "POST" });
     return jsonOrThrow<ProcessResult | { status: string; polling_url: string }>(
+      res,
+    );
+  },
+
+  // Phase 1N — request cooperative cancellation of an active run.
+  async cancelBatch(batchId: string) {
+    const res = await fetch(`/api/batches/${batchId}/cancel`, {
+      method: "POST",
+    });
+    return jsonOrThrow<{ batch_id: string; status: string; message: string }>(
       res,
     );
   },
@@ -219,5 +348,151 @@ export const api = {
       { method: "DELETE" },
     );
     return jsonOrThrow<RegionHintsResponse & { deleted: number }>(res);
+  },
+
+  // ---- Phase 2D — template revision history --------------------------
+  async listRevisions(batchId: string) {
+    const res = await fetch(`/api/batches/${batchId}/revisions`);
+    return jsonOrThrow<RevisionListResponse>(res);
+  },
+
+  async activateRevision(batchId: string, revisionId: string) {
+    const res = await fetch(
+      `/api/batches/${batchId}/revisions/${encodeURIComponent(revisionId)}/activate`,
+      { method: "POST" },
+    );
+    return jsonOrThrow<{
+      batch_id: string;
+      current_revision_id: string;
+      activated: import("./types").RevisionEntry;
+    }>(res);
+  },
+
+  async explainCell(batchId: string, rowIndex: number, column: string) {
+    const res = await fetch(
+      `/api/batches/${batchId}/cells/${rowIndex}/${encodeURIComponent(column)}/explain`,
+    );
+    return jsonOrThrow<import("./types").CellExplain>(res);
+  },
+
+  async overrideCell(
+    batchId: string,
+    rowIndex: number,
+    column: string,
+    body: {
+      new_value: unknown;
+      scope: "cell" | "vendor";
+      note?: string;
+      contains_text?: string;
+    },
+  ) {
+    const res = await fetch(
+      `/api/batches/${batchId}/cells/${rowIndex}/${encodeURIComponent(column)}/override`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    return jsonOrThrow<{
+      batch_id: string;
+      row_index: number;
+      column: string;
+      saved: "edit" | "learned_correction";
+      correction_id: string | null;
+      new_value: unknown;
+    }>(res);
+  },
+
+  async remapCellSource(
+    batchId: string,
+    rowIndex: number,
+    column: string,
+    body: {
+      field_key: string;
+      page: number;
+      bbox: { x: number; y: number; w: number; h: number };
+      scope?: "cell" | "document" | "batch" | "vendor";
+      note?: string;
+    },
+  ) {
+    const res = await fetch(
+      `/api/batches/${batchId}/cells/${rowIndex}/${encodeURIComponent(column)}/remap-source`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    return jsonOrThrow<{
+      batch_id: string;
+      correction_id: string;
+      saved: string;
+    }>(res);
+  },
+
+  async listLearnedCorrections(vendorKey?: string) {
+    const url = vendorKey
+      ? `/api/learned-corrections?vendor_key=${encodeURIComponent(vendorKey)}`
+      : "/api/learned-corrections";
+    const res = await fetch(url);
+    return jsonOrThrow<{
+      vendor_key: string;
+      items: import("./types").LearnedCorrection[];
+    }>(res);
+  },
+
+  async deleteLearnedCorrection(vendorKey: string, correctionId: string) {
+    const res = await fetch(
+      `/api/learned-corrections/${encodeURIComponent(vendorKey)}/${encodeURIComponent(correctionId)}`,
+      { method: "DELETE" },
+    );
+    return jsonOrThrow<{
+      vendor_key: string;
+      correction_id: string;
+      deleted: true;
+    }>(res);
+  },
+
+  async getDocumentTrace(batchId: string, filename: string) {
+    const res = await fetch(
+      `/api/batches/${batchId}/documents/${encodeURIComponent(filename)}/trace`,
+    );
+    return jsonOrThrow<import("./types").DocumentTraceResponse>(res);
+  },
+
+  async saveEdits(
+    batchId: string,
+    edits: Record<number, Record<string, unknown>>,
+  ) {
+    const res = await fetch(`/api/batches/${batchId}/save-edits`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ edits }),
+    });
+    return jsonOrThrow<{
+      batch_id: string;
+      applied: number;
+      skipped: number;
+      current_revision_id: string | null;
+    }>(res);
+  },
+
+  async deleteRevision(batchId: string, revisionId: string) {
+    const res = await fetch(
+      `/api/batches/${batchId}/revisions/${encodeURIComponent(revisionId)}`,
+      { method: "DELETE" },
+    );
+    return jsonOrThrow<{
+      batch_id: string;
+      deleted: import("./types").RevisionEntry;
+      current_revision_id: string | null;
+    }>(res);
+  },
+
+  // ---- Phase 2D — cross-batch processing queue -----------------------
+  async getQueueStatus() {
+    const res = await fetch("/api/processing/queue");
+    return jsonOrThrow<QueueStatus>(res);
   },
 };

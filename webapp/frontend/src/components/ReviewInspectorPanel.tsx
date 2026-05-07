@@ -24,9 +24,21 @@ type Props = {
   onSelectFile: (filename: string) => void;
   activeTab: "issues" | "row";
   onTabChange: (tab: "issues" | "row") => void;
+  /** Phase 1K — set of issue keys the operator has marked reviewed.
+   *  Browser-session state in App.tsx; pure UI signal — does NOT
+   *  remove the underlying manual_review reason. */
+  reviewedKeys?: Set<string>;
+  onToggleReviewed?: (key: string) => void;
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
 };
+
+/** Build a stable key for a (review item, reason) pair so the
+ *  "reviewed" set survives re-orderings / re-runs of the same set
+ *  of items. */
+export function issueKey(it: ManualReviewItem, reason: string): string {
+  return `${it.invoice_number || it.account_number || it.source_file}::${reason}`;
+}
 
 const REASON_HELP: Record<string, string> = {
   unknown_unit_number_for_location:
@@ -94,6 +106,8 @@ export function ReviewInspectorPanel({
   onSelectFile,
   activeTab,
   onTabChange,
+  reviewedKeys,
+  onToggleReviewed,
   collapsed,
   onToggleCollapsed,
 }: Props) {
@@ -146,8 +160,15 @@ export function ReviewInspectorPanel({
           </button>
         </div>
         {onToggleCollapsed && (
-          <button onClick={onToggleCollapsed} className="icon-button">
-            {collapsed ? "Expand" : "Collapse"}
+          <button
+            onClick={onToggleCollapsed}
+            className="icon-btn"
+            title={collapsed ? "Expand panel" : "Collapse panel"}
+            aria-label={collapsed ? "Expand panel" : "Collapse panel"}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <polyline points={collapsed ? "9 18 15 12 9 6" : "15 18 9 12 15 6"} />
+            </svg>
           </button>
         )}
       </div>
@@ -160,6 +181,8 @@ export function ReviewInspectorPanel({
               itemToRowIndex={itemToRowIndex}
               onSelectRow={onSelectRow}
               onSelectFile={onSelectFile}
+              reviewedKeys={reviewedKeys}
+              onToggleReviewed={onToggleReviewed}
             />
           ) : (
             <SelectedRowView
@@ -179,11 +202,15 @@ function IssuesView({
   itemToRowIndex,
   onSelectRow,
   onSelectFile,
+  reviewedKeys,
+  onToggleReviewed,
 }: {
   grouped: Record<string, ManualReviewItem[]>;
   itemToRowIndex: Map<ManualReviewItem, number>;
   onSelectRow: (rowIndex: number) => void;
   onSelectFile: (filename: string) => void;
+  reviewedKeys?: Set<string>;
+  onToggleReviewed?: (key: string) => void;
 }) {
   const groupKeys = Object.keys(grouped).sort();
   if (groupKeys.length === 0) {
@@ -224,10 +251,12 @@ function IssuesView({
                 const rowIdx = itemToRowIndex.get(it);
                 return it.reasons.map((reason) => {
                   const sev = severityFor(reason);
+                  const key = issueKey(it, reason);
+                  const isReviewed = reviewedKeys?.has(key) ?? false;
                   return (
                     <li
                       key={`${it.invoice_number || it.account_number}-${reason}`}
-                      className={`issue-card severity-${sev}`}
+                      className={`issue-card severity-${sev} ${isReviewed ? "is-reviewed" : ""}`}
                     >
                       <div className="issue-card-head">
                         <span className={`issue-sev-dot sev-${sev}`} aria-hidden />
@@ -270,6 +299,20 @@ function IssuesView({
                         >
                           Open document
                         </button>
+                        {onToggleReviewed && (
+                          <button
+                            type="button"
+                            className={`btn btn-mini ${isReviewed ? "btn-accent" : "btn-ghost"}`}
+                            onClick={() => onToggleReviewed(key)}
+                            title={
+                              isReviewed
+                                ? "Marked reviewed in this session"
+                                : "Mark this issue as reviewed (session only)"
+                            }
+                          >
+                            {isReviewed ? "✓ Reviewed" : "Mark reviewed"}
+                          </button>
+                        )}
                       </div>
                     </li>
                   );

@@ -1,10 +1,14 @@
-// Phase 1J — compact workflow indicator: Upload → Process → Review → Export.
+// Phase 1L — compact workflow status strip.
 //
-// Lives in the topbar. Each step shows pending / active / complete /
-// warning state with a one-line subtitle (e.g. "12 invoices",
-// "3 issues"). The step is purely a status indicator — clicking does
-// not navigate. The active step is the first one with `pending` /
-// `active` state.
+// Replaces the Phase 1J/1K toy 1-2-3-4 numbered circles with a compact
+// inline status strip:
+//
+//    Upload  ·  Process  ·  Review  ·  Export
+//      ✓        ✓           ⚠           …
+//
+// Each step is a tiny label + a status dot (color = state). Active
+// step gets a subtle accent halo. The whole strip is informational —
+// clicking does not navigate.
 
 type StepStatus = "pending" | "active" | "complete" | "warning";
 
@@ -33,9 +37,10 @@ export function WorkflowSteps({
   const upload: Step = {
     key: "upload",
     label: "Upload",
-    status:
-      fileCount === 0 ? "active" : "complete",
-    detail: fileCount === 0 ? "Drop files" : `${fileCount} file${fileCount === 1 ? "" : "s"}`,
+    status: fileCount === 0 ? "active" : "complete",
+    detail: fileCount === 0
+      ? "Drop files"
+      : `${fileCount} file${fileCount === 1 ? "" : "s"}`,
   };
   const process: Step = {
     key: "process",
@@ -48,7 +53,7 @@ export function WorkflowSteps({
           ? "complete"
           : "active",
     detail: isProcessing
-      ? "Running…"
+      ? "Running"
       : invoiceCount > 0
         ? `${invoiceCount} invoice${invoiceCount === 1 ? "" : "s"}`
         : fileCount > 0
@@ -85,17 +90,21 @@ export function WorkflowSteps({
   const steps = [upload, process, review, exportStep];
 
   return (
-    <ol className="workflow-steps" aria-label="Workflow">
+    <ol className="workflow-strip" aria-label="Workflow">
       {steps.map((s, i) => (
-        <li key={s.key} className={`workflow-step status-${s.status}`}>
-          <span className="workflow-step-num">{i + 1}</span>
-          <div className="workflow-step-text">
-            <span className="workflow-step-label">{s.label}</span>
+        <li key={s.key} className={`workflow-strip-item status-${s.status}`}>
+          <span className={`workflow-strip-dot status-${s.status}`} aria-hidden />
+          <span className="workflow-strip-text">
+            <span className="workflow-strip-label">{s.label}</span>
             {s.detail && (
-              <span className="workflow-step-detail">{s.detail}</span>
+              <span className="workflow-strip-detail">· {s.detail}</span>
             )}
-          </div>
-          {i < steps.length - 1 && <span className="workflow-step-sep" aria-hidden />}
+          </span>
+          {i < steps.length - 1 && (
+            <span className="workflow-strip-sep" aria-hidden>
+              ›
+            </span>
+          )}
         </li>
       ))}
     </ol>

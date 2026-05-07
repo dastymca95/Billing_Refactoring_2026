@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($csv = Import-Csv \"C:\\\\Users\\\\Dasty\\\\PycharmProjects\\\\Billing_Refactoring_2026\\\\Vendors\\\\Vendor List.csv\"; $unique = $csv | Select-Object -ExpandProperty Vendor -Unique; $unique.Count)"
+    ]
+  }
+}
