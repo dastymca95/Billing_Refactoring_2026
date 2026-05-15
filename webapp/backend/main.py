@@ -17,9 +17,13 @@ from fastapi.responses import JSONResponse
 from .settings import BATCHES_ROOT, InvalidBatchIdError
 from .api import (
     ai_status,
+    ai_invoice,
+    ai_mappings,
     batches,
+    canonical_rules,
     cells,
     export,
+    invoice_format_rules,
     preview,
     processing,
     regions,
@@ -68,8 +72,15 @@ def create_app() -> FastAPI:
     # Phase 1H — region hints + AI status.
     app.include_router(regions.router)
     app.include_router(ai_status.router)
+    app.include_router(ai_invoice.router)
+    app.include_router(ai_invoice.test_router)
+    app.include_router(ai_invoice.batch_router)
+    app.include_router(ai_mappings.router)
+    app.include_router(ai_mappings.batch_router)
     # Phase 1Z — Vendor Rules Studio.
     app.include_router(vendor_rules.router)
+    app.include_router(invoice_format_rules.router)
+    app.include_router(canonical_rules.router)
     # Phase 2K — Cell explain / correct / learn.
     app.include_router(cells.router)
     app.include_router(cells.learned_router)

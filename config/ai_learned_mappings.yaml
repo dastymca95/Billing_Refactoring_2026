@@ -1,0 +1,32 @@
+gl_mappings:
+  lowes:
+    item_patterns:
+    - confirmed_by: user
+      created_at: '2026-05-10T21:12:54+00:00'
+      display_pattern: 3-3/4-In (96mm) bar pull
+      gl_account: '6651'
+      gl_code: '6651'
+      gl_name: Hardware - Misc
+      pattern: 3 3 4 in 96mm bar pull
+      updated_at: '2026-05-10T21:12:54+00:00'
+    vendor_name: Lowe's
+  lowes_pro_supply:
+    item_patterns:
+    - confirmed_by: user
+      created_at: '2026-05-11T20:10:30+00:00'
+      display_pattern: 3-3/4-In (96mm) bar pull
+      gl_account: '6651'
+      gl_code: '6651'
+      gl_name: Hardware - Misc
+      pattern: 3 3 4 in 96mm bar pull
+      updated_at: '2026-05-11T20:10:30+00:00'
+    vendor_name: Lowes Pro Supply
+property_mappings: {}
+vendor_mappings:
+  lowes:
+    confirmed_by: user
+    created_at: '2026-05-10T21:12:58+00:00'
+    detected_vendor: Lowe's
+    resman_vendor_name: Lowes Pro Supply
+    updated_at: '2026-05-10T21:12:58+00:00'
+    vendor_id: LOWESGW

@@ -1,0 +1,59 @@
+{
+  "key": "spectrum",
+  "vendor": "Spectrum Business & Community Services",
+  "category": "subscriptions",
+  "description": "Spectrum Community Solutions invoice with service-period lines and zero-dollar promotional item.",
+  "status": "complete",
+  "requires_live_ai": false,
+  "source_document": "Spectrum_Community_Solutions_0310675042426.pdf",
+  "support_document_url": "https://dropbox.example/canonical/spectrum-0310675042426.pdf",
+  "ignored_source_items": ["previous_balance", "payments", "zero_amount_lines"],
+  "extracted_candidates": {
+    "vendor_name": "Spectrum",
+    "category": "subscriptions",
+    "invoice_number": "0310675042426",
+    "invoice_date": "04/24/2026",
+    "due_date": "05/11/2026",
+    "bill_or_credit": "Bill",
+    "account_number": "8363 29 023 0310675",
+    "service_period_start": "04/24/2026",
+    "service_period_end": "05/23/2026",
+    "property_candidate": "Aspen Meadows Apartments",
+    "property_abbreviation": "AMA",
+    "service_address": "Aspen Meadows Apartments",
+    "line_items": [
+      {
+        "description": "Community Solutions Services",
+        "quantity": 1,
+        "unit_price": 10836.0,
+        "amount": 10836.0,
+        "gl_account_candidate": "6905",
+        "confidence": 0.95,
+        "reason": "Visible current service charge."
+      },
+      {
+        "description": "Taxes, Fees and Charges",
+        "quantity": 1,
+        "unit_price": 235.51,
+        "amount": 235.51,
+        "gl_account_candidate": "6905",
+        "confidence": 0.9,
+        "reason": "Visible taxes and fees charge."
+      },
+      {
+        "description": "Xumo / Spectrum Internet promotional line",
+        "quantity": 1,
+        "unit_price": 0,
+        "amount": 0,
+        "gl_account_candidate": "6905",
+        "confidence": 0.8,
+        "reason": "Visible zero-dollar promotional line."
+      }
+    ],
+    "subtotal": 11071.51,
+    "tax_amount": 0,
+    "total_amount": 11071.51,
+    "confidence": 0.94,
+    "warnings": []
+  }
+}

@@ -11,11 +11,55 @@ export type FileEntry = {
   vendor_confidence: number;
   vendor_detection_reason: string;
   supported_in_phase_1: boolean;
+  source_type?: string;
+  file_support_status?: string;
+  file_support_label?: string;
+  file_support_reason?: string;
+};
+
+export type UploadFileProgress = {
+  id: string;
+  batchId: string;
+  filename: string;
+  size_bytes: number;
+  extension: string;
+  percent: number;
+  status: "queued" | "uploading" | "done" | "failed";
+  error?: string;
 };
 
 export type FilesResponse = {
   batch_id: string;
   files: FileEntry[];
+};
+
+export type IngestionPreviewResponse = {
+  batch_id: string;
+  filename: string;
+  source_type: string;
+  mime_type: string;
+  file_size_bytes: number;
+  page_count: number;
+  sheet_count: number;
+  table_count: number;
+  text_quality_score: number;
+  extraction_quality: string;
+  needs_ocr: boolean;
+  needs_vision: boolean;
+  warnings: string[];
+  vendor_hint: string;
+  category_hint: string;
+  text_preview: string;
+  tables_preview: {
+    source: string;
+    sheet_name?: string | null;
+    page_number?: number | null;
+    table_index: number;
+    headers: string[];
+    rows: unknown[][];
+    confidence?: number | null;
+    warnings: string[];
+  }[];
 };
 
 export type FilePreview =
@@ -76,6 +120,87 @@ export type PreviewRowMeta = {
   // the source PDF) that fed this row. Drives the row ↔ overlay
   // highlight in the document viewer.
   trace_ids?: string[];
+  // Phase AI-1 — provenance/validation metadata for AI-assisted supplier
+  // invoices. These are intentionally optional so deterministic vendor rows
+  // remain unchanged.
+  ai_generated?: boolean;
+  ai_confidence?: number;
+  ai_confidence_low?: boolean;
+  ai_validation_flags?: string[];
+  ai_warnings?: string[];
+  ai_provenance?: Record<string, unknown>;
+  ai_mapping_provenance?: Record<string, unknown>[];
+  ai_detected_vendor?: string | null;
+  ai_property_candidate?: string | null;
+  ai_service_address?: string | null;
+  ai_source_gl_candidate?: string | null;
+  ai_generated_description?: boolean;
+  ai_tax_handling?: string | null;
+  ai_invoice_date_source?: string | null;
+  ai_zero_amount_lines_excluded?: number;
+};
+
+export type AiVendorCandidate = {
+  vendor_name: string;
+  vendor_id: string;
+  score: number;
+  reason: string;
+  learned?: boolean;
+};
+
+export type AiVendorCandidatesResponse = {
+  detected_vendor: string;
+  normalized_detected_vendor: string;
+  candidates: AiVendorCandidate[];
+  needs_confirmation: boolean;
+};
+
+export type AiGlCandidate = {
+  gl_account: string;
+  gl_code: string;
+  gl_name: string;
+  score: number;
+  reason: string;
+  learned?: boolean;
+  valid?: boolean;
+};
+
+export type AiGlCandidatesResponse = {
+  line_item_description: string;
+  amount: number | null;
+  vendor_name: string;
+  ai_suggested_gl: string;
+  candidates: AiGlCandidate[];
+  needs_confirmation: boolean;
+};
+
+export type AiPropertyCandidate = {
+  property_abbreviation: string;
+  property_name: string;
+  location: string;
+  address: string;
+  score: number;
+  reason: string;
+};
+
+export type AiPropertyCandidatesResponse = {
+  query: string;
+  service_address: string;
+  candidates: AiPropertyCandidate[];
+  needs_confirmation: boolean;
+};
+
+export type AiLocationCandidate = {
+  property_abbreviation: string;
+  property_name: string;
+  location: string;
+  address: string;
+};
+
+export type AiLocationCandidatesResponse = {
+  property_abbreviation: string;
+  query: string;
+  locations: AiLocationCandidate[];
 };
 
 // Phase 2J — Extraction Trace Overlay.
@@ -117,6 +242,10 @@ export type CellExplain = {
   source_file: string | null;
   source_page: number | null;
   vendor_key: string;
+  ai_generated?: boolean;
+  ai_confidence?: number | null;
+  ai_validation_flags?: string[];
+  ai_warnings?: string[];
 };
 
 export type LearnedCorrection = {
@@ -253,12 +382,19 @@ export type BatchProgress = {
   // Phase 1N — cancel state.
   cancel_requested?: boolean;
   cancelled_at?: string;
+  // Phase AI-1 — surfaced by the backend only while an AI-assisted run is
+  // active. Unknown fields are tolerated by older progress snapshots.
+  processing_mode?: "deterministic" | "ai_assisted" | "hybrid" | string;
+  ai_stage?: string;
+  ai_enabled?: boolean;
+  ai_disabled_reason?: string;
 };
 
 // Phase 1H — batch document mode + AI fallback policy.
 export type DocumentMode =
   | "digital_pdf"
   | "scanned_pdf"
+  | "screenshot_image"
   | "mixed_pdf"
   | "csv_excel"
   | "auto_detect";
@@ -273,6 +409,7 @@ export const DOCUMENT_MODES: DocumentMode[] = [
   "auto_detect",
   "digital_pdf",
   "scanned_pdf",
+  "screenshot_image",
   "mixed_pdf",
   "csv_excel",
 ];
@@ -281,6 +418,7 @@ export const DOCUMENT_MODE_LABELS: Record<DocumentMode, string> = {
   auto_detect: "Auto-detect",
   digital_pdf: "Digital PDFs",
   scanned_pdf: "Scanned PDFs",
+  screenshot_image: "Screenshots / Photos",
   mixed_pdf: "Mixed PDFs",
   csv_excel: "CSV / Excel",
 };
@@ -289,6 +427,7 @@ export const DOCUMENT_MODE_DESCRIPTIONS: Record<DocumentMode, string> = {
   auto_detect: "Let the system pick per-file. Safe default.",
   digital_pdf: "Text-based bills (e.g. UtilityBill_05_2026.pdf).",
   scanned_pdf: "Image scans of bills — OCR is required.",
+  screenshot_image: "Receipt screenshots or phone photos for AI vision assist.",
   mixed_pdf: "A mix of scanned and digital PDFs.",
   csv_excel: "Billing-history exports (.csv / .xlsx).",
 };
@@ -327,15 +466,204 @@ export type QueueStatus = {
 
 export type AiStatus = {
   enabled: boolean;
-  provider: string;
+  provider: string | null;
+  model?: string | null;
   configured: boolean;
+  supports_vision?: boolean;
+  vision_enabled?: boolean;
+  vision_provider?: string | null;
+  vision_model?: string | null;
+  vision_mode?: string | null;
+  message?: string;
   reason: string;
   policy?: string;
   max_cost_per_batch_usd?: number;
   allowed_tasks?: string[];
 };
 
+export type AiVisionAssistResponse = {
+  dry_run: boolean;
+  provider: string | null;
+  model: string | null;
+  vision_enabled: boolean;
+  vision_mode: string;
+  extraction: Record<string, unknown>;
+  validation: {
+    valid: boolean;
+    manual_review_reasons: string[];
+    manual_review_codes: string[];
+    warnings: string[];
+    row_count: number;
+    total_amount: number | string | null;
+    confidence?: number;
+    text_vision_agreement_fields?: string[];
+    text_vision_conflict_fields?: string[];
+    [key: string]: unknown;
+  };
+  normalized: Record<string, unknown>;
+  trace_regions: TraceItem[];
+};
+
 // Phase 1H — region hints. Coordinates are normalized to [0,1].
+export type InvoiceFormatRuleScopeType =
+  | "general"
+  | "vendor"
+  | "vendor_group"
+  | "property"
+  | "property_group"
+  | "gl_account"
+  | "gl_group";
+
+export type InvoiceFormatRule = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  priority: number;
+  scope: {
+    type: InvoiceFormatRuleScopeType;
+    value: string;
+  };
+  document_type: "any" | "bill" | "invoice";
+  templates: {
+    invoice_number: string;
+    invoice_description: string;
+    line_item_description: string;
+  };
+};
+
+export type InvoiceFormatRulesConfig = {
+  version: number;
+  updated_at?: string;
+  description?: string;
+  rule_priority?: string[];
+  template_requirements?: {
+    required_columns: string[];
+  };
+  groups: {
+    vendor_groups: Record<string, { label: string; vendors: string[] }>;
+    gl_groups: Record<string, { label: string; gl_accounts: string[] }>;
+    property_groups: Record<string, { label: string; properties: string[] }>;
+  };
+  rules: InvoiceFormatRule[];
+};
+
+export type InvoiceFormatRulesPayload = {
+  config: InvoiceFormatRulesConfig;
+  template_columns: string[];
+  references: {
+    vendors: { vendor_name: string; vendor_id: string; status: string; default_gl?: string }[];
+    gl_accounts: { gl_code: string; gl_name: string; type: string }[];
+    properties: { property_abbreviation: string; property_name: string }[];
+  };
+  variables: { key: string; label: string }[];
+  presets: Record<string, { label: string; template: string; description: string }[]>;
+  scope_types: { value: InvoiceFormatRuleScopeType; label: string }[];
+};
+
+export type CanonicalRuleGroup = {
+  key: string;
+  title: string;
+  items: string[];
+};
+
+export type CanonicalCategorySummary = {
+  key: string;
+  label: string;
+  summary: string[];
+  group_count: number;
+  editable: boolean;
+};
+
+export type CanonicalRulesPayload = {
+  source: Record<string, unknown>;
+  required_columns: string[];
+  optional_columns: string[];
+  categories: CanonicalCategorySummary[];
+  variables: { key: string; label: string }[];
+};
+
+export type CanonicalCategoryEditable = {
+  labels: string[];
+  vendor_keywords: string[];
+  service_keywords: string[];
+  default_gl_candidates: Record<string, string>;
+  fee_handling: Record<string, string>;
+  ignore_line_keywords: string[];
+  location_policy: string;
+  use_ai: boolean;
+  require_vendor_validation: boolean;
+  require_gl_validation: boolean;
+  invoice_description_format: string;
+  line_item_description_format: string;
+};
+
+export type CanonicalCategoryPayload = {
+  category: CanonicalCategorySummary;
+  groups: CanonicalRuleGroup[];
+  editable: CanonicalCategoryEditable;
+  validation: CanonicalRulesValidationResponse;
+};
+
+export type CanonicalRulesValidationResponse = {
+  ok: boolean;
+  issues: { severity: string; path: string; message: string }[];
+};
+
+export type CanonicalRulesTestBenchResponse = {
+  ok: boolean;
+  skipped?: boolean;
+  skip_reason?: string;
+  dry_run: boolean;
+  fixture_key?: string;
+  test_case: string;
+  title: string;
+  expected: Record<string, unknown>;
+  actual: Record<string, unknown>;
+  checks: {
+    group?: string;
+    field: string;
+    expected: unknown;
+    actual: unknown;
+    pass: boolean;
+    reason?: string;
+    required?: boolean;
+  }[];
+  extracted_candidates: Record<string, unknown>;
+  canonical_application: Record<string, unknown>;
+  rows: PreviewRow[];
+  review_flags: Record<string, unknown>[];
+  reasoning_timeline: { step: string; detail: string }[];
+};
+
+export type CanonicalFixtureSummary = {
+  key: string;
+  vendor: string;
+  category: string;
+  description: string;
+  status: "complete" | "incomplete" | string;
+  requires_live_ai: boolean;
+  skip_reason?: string;
+  last_result?: Record<string, unknown> | null;
+};
+
+export type CanonicalRulesFixtureList = {
+  fixtures: CanonicalFixtureSummary[];
+};
+
+export type CanonicalRulesRunAllResponse = {
+  ok: boolean;
+  results: CanonicalRulesTestBenchResponse[];
+  summary: { fixture_key: string; status: string; failed_checks: string[]; skip_reason?: string }[];
+};
+
+export type CanonicalRulesImportPreview = {
+  ok: boolean;
+  excel_path: string;
+  changed_categories: string[];
+  imported_rows: number;
+  validation: CanonicalRulesValidationResponse;
+};
+
 export type RegionLabel =
   | "service_address"
   | "account_number"

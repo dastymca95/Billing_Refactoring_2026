@@ -15,12 +15,11 @@ type Props = {
 };
 
 const AI_HELP_TASKS = [
-  "Service address extraction",
-  "Account number extraction",
-  "Invoice / due dates",
-  "Total amount disambiguation",
-  "Notice boundary detection",
-  "OCR cleanup on messy scans",
+  "Variable supplier invoice extraction",
+  "Line item reading",
+  "Vendor matching",
+  "GL mapping suggestions",
+  "Total validation",
   "Manual-review explanations",
 ];
 
@@ -69,6 +68,7 @@ export function AiFallbackStatusBadge({ className }: Props) {
       <button
         type="button"
         className={`ai-pill ${labelInfo.tone}`}
+        data-testid="ai-status-pill"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
         aria-haspopup="dialog"
@@ -86,15 +86,27 @@ export function AiFallbackStatusBadge({ className }: Props) {
           <div className="ai-pop-row">
             <span className="ai-pop-key">Provider</span>
             <span className="ai-pop-val">
-              {status?.provider === "disabled"
+              {!status?.provider
                 ? "Not configured"
                 : prettyProvider(status?.provider)}
             </span>
           </div>
           <div className="ai-pop-row">
+            <span className="ai-pop-key">Model</span>
+            <span className="ai-pop-val">{status?.model || "Not configured"}</span>
+          </div>
+          <div className="ai-pop-row">
             <span className="ai-pop-key">Mode</span>
             <span className="ai-pop-val">
               {status?.enabled ? "Rules + OCR + AI" : "Rules + OCR"}
+            </span>
+          </div>
+          <div className="ai-pop-row">
+            <span className="ai-pop-key">Vision</span>
+            <span className="ai-pop-val">
+              {status?.vision_enabled
+                ? `${prettyProvider(status.vision_provider || status.provider)} · ${status.vision_model || "Configured"} · ${status.vision_mode || "fallback_only"}`
+                : "Off"}
             </span>
           </div>
           <div className="ai-pop-section-title">What AI assist can help with</div>
@@ -114,10 +126,10 @@ export function AiFallbackStatusBadge({ className }: Props) {
           <details className="ai-pop-details">
             <summary>Developer setup</summary>
             <div className="ai-pop-hint">
-              Set <code>AI_FALLBACK_ENABLED=true</code>,{" "}
-              <code>AI_PROVIDER</code>, and the matching API key in{" "}
-              <code>.env</code>. See <code>docs/architecture/</code> for the
-              full provider list.
+              Set <code>AI_ASSIST_ENABLED=true</code>, <code>AI_PROVIDER</code>,{" "}
+              <code>AI_BASE_URL</code>, <code>AI_MODEL</code>, and the matching{" "}
+              <code>AI_API_KEY</code> in <code>.env</code>. Restart the backend
+              after changing provider settings.
             </div>
           </details>
         </div>
@@ -152,15 +164,31 @@ function labelFor(
       message: "Checking AI configuration…",
     };
   }
-  if (status.enabled) {
+  if (status.enabled && status.configured) {
+    if (status.provider === "mock") {
+      return {
+        label: "AI: Mock",
+        tone: "tone-ready",
+        message:
+          "AI assist is enabled with the mock provider. Variable invoice processing can be tested without external calls or API keys.",
+      };
+    }
+    if (status.vision_enabled) {
+      return {
+        label: "AI: Vision",
+        tone: "tone-ready",
+        message:
+          "AI assist and AI Vision are configured. Variable invoices, screenshots, and receipt photos can be extracted when deterministic rules do not apply.",
+      };
+    }
     return {
-      label: "AI Ready",
-      tone: "tone-ready",
+      label: "AI: Text only",
+      tone: "tone-configured",
       message:
-        "AI assist is ready. It will suggest values only when rules and OCR confidence is low. Every AI-filled field is flagged for manual review.",
+        "AI assist is configured for text extraction. Screenshots and receipt photos need OCR text or AI Vision enabled.",
     };
   }
-  if (status.provider === "disabled") {
+  if (!status.provider) {
     return {
       label: "AI Off",
       tone: "tone-off",
@@ -171,10 +199,9 @@ function labelFor(
   }
   if (!status.configured) {
     return {
-      label: "AI Not Configured",
-      tone: "tone-configured",
-      message:
-        "A provider is selected but no API key is set yet.",
+      label: "AI Error",
+      tone: "tone-error",
+      message: status.message || status.reason || "AI provider configuration is incomplete.",
       hint: "Configure provider credentials in .env to enable AI fallback.",
     };
   }
@@ -186,19 +213,23 @@ function labelFor(
   };
 }
 
-function prettyProvider(p?: string): string {
+function prettyProvider(p?: string | null): string {
   if (!p) return "—";
   switch (p) {
     case "disabled":
       return "Disabled";
     case "openai":
       return "OpenAI";
+    case "openai_compatible":
+      return "OpenAI-compatible";
     case "anthropic":
       return "Anthropic";
     case "google_gemini":
       return "Google Gemini";
     case "deepseek":
       return "DeepSeek";
+    case "mock":
+      return "Mock provider";
     default:
       return p;
   }

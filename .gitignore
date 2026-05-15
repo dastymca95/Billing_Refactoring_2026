@@ -46,3 +46,10 @@ Thumbs.db
 
 webapp/_phase1d_*
 *.tsbuildinfo
+
+# Phase PERF-1 — runtime artefacts.
+# webapp_data/cache/ is already covered by webapp_data/ above; this
+# block exists to call out the new locations for future contributors.
+# Profile script outputs are under docs/reports/.../phase_perf1/ and
+# are intentionally committed as part of the report.
+webapp_data/cache/ocr/

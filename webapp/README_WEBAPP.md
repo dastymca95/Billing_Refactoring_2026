@@ -27,6 +27,42 @@ A simple local web UI on top of the existing Python/YAML billing logic. Drag bil
 
 The webapp **never duplicates business rules**. All logic stays in `config/vendors/*.yaml` + the existing Python helpers under `utils/` and the vendor processors.
 
+## Universal File Ingestion (Phase AI-9)
+
+Uploads now pass through a document-only normalization layer before the
+universal/canonical invoice reasoner uses them. Deterministic utility processors
+still keep their routing priority; ingestion does not replace Richmond, HWEA,
+Pennyrile, Shelbyville, or the utility processors.
+
+Normalized model:
+
+- `DocumentCandidate`: source type, MIME type, file size, page/sheet counts, text, quality score, OCR/vision recommendations, warnings, page/table/image candidates, and vendor/category hints.
+- `PageCandidate`: per-page text, OCR confidence when available, dimensions, image refs, text blocks.
+- `TableCandidate`: CSV/Excel/Word/PDF table rows, headers, source sheet/page, confidence.
+- `ImageCandidate`: original screenshots/images or rendered page references for vision assist.
+
+Support levels:
+
+| Type | Status | Notes |
+| --- | --- | --- |
+| Digital PDF | Supported | `pdfplumber` text and best-effort table extraction. |
+| Scanned PDF | Supported with OCR caveat | Local OCR is attempted when available; weak text recommends vision. |
+| PNG/JPG/WebP screenshots | Supported with OCR/vision caveat | One page candidate is created; image bytes are not logged. |
+| XLSX | Supported | Uses `openpyxl`, caps very large workbooks, extracts sheets/tables. |
+| CSV | Supported | Detects delimiter, extracts a table candidate, truncates safely. |
+| DOCX | Supported | Reads document XML paragraphs and tables without adding a new dependency. |
+| XLS / DOC / unknown | Limited or unsupported | Returns friendly warnings instead of crashing. |
+| `Output/Template.xlsx` | Protected | Marked as internal template and ignored as an invoice source. |
+
+Diagnostic endpoint, no AI/Dropbox/export side effects:
+
+```powershell
+Invoke-RestMethod "http://localhost:8001/api/batches/<batch_id>/files/<filename>/ingestion-preview"
+```
+
+The response is capped to source type, quality, warnings, hints, a short text
+preview, and limited table previews.
+
 ## Architecture
 
 ```
@@ -679,6 +715,171 @@ Names typed into the modals end up in `batch_metadata.json` and surface in:
 If a metadata file is missing the `batch_name` field (legacy batches from very early phases), the UI falls back to the `batch_id` so nothing is unlabelled.
 
 For full root cause + tests, see [`docs/reports/phases/WEBAPP_PHASE_1P_BATCH_MANAGEMENT_UX_REPORT.md`](../docs/reports/phases/WEBAPP_PHASE_1P_BATCH_MANAGEMENT_UX_REPORT.md).
+
+## Phase AI-1 — AI-assisted variable invoice processing
+
+AI-assisted invoice extraction is available only for vendors without a dedicated deterministic processor, such as HD Supply, Lowe's, Home Depot, maintenance suppliers, and other variable supplier invoices. Richmond Utilities, HWEA, Pennyrile, Shelbyville, McMinnville, Zillow, Atmos, Columbia, and the other wired processors still route through their existing deterministic code first.
+
+AI is disabled by default. When disabled, unknown/variable invoices do not crash processing; they are returned as manual-review items with the message that AI invoice processing is not configured.
+
+To enable a provider, open or create `.env` at the project root and set:
+
+```env
+AI_ASSIST_ENABLED=true
+AI_PROVIDER=openai_compatible
+AI_BASE_URL=<your provider base URL>
+AI_MODEL=<your model name>
+AI_API_KEY=<your-key>
+```
+
+`AI_PROVIDER=openai_compatible` targets providers that expose an OpenAI-compatible `/chat/completions` API. This can be used with DeepSeek-compatible endpoints when you supply that provider's base URL, model name, and key. Do not put a real key in source control.
+
+Vision assist is off by default and remains separate from text extraction. Enable it only when the configured provider/model supports image input:
+
+```env
+AI_VISION_ENABLED=false
+AI_VISION_PROVIDER=openai_compatible
+AI_VISION_MODEL=<vision-capable-model>
+AI_VISION_BASE_URL=<vision provider base URL if different>
+AI_VISION_API_KEY=<vision provider key if different>
+AI_VISION_MAX_PAGES=2
+AI_VISION_MAX_IMAGE_WIDTH=1600
+AI_VISION_MODE=fallback_only
+```
+
+Text-only AI remains the primary path for readable PDFs. Screenshots/photos use vision automatically when `AI_VISION_ENABLED=true`. PDFs use vision when OCR text is empty/weak, or when `AI_VISION_MODE=always`. `AI_VISION_MODEL` must be a model that actually accepts image input. If your text provider does not support images, set `AI_VISION_BASE_URL` and `AI_VISION_API_KEY` for a separate OpenAI-compatible vision provider.
+
+For local deterministic testing without an external provider:
+
+```env
+AI_ASSIST_ENABLED=true
+AI_PROVIDER=mock
+AI_MODEL=mock-invoice-v1
+```
+
+Then restart the backend. Restart the frontend only if you changed frontend dev-server settings. `GET /api/ai/status` confirms whether AI is enabled/configured and never returns the API key.
+
+PowerShell checks:
+
+```powershell
+Invoke-RestMethod http://localhost:8001/api/ai/status
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://localhost:8001/api/ai-invoice/test-extract `
+  -ContentType "application/json" `
+  -Body '{"vendor_hint":"HD Supply","document_text":"Invoice text to test extraction","dry_run":true}'
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://localhost:8001/api/batches/<batch_id>/ai-invoice/vision-assist `
+  -ContentType "application/json" `
+  -Body '{"filename":"invoice.pdf","page_numbers":[1],"vendor_hint":"HD Supply","dry_run":true}'
+```
+
+The test endpoint is a dry run only: it calls the configured provider, validates the structured response, and does not write `Output/Template.xlsx`, create revisions, upload to Dropbox, or persist source files.
+
+Guardrails:
+- AI output is treated as extraction candidates and validated before it reaches the template.
+- Totals, dates, vendor mapping, property abbreviation, GL suggestions, and confidence are checked.
+- Low-confidence or failed validation rows are marked for manual review.
+- The provider receives text-first input; vision assist sends capped page images only when explicitly enabled and useful.
+- Vision trace boxes are stored in the batch-local trace folder and shown as subtle AI vision candidates in the document overlay.
+- Real providers are never called unless `AI_ASSIST_ENABLED=true` and required provider settings are configured.
+- `AI_MAX_TEXT_CHARS`, `AI_MAX_RESPONSE_TOKENS`, `AI_MAX_OUTPUT_CHARS`, `AI_MAX_PAGES`, and `AI_TIMEOUT_SECONDS` cap provider input/output and runtime.
+
+See [`docs/reports/phases/WEBAPP_PHASE_AI1_AI_VENDOR_INVOICE_PROCESSOR_AND_SCAN_UX_REPORT.md`](../docs/reports/phases/WEBAPP_PHASE_AI1_AI_VENDOR_INVOICE_PROCESSOR_AND_SCAN_UX_REPORT.md).
+
+## Output Format Rules
+
+The sidebar includes a `Formats` stage for changing ResMan output formatting without editing code. Use it to configure:
+
+- required invoice number generation
+- invoice description format
+- line item description format
+- global rules
+- vendor-specific rules
+- vendor group rules
+- GL code / GL group rules
+- property / property group rules
+
+Rules are stored in:
+
+```text
+config/invoice_format_rules.yaml
+```
+
+The backend writes this file atomically and keeps backups under:
+
+```text
+config/.backups/invoice_format_rules/
+```
+
+Example invoice-number template:
+
+```text
+{account_number}-{service_period_start_month3_upper}{service_period_end_year2}
+```
+
+This previews as:
+
+```text
+040582701-01-MAR26
+```
+
+Useful API checks:
+
+```powershell
+Invoke-RestMethod http://localhost:8001/api/invoice-format-rules
+
+$body = @{
+  sample = @{}
+} | ConvertTo-Json -Depth 6
+Invoke-RestMethod -Method Post -Uri http://localhost:8001/api/invoice-format-rules/preview -ContentType "application/json" -Body $body
+```
+
+## Phase U1 Utility Processor Expansion
+
+Utility vendor expansion now has a shared deterministic contract instead of
+one-off script behavior.
+
+Added U1 pieces:
+
+- `webapp/backend/services/utility_processor_common.py`
+- `utils/utility_bill_parser.py`
+- `utils/utility_tax_allocator.py`
+- `utils/utility_invoice_number.py`
+- `utils/utility_line_classifier.py`
+- `scripts/bootstrap_utility_vendor_configs.py`
+- `scripts/smoke_utility_processors.py`
+
+Every in-scope utility vendor YAML now has a `utility_processing:` overlay that
+records its training folder, implementation status, processor registration,
+tax behavior, fee behavior, community billing behavior, and validation
+contract.
+
+Utility rules enforced by the shared layer:
+
+- tax is allocated proportionally; standalone tax rows are forbidden
+- connection/reconnection fees use GL `6956`
+- late fees do not use GL `6956`
+- previous balances and payments are not exported as expense rows by default
+- Property Abbreviation is mandatory
+- Location is used only for valid Unit Info Clean unit/location matches
+- raw full addresses are forbidden in Location
+- GL Account must be numeric and present in Chart of Accounts
+
+Run:
+
+```powershell
+python scripts\smoke_utility_processors.py
+```
+
+Reports:
+
+- `docs/reports/phases/UTILITY_VENDOR_DISCOVERY_REPORT.md`
+- `docs/reports/phases/UTILITY_OLD_SCRIPTS_ANALYSIS_REPORT.md`
+- `docs/reports/phases/WEBAPP_PHASE_U1_UTILITY_VENDOR_PROCESSOR_EXPANSION_REPORT.md`
 
 ## Things this Phase **does NOT** do
 

@@ -1,0 +1,34 @@
+status: complete
+vendor_expected: EPB Fiber Optics
+category_expected: utilities
+invoice_number_expected: C10181446 May 26
+account_number_expected: C10181446
+invoice_date_expected: 05/07/2026
+due_date_expected: 05/22/2026
+service_period_expected:
+  start: 05/08/2026
+  end: 06/07/2026
+  range: 05/08/26-06/07/26
+property_abbreviation_expected: RCC
+location_expected: ""
+location_policy_expected: valid_unit_if_present
+invoice_description_expected: 05/08/26-06/07/26 - 21752 River Canyon Rd
+line_items_expected:
+  - line_item_number: 1
+    gl_account: "6139"
+    description: 05/08/26-06/07/26 - 21752 River Canyon Rd - Fi-Speed Internet
+    amount: 67.98
+  - line_item_number: 2
+    gl_account: "6139"
+    description: 05/08/26-06/07/26 - 21752 River Canyon Rd - Tax and Surcharges
+    amount: 0.97
+expense_type_expected: General
+is_replacement_reserve_expected: false
+total_expected: 68.95
+expected_review_flags:
+  - invoice_number_formatted_from_policy
+  - location_unresolved
+ignored_source_items:
+  - previous_balance
+  - payments
+notes: EPB uses current invoice-number formatting policy for utility bills, so the output invoice number intentionally uses account plus service period month/year.

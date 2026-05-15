@@ -1,0 +1,46 @@
+{
+  "key": "tk_elevator",
+  "vendor": "TK Elevator Corporation",
+  "category": "other_infrequent",
+  "description": "TK Elevator service invoice with labor and trip-charge lines.",
+  "status": "complete",
+  "requires_live_ai": false,
+  "source_document": "tk_elevator_7000080162.png",
+  "support_document_url": "https://dropbox.example/canonical/tk-elevator-7000080162.png",
+  "extracted_candidates": {
+    "vendor_name": "TK Elevator",
+    "category": "other_infrequent",
+    "invoice_number": "7000080162",
+    "invoice_date": "08/27/2025",
+    "due_date": "08/27/2025",
+    "bill_or_credit": "Bill",
+    "account_number": "8039646-229260",
+    "service_address": "600 Georgia Ave, Chattanooga, TN 37402-1407",
+    "property_candidate": "Hogshead Apartments",
+    "line_items": [
+      {
+        "description": "Governor switch tripped adjusted governor - labor",
+        "quantity": 1,
+        "unit_price": 637.5,
+        "amount": 637.5,
+        "gl_account_candidate": "6530",
+        "confidence": 0.93,
+        "reason": "Visible TK Elevator labor/service line."
+      },
+      {
+        "description": "Trip charge",
+        "quantity": 1,
+        "unit_price": 95.0,
+        "amount": 95.0,
+        "gl_account_candidate": "6530",
+        "confidence": 0.93,
+        "reason": "Visible TK Elevator trip charge line."
+      }
+    ],
+    "subtotal": 732.5,
+    "tax_amount": 0,
+    "total_amount": 732.5,
+    "confidence": 0.93,
+    "warnings": []
+  }
+}

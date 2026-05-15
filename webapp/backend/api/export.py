@@ -95,6 +95,8 @@ def export_endpoint(batch_id: str, body: Optional[ExportRequest] = None) -> dict
     edited_rows = body.edited_rows if (body and body.edited_rows is not None) else None
     try:
         return batch_processor.export_batch(batch_id, edited_rows=edited_rows)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 

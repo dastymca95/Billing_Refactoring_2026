@@ -33,7 +33,10 @@ type Props = {
   fileUrl: string;
   pageNumber: number;
   zoom: number;
+  initialNaturalSize?: { width: number; height: number } | null;
+  onFirstFrame?: (pageNumber: number) => void;
   onPageRendered?: (info: PageInfo) => void;
+  suppressFirstFramePlaceholder?: boolean;
 };
 
 // Per-tab cache for loaded PDF documents. Avoids re-parsing the same
@@ -95,14 +98,24 @@ const RASTER_DEBOUNCE_MS = 150;
 // scaling starts to read as fuzzy on retina displays.
 const STRETCH_THRESHOLD = 1.6;
 
-export function PdfPageCanvas({ fileUrl, pageNumber, zoom, onPageRendered }: Props) {
+export function PdfPageCanvas({
+  fileUrl,
+  pageNumber,
+  zoom,
+  initialNaturalSize,
+  onFirstFrame,
+  onPageRendered,
+  suppressFirstFramePlaceholder = false,
+}: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hasFrame, setHasFrame] = useState(false);
   // Phase 2I — natural (zoom = 1) page size, captured on the first
   // successful render. All subsequent layout math is derived from it,
   // so we don't have to re-rasterise just to learn the page dimensions.
-  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(null);
+  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(
+    initialNaturalSize ?? null,
+  );
 
   // The scale we *actually* rasterised at. Lags the `zoom` prop while
   // the user is wheel-zooming; catches up after the debounce.
@@ -118,6 +131,10 @@ export function PdfPageCanvas({ fileUrl, pageNumber, zoom, onPageRendered }: Pro
   useEffect(() => {
     onPageRenderedRef.current = onPageRendered;
   }, [onPageRendered]);
+  const onFirstFrameRef = useRef(onFirstFrame);
+  useEffect(() => {
+    onFirstFrameRef.current = onFirstFrame;
+  }, [onFirstFrame]);
 
   const setLoadingDelayed = useCallback((on: boolean) => {
     if (on) {
@@ -132,7 +149,7 @@ export function PdfPageCanvas({ fileUrl, pageNumber, zoom, onPageRendered }: Pro
 
   // Reset raster cache when the file or page changes.
   useEffect(() => {
-    setNaturalSize(null);
+    setNaturalSize(initialNaturalSize ?? null);
     setHasFrame(false);
     setRasterScale(zoom);
     lastZoomRef.current = zoom;
@@ -140,7 +157,7 @@ export function PdfPageCanvas({ fileUrl, pageNumber, zoom, onPageRendered }: Pro
     // file/page swaps, not on zoom changes (which the dedicated
     // debounce effect below handles).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fileUrl, pageNumber]);
+  }, [fileUrl, pageNumber, initialNaturalSize?.width, initialNaturalSize?.height]);
 
   // Phase 2I — debounce the heavy raster re-render. While the user is
   // wheel-zooming, ``zoom`` keeps changing every few milliseconds; we
@@ -217,6 +234,7 @@ export function PdfPageCanvas({ fileUrl, pageNumber, zoom, onPageRendered }: Pro
         if (!naturalSize) setNaturalSize(natural);
 
         setHasFrame(true);
+        onFirstFrameRef.current?.(pageNumber);
         cancelDelay();
         setLoadingVisible(false);
         // Notify the parent with the *displayed* size at the current
@@ -236,6 +254,7 @@ export function PdfPageCanvas({ fileUrl, pageNumber, zoom, onPageRendered }: Pro
         if ((e as { name?: string })?.name === "RenderingCancelledException")
           return;
         setError("Could not render this PDF page.");
+        onFirstFrameRef.current?.(pageNumber);
         // eslint-disable-next-line no-console
         console.warn("PDF render failed:", e);
         cancelDelay();
@@ -319,7 +338,7 @@ export function PdfPageCanvas({ fileUrl, pageNumber, zoom, onPageRendered }: Pro
             : undefined
         }
       />
-      {!hasFrame && !error && (
+      {!suppressFirstFramePlaceholder && !hasFrame && !error && (
         <div className="pdf-canvas-first-frame" data-testid="pdf-first-frame-placeholder">
           <div className="pdf-canvas-first-frame-page" />
         </div>

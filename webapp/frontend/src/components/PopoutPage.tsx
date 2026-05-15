@@ -23,8 +23,10 @@ import type {
   BatchStatus,
   ManualReviewItem,
   PreviewResponse,
+  PreviewRow,
 } from "../types";
 import { DocumentPreviewPanel } from "./DocumentPreviewPanel";
+import type { CellEdits } from "./ResManTemplatePreview";
 import { TemplateWorkspace } from "./TemplateWorkspace";
 
 type PopoutKind = "template" | "document";
@@ -65,6 +67,7 @@ export default function PopoutPage({ query }: { query: PopoutQuery }) {
     ? { batchId: query.batch, filename: query.file, pageNumber: 1 }
     : null);
   const [selectedRowIndex, setSelectedRowIndex] = useState<number | null>(null);
+  const [edits, setEdits] = useState<CellEdits>({});
 
   // BroadcastChannel sync with the main window. Outgoing: this popout
   // posts `row-select` whenever the operator picks a row. Incoming:
@@ -80,8 +83,29 @@ export default function PopoutPage({ query }: { query: PopoutQuery }) {
     ch.onmessage = (ev) => {
       const data = ev.data as
         | { type: "row-select"; rowIndex: number | null; source: string }
+        | { type: "cell-edit"; rowIndex: number; columnKey: string; value: unknown; source: string }
+        | { type: "row-add"; row: PreviewRow; source: string }
         | undefined;
-      if (!data || data.type !== "row-select" || data.source === "popout") return;
+      if (!data || data.source === "popout") return;
+      if (data.type === "cell-edit") {
+        setEdits((prev) => ({
+          ...prev,
+          [data.rowIndex]: {
+            ...(prev[data.rowIndex] ?? {}),
+            [data.columnKey]: data.value,
+          },
+        }));
+        return;
+      }
+      if (data.type === "row-add") {
+        setPreview((prev) => {
+          if (!prev) return prev;
+          const rows = [...prev.rows, data.row];
+          return { ...prev, rows, row_count: rows.length };
+        });
+        return;
+      }
+      if (data.type !== "row-select") return;
       lastIncomingRowRef.current = data.rowIndex; // suppress echo
       setSelectedRowIndex(data.rowIndex);
     };
@@ -90,6 +114,27 @@ export default function PopoutPage({ query }: { query: PopoutQuery }) {
       if (channelRef.current === ch) channelRef.current = null;
     };
   }, [query.kind, query.batch]);
+
+  const refreshTemplate = useCallback(async () => {
+    if (query.kind !== "template") return;
+    try {
+      const s = await api.getBatch(query.batch);
+      setStatus(s);
+      if (s.preview_available) {
+        const [p, r] = await Promise.all([
+          api.preview(query.batch),
+          api.manualReview(query.batch),
+        ]);
+        setPreview(p);
+        setReview(r.items);
+      } else {
+        setPreview(null);
+        setReview([]);
+      }
+    } catch (e) {
+      setError(getFriendlyErrorMessage(e, "Refresh detached review"));
+    }
+  }, [query.batch, query.kind]);
 
   const handleSelectRow = useCallback((rowIndex: number | null) => {
     setSelectedRowIndex(rowIndex);
@@ -105,6 +150,46 @@ export default function PopoutPage({ query }: { query: PopoutQuery }) {
       source: "popout",
     });
   }, []);
+
+  const handleCellEdit = useCallback(
+    (rowIndex: number, columnKey: string, value: unknown) => {
+      setEdits((prev) => ({
+        ...prev,
+        [rowIndex]: {
+          ...(prev[rowIndex] ?? {}),
+          [columnKey]: value,
+        },
+      }));
+      channelRef.current?.postMessage({
+        type: "cell-edit",
+        rowIndex,
+        columnKey,
+        value,
+        source: "popout",
+      });
+    },
+    [],
+  );
+
+  const handleAddPreviewRow = useCallback(
+    (row: PreviewRow, _afterRowIndex?: number) => {
+      setPreview((prev) => {
+        if (!prev) return prev;
+        const rows = [...prev.rows, row];
+        return {
+          ...prev,
+          rows,
+          row_count: rows.length,
+        };
+      });
+      channelRef.current?.postMessage({
+        type: "row-add",
+        row,
+        source: "popout",
+      });
+    },
+    [],
+  );
 
   // Mark the body so popout-specific CSS can apply (no scrollbars on root,
   // no app shell padding, etc.).
@@ -204,7 +289,7 @@ export default function PopoutPage({ query }: { query: PopoutQuery }) {
           <span className="popout-header-meta">
             · {status.batch_name || query.batch}
           </span>
-          <span className="popout-header-readonly">Read-only</span>
+          <span className="popout-header-readonly">Detached review</span>
         </div>
         <button type="button" className="popout-header-close" onClick={closeWindow}>
           Close window
@@ -214,16 +299,17 @@ export default function PopoutPage({ query }: { query: PopoutQuery }) {
         {query.kind === "template" && (
           <TemplateWorkspace
             preview={preview}
-            edits={{}}
-            onCellEdit={() => undefined}
+            edits={edits}
+            onCellEdit={handleCellEdit}
+            onAddPreviewRow={handleAddPreviewRow}
+            batchId={query.batch}
+            onAiMappingApplied={refreshTemplate}
             fileCount={fileCount}
             selectedRowIndex={selectedRowIndex}
             activeDocumentPage={null}
             // Picking a row here broadcasts to the main window so the
             // Document panel scrolls to the matching bill page.
             onSelectRow={handleSelectRow}
-            // Suppress edit-only affordances inside the popout.
-            readOnly
             batchName={status.batch_name}
             vendorLabel={vendorLabel}
             exportName={(status.metadata as any)?.export_name || ""}

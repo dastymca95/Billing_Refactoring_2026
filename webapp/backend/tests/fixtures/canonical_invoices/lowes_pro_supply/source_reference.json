@@ -1,0 +1,45 @@
+{
+  "key": "lowes_pro_supply",
+  "vendor": "Lowes Pro Supply",
+  "category": "other_infrequent",
+  "description": "Lowe's Pro Supply small hardware invoice with tax and excluded zero-dollar promotional line.",
+  "status": "complete",
+  "requires_live_ai": false,
+  "source_document": "lowes_pro_supply_83690.pdf",
+  "support_document_url": "https://dropbox.example/canonical/lowes-pro-supply-83690.pdf",
+  "ignored_source_items": ["zero_amount_lines"],
+  "extracted_candidates": {
+    "vendor_name": "Lowe's Pro Supply",
+    "category": "other_infrequent",
+    "invoice_number": "83690",
+    "invoice_date": "05/09/2026",
+    "due_date": "06/08/2026",
+    "bill_or_credit": "Bill",
+    "service_address": "850 Professional Park Dr, Clarksville, TN 37040-5256",
+    "property_candidate": "The Oakley at Pro Park",
+    "line_items": [
+      {
+        "description": "3-3/4-In (96mm) bar pull",
+        "quantity": 1,
+        "unit_price": 6.16,
+        "amount": 6.16,
+        "gl_account_candidate": "6651",
+        "confidence": 0.84,
+        "reason": "Visible hardware line item."
+      },
+      {
+        "description": "Promotional discount app",
+        "quantity": 1,
+        "unit_price": 0,
+        "amount": 0,
+        "confidence": 0.75,
+        "reason": "Visible zero-dollar promotional line."
+      }
+    ],
+    "subtotal": 6.16,
+    "tax_amount": 0.59,
+    "total_amount": 6.75,
+    "confidence": 0.85,
+    "warnings": []
+  }
+}

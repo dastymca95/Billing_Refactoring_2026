@@ -1,0 +1,31 @@
+status: complete
+vendor_expected: Capital Waste Services
+category_expected: trash_collection_services
+invoice_number_expected: "3150854"
+account_number_expected: "160243"
+invoice_date_expected: 04/30/2026
+due_date_expected: 05/30/2026
+service_period_expected:
+  start: 05/01/2026
+  end: 05/31/2026
+  range: 05/01/26-05/31/26
+property_abbreviation_expected: RCC
+location_expected: ""
+location_policy_expected: property_level_blank_location_allowed
+invoice_description_expected: 05/01/26-05/31/26 - River Canyon Apartments
+line_items_expected:
+  - line_item_number: 1
+    gl_account: "6940"
+    description: 05/01/26-05/31/26 - River Canyon Apartments - 6 Yard Trash Service
+    amount: 365.40
+  - line_item_number: 2
+    gl_account: "6940"
+    description: 05/01/26-05/31/26 - River Canyon Apartments - Fuel Recovery Adjustment
+    amount: 34.93
+expense_type_expected: General
+is_replacement_reserve_expected: false
+total_expected: 400.33
+expected_review_flags: []
+ignored_source_items:
+  - previous_balance
+  - payments

@@ -11,13 +11,27 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { api, getFriendlyErrorMessage } from "../api";
-import type { BatchListEntry, BatchProgress, FileEntry } from "../types";
+import { KebabMenu } from "./KebabMenu";
+import {
+  DOCUMENT_MODE_DESCRIPTIONS,
+  DOCUMENT_MODE_LABELS,
+  DOCUMENT_MODES,
+  type BatchListEntry,
+  type BatchProgress,
+  type DocumentMode,
+  type FileEntry,
+  type UploadFileProgress,
+} from "../types";
 
 type Props = {
   batchList: BatchListEntry[];
   activeBatchId: string | null;
   onSwitchBatch: (batchId: string) => Promise<boolean | void> | boolean | void;
-  onCreateBatch: () => void;
+  onCreateBatch: (params: {
+    batchName?: string;
+    documentMode: DocumentMode;
+  }) => Promise<string | void> | string | void;
+  createRequestToken?: number;
   onRenameBatch: (batchId: string, newName: string) => Promise<void>;
   onDeleteBatch: (batchId: string) => void;
   onRefreshBatchList: () => void;
@@ -44,8 +58,16 @@ type Props = {
     batchId: string,
     files: File[],
   ) => Promise<void> | void;
+  uploadItems?: UploadFileProgress[];
 
   onProcessBatch: (batchId: string) => Promise<void> | void;
+  // Phase 2M — process a single file in the batch (skips the queue,
+  // runs synchronously on the server, refreshes the preview).
+  onProcessFile?: (
+    batchId: string,
+    filename: string,
+    mode?: "replace" | "merge",
+  ) => Promise<void> | void;
   processingBatchId?: string | null;
   isProcessing: boolean;
   isSwitchingBatch?: boolean;
@@ -59,13 +81,16 @@ type Props = {
 };
 
 const ACCEPT_TYPES = ".csv,.xlsx,.xls,.pdf,.png,.jpg,.jpeg,.gif,.bmp,.webp,.docx,.doc,.txt";
+const SCREENSHOT_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp"]);
 const FILE_LOAD_TIMEOUT_MS = 12_000;
+const BATCH_NAME_MAX = 80;
 
 export function BatchExplorer({
   batchList,
   activeBatchId,
   onSwitchBatch,
   onCreateBatch,
+  createRequestToken,
   onRenameBatch,
   onDeleteBatch,
   onRefreshBatchList,
@@ -77,16 +102,28 @@ export function BatchExplorer({
   onDeleteFile,
   onUploadFiles,
   onUploadFilesToBatch,
+  uploadItems = [],
   onProcessBatch,
+  onProcessFile,
   processingBatchId,
   isProcessing,
   isSwitchingBatch,
   queueStatus,
   progress,
 }: Props) {
-  const [openIds, setOpenIds] = useState<Set<string>>(() =>
-    activeBatchId ? new Set([activeBatchId]) : new Set(),
-  );
+  const [openIds, setOpenIds] = useState<Set<string>>(() => new Set());
+  const listRef = useRef<HTMLDivElement | null>(null);
+
+  const restoreListScroll = useCallback((scrollTop: number) => {
+    const list = listRef.current;
+    if (!list) return;
+    window.requestAnimationFrame(() => {
+      list.scrollTop = scrollTop;
+      window.requestAnimationFrame(() => {
+        list.scrollTop = scrollTop;
+      });
+    });
+  }, []);
 
   // Phase 2I.14 — auto-expand the batch that just started running, so
   // the operator sees the per-file progress without having to click.
@@ -138,12 +175,6 @@ export function BatchExplorer({
   useEffect(() => {
     if (!activeBatchId) return;
     setDragOverBatchId(null);
-    setOpenIds((prev) => {
-      if (prev.has(activeBatchId)) return prev;
-      const next = new Set(prev);
-      next.add(activeBatchId);
-      return next;
-    });
   }, [activeBatchId]);
 
   useEffect(() => {
@@ -246,12 +277,14 @@ export function BatchExplorer({
   ]);
 
   const toggleOpen = (batchId: string) => {
+    const scrollTop = listRef.current?.scrollTop ?? 0;
     setOpenIds((prev) => {
       const next = new Set(prev);
       if (next.has(batchId)) next.delete(batchId);
       else next.add(batchId);
       return next;
     });
+    restoreListScroll(scrollTop);
   };
 
   const toggleFileOpen = (batchId: string, filename: string) => {
@@ -317,20 +350,12 @@ export function BatchExplorer({
 
   return (
     <div className="batch-explorer" data-testid="batch-explorer">
-      <div className="batch-explorer-header">
-        <span className="batch-explorer-title">Batches</span>
-        <button
-          type="button"
-          className="batch-explorer-add"
-          onClick={onCreateBatch}
-          title="Create a new batch"
-          aria-label="Create a new batch"
-          data-testid="explorer-add-batch"
-        >
-          <PlusIcon /> New batch
-        </button>
-      </div>
-      <div className="batch-explorer-list">
+      <div className="batch-explorer-list" ref={listRef}>
+        <CreateBatchRow
+          requestToken={createRequestToken}
+          onCreate={onCreateBatch}
+          onUploadCreatedFiles={(batchId, pasted) => uploadToBatch(batchId, pasted)}
+        />
         {batchList.length === 0 && (
           <div className="batch-explorer-empty">
             No batches yet. Create a batch to start collecting bills.
@@ -341,6 +366,9 @@ export function BatchExplorer({
           const isOpen = openIds.has(b.batch_id);
           const isThisProcessing = processingBatchId === b.batch_id;
           const filesForBatch = isActive ? files : filesByBatchId[b.batch_id] ?? [];
+          const uploadsForBatch = uploadItems.filter(
+            (item) => item.batchId === b.batch_id,
+          );
           return (
             <BatchRow
               key={b.batch_id}
@@ -368,6 +396,7 @@ export function BatchExplorer({
               <BatchChildren
                 batchId={b.batch_id}
                 files={filesForBatch}
+                uploadItems={uploadsForBatch}
                 isLoading={
                   !isActive &&
                   loadingBatches.has(b.batch_id) &&
@@ -392,6 +421,11 @@ export function BatchExplorer({
                     }));
                   }
                 }}
+                onProcessFile={
+                  onProcessFile
+                    ? (filename, mode) => void onProcessFile(b.batch_id, filename, mode)
+                    : undefined
+                }
                 onUploadFiles={(dropped) => void uploadToBatch(b.batch_id, dropped)}
                 isProcessing={isProcessing}
                 isSwitchingBatch={isActive ? isSwitchingBatch : false}
@@ -401,6 +435,240 @@ export function BatchExplorer({
             </BatchRow>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+function CreateBatchRow({
+  requestToken,
+  onCreate,
+  onUploadCreatedFiles,
+}: {
+  requestToken?: number;
+  onCreate: (params: {
+    batchName?: string;
+    documentMode: DocumentMode;
+  }) => Promise<string | void> | string | void;
+  onUploadCreatedFiles?: (batchId: string, files: File[]) => Promise<void> | void;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [draftName, setDraftName] = useState("");
+  const [mode, setMode] = useState<DocumentMode>("auto_detect");
+  const [error, setError] = useState<string | null>(null);
+  const [isCreating, setIsCreating] = useState(false);
+  const [queuedScreenshots, setQueuedScreenshots] = useState<File[]>([]);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!requestToken) return;
+    setIsOpen(true);
+  }, [requestToken]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const id = window.setTimeout(() => inputRef.current?.focus(), 120);
+    return () => window.clearTimeout(id);
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      const node = wrapRef.current;
+      if (!node) return;
+      if (e.target instanceof Node && !node.contains(e.target)) {
+        setIsOpen(false);
+        setError(null);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [isOpen]);
+
+  const reset = () => {
+    setDraftName("");
+    setMode("auto_detect");
+    setError(null);
+    setQueuedScreenshots([]);
+  };
+
+  const close = () => {
+    setIsOpen(false);
+    reset();
+  };
+
+  const submit = async () => {
+    const name = draftName.trim();
+    if (name.length > BATCH_NAME_MAX) {
+      setError(`Batch name is too long (max ${BATCH_NAME_MAX} characters).`);
+      return;
+    }
+    setError(null);
+    setIsCreating(true);
+    try {
+      const created = await onCreate({ batchName: name || undefined, documentMode: mode });
+      const createdBatchId = typeof created === "string" ? created : undefined;
+      const filesToUpload = queuedScreenshots.slice();
+      close();
+      if (createdBatchId && filesToUpload.length > 0 && onUploadCreatedFiles) {
+        window.setTimeout(() => {
+          void Promise.resolve(onUploadCreatedFiles(createdBatchId, filesToUpload)).catch((error) => {
+            // The upload path owns user-facing toasts and inline row errors.
+            // Keep this panel responsive; do not hold "Creating..." open
+            // while screenshots are being uploaded.
+            // eslint-disable-next-line no-console
+            console.warn("queued screenshot upload failed:", error);
+          });
+        }, 0);
+      }
+    } catch (e) {
+      setError(getFriendlyErrorMessage(e, "Create batch"));
+    } finally {
+      setIsCreating(false);
+    }
+  };
+
+  const queueScreenshotFiles = (files: File[]) => {
+    const images = files.filter(isScreenshotFile);
+    if (images.length === 0) return;
+    setQueuedScreenshots((prev) => [...prev, ...images.map(normalizeScreenshotFile)]);
+    setMode("screenshot_image");
+    setError(null);
+  };
+
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const files = filesFromClipboard(e.clipboardData);
+    if (files.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    queueScreenshotFiles(files);
+  };
+
+  return (
+    <div
+      className={`create-batch-row ${isOpen ? "open" : ""}`}
+      data-testid="explorer-add-batch"
+      ref={wrapRef}
+    >
+      <button
+        type="button"
+        className="create-batch-trigger"
+        onClick={() => setIsOpen((v) => !v)}
+        aria-expanded={isOpen}
+        aria-controls="inline-new-batch-panel"
+        title="Create a new batch"
+      >
+        <span className="create-batch-plus" aria-hidden>
+          <PlusIcon />
+        </span>
+        <span className="create-batch-title">New batch</span>
+      </button>
+      <div
+        className={`create-batch-popover ${isOpen ? "open" : ""}`}
+        id="inline-new-batch-panel"
+        data-testid="inline-new-batch-panel"
+        aria-hidden={!isOpen}
+        role="menu"
+      >
+        <div className="create-batch-panel" onPaste={handlePaste}>
+          <input
+            ref={inputRef}
+            type="text"
+            className="create-batch-input"
+            data-testid="inline-new-batch-name-input"
+            placeholder="Optional batch name"
+            value={draftName}
+            maxLength={BATCH_NAME_MAX + 5}
+            onChange={(e) => {
+              setDraftName(e.target.value);
+              if (error) setError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void submit();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                close();
+              }
+            }}
+          />
+          <div className="create-batch-mode-list" role="listbox" aria-label="Document type">
+            {DOCUMENT_MODES.map((m) => (
+              <button
+                key={m}
+                type="button"
+                className={`create-batch-mode ${mode === m ? "active" : ""}`}
+                onClick={() => setMode(m)}
+                role="option"
+                aria-selected={mode === m}
+              >
+                <span className="create-batch-mode-icon" aria-hidden>
+                  {modeIcon(m)}
+                </span>
+                <span className="create-batch-mode-copy">
+                  <span className="create-batch-mode-title">
+                    {DOCUMENT_MODE_LABELS[m]}
+                  </span>
+                  <span className="create-batch-mode-description">
+                    {shortModeDescription(m)}
+                  </span>
+                </span>
+                {mode === m && <CheckMarkIcon />}
+              </button>
+            ))}
+          </div>
+          <div
+            className={`create-batch-screenshot-drop ${queuedScreenshots.length ? "has-files" : ""}`}
+            tabIndex={0}
+            onPaste={handlePaste}
+            onDragOver={(e) => {
+              e.preventDefault();
+              if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              queueScreenshotFiles(Array.from(e.dataTransfer.files || []));
+            }}
+            data-dropzone="true"
+            data-testid="inline-new-batch-screenshot-paste"
+          >
+            <span>{queuedScreenshots.length ? `${queuedScreenshots.length} screenshot${queuedScreenshots.length === 1 ? "" : "s"} ready` : "Paste or drop screenshots"}</span>
+            <small>{queuedScreenshots.length ? "They upload after Create." : "Ctrl+V from snipping tool or phone photo."}</small>
+          </div>
+          {error && (
+            <div className="create-batch-error" data-testid="inline-new-batch-error">
+              {error}
+            </div>
+          )}
+          <div className="create-batch-actions">
+            <button
+              type="button"
+              className="create-batch-cancel"
+              onClick={close}
+              disabled={isCreating}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="create-batch-submit"
+              onClick={() => void submit()}
+              disabled={isCreating}
+              data-testid="inline-create-batch-submit"
+            >
+              {isCreating ? "Creating..." : "Create"}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -600,19 +868,28 @@ function BatchRow({
             </>
           )}
         </button>
-        <button
-          type="button"
-          className="batch-row-delete"
-          title={`Delete "${friendly}"`}
-          aria-label={`Delete batch "${friendly}"`}
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete();
-          }}
-          data-testid="explorer-batch-delete"
+        {/* Phase 2M — destructive + power actions live inside a kebab
+            (3-dots) menu instead of an always-visible trash icon, so the
+            row stays calm. The Process button is kept as a primary
+            action because it's frequent and non-destructive. */}
+        <span
+          className="batch-row-kebab-wrap"
+          onClick={(e) => e.stopPropagation()}
         >
-          <TrashIcon />
-        </button>
+          <KebabMenu
+            ariaLabel={`More actions for "${friendly}"`}
+            testId="explorer-batch-menu"
+            className="batch-row-kebab"
+            items={[
+              {
+                label: "Delete batch",
+                tone: "danger",
+                icon: <TrashIcon />,
+                onClick: onDelete,
+              },
+            ]}
+          />
+        </span>
       </div>
       {/* Phase 2I.14 — live progress strip on the folder. Shows a thin
           animated fill that tracks `percent` plus a one-line status
@@ -693,6 +970,7 @@ function numberOrNull(v: unknown): number | null {
 function BatchChildren({
   batchId,
   files,
+  uploadItems = [],
   isLoading,
   errorMessage,
   selectedFile,
@@ -703,6 +981,7 @@ function BatchChildren({
   onSelectFile,
   onSelectPage,
   onDeleteFile,
+  onProcessFile,
   onUploadFiles,
   isProcessing,
   isSwitchingBatch,
@@ -711,6 +990,7 @@ function BatchChildren({
 }: {
   batchId: string;
   files: FileEntry[];
+  uploadItems?: UploadFileProgress[];
   isLoading: boolean;
   errorMessage?: string;
   selectedFile: string | null;
@@ -725,13 +1005,20 @@ function BatchChildren({
   onSelectFile: (filename: string) => void;
   onSelectPage: (filename: string, pageNumber: number) => void;
   onDeleteFile: (filename: string) => void;
+  onProcessFile?: (filename: string, mode?: "replace" | "merge") => void;
   onUploadFiles: (files: File[]) => void;
   isProcessing: boolean;
   isSwitchingBatch?: boolean;
   expectedFileCount: number;
   progress?: BatchProgress | null;
 }) {
-  if (isLoading) {
+  const actualFileNames = new Set(files.map((file) => file.filename));
+  const visibleUploads = uploadItems.filter(
+    (item) => item.status !== "done" || !actualFileNames.has(item.filename),
+  );
+  const hasVisibleRows = files.length > 0 || visibleUploads.length > 0;
+
+  if (isLoading && visibleUploads.length === 0) {
     const n = Math.max(1, Math.min(6, expectedFileCount || 2));
     return (
       <div className="batch-row-children">
@@ -757,12 +1044,12 @@ function BatchChildren({
           </button>
         </div>
       )}
-      {!errorMessage && files.length === 0 && (
+      {!errorMessage && !hasVisibleRows && (
         <div className="batch-row-empty" data-testid="batch-files-empty">
           No files in this batch.
         </div>
       )}
-      {!errorMessage && files.length > 0 && (
+      {!errorMessage && hasVisibleRows && (
         <ul className="batch-row-files">
           {(() => {
             const currentFile = progress?.current_file?.trim() || "";
@@ -808,12 +1095,20 @@ function BatchChildren({
                     onSelectPage(f.filename, pageNumber)
                   }
                   onDelete={() => onDeleteFile(f.filename)}
+                  onProcess={
+                    onProcessFile
+                      ? (mode) => onProcessFile(f.filename, mode)
+                      : undefined
+                  }
                   processingPhase={phase}
                   filePercent={filePct}
                 />
               );
             });
           })()}
+          {visibleUploads.map((item) => (
+            <UploadFileChild key={item.id} item={item} />
+          ))}
         </ul>
       )}
       <AddFilesAffordance
@@ -821,6 +1116,65 @@ function BatchChildren({
         disabled={isProcessing || isSwitchingBatch === true}
       />
     </div>
+  );
+}
+
+function UploadFileChild({ item }: { item: UploadFileProgress }) {
+  const ext = (item.extension || extensionFromName(item.filename)).replace(/^\./, "").toLowerCase();
+  const pct = clamp01(item.percent);
+  const isFailed = item.status === "failed";
+  const isUploading = item.status === "uploading";
+  const isDone = item.status === "done";
+  const phase = isFailed ? "failed" : isUploading ? "active" : isDone ? "done" : "pending";
+  const statusLabel = isFailed
+    ? "Upload failed"
+    : isUploading
+        ? `Uploading ${Math.round(pct)}%`
+        : isDone
+          ? "Uploaded"
+          : "Waiting to upload";
+  return (
+    <li
+      className={`file-tree-node upload-tree-node phase-${phase}`}
+      data-testid="explorer-upload-node"
+      data-filename={item.filename}
+    >
+      <div className={`file-row upload-file-row phase-${phase}`}>
+        <span className="file-row-page-spacer" aria-hidden />
+        <div
+          className="file-row-main upload-file-main"
+          aria-label={`${statusLabel}: ${item.filename}`}
+        >
+          <FileTypeIcon ext={ext} />
+          <span className="file-row-name upload-file-name" title={item.filename}>
+            {item.filename}
+          </span>
+          <span
+            className={`upload-inline-progress ${isFailed ? "upload-failed" : ""}`}
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(pct)}
+          >
+            <span
+              className="upload-inline-progress-fill"
+              style={{ width: `${isFailed ? 100 : isDone ? 100 : pct}%` }}
+            />
+          </span>
+          <span
+            className={`upload-stop-indicator ${isFailed ? "upload-failed" : ""}`}
+            aria-hidden
+          >
+            <span />
+          </span>
+        </div>
+      </div>
+      {isFailed && item.error && (
+        <div className="upload-row-error" title={item.error}>
+          {item.error}
+        </div>
+      )}
+    </li>
   );
 }
 
@@ -834,6 +1188,7 @@ function FileChild({
   onSelect,
   onSelectPage,
   onDelete,
+  onProcess,
   processingPhase = "idle",
   filePercent = null,
 }: {
@@ -846,11 +1201,13 @@ function FileChild({
   onSelect: () => void;
   onSelectPage: (pageNumber: number) => void;
   onDelete: () => void;
+  onProcess?: (mode?: "replace" | "merge") => void;
   processingPhase?: "idle" | "done" | "active" | "pending";
   filePercent?: number | null;
 }) {
   const ext = (file.extension || "").replace(/^\./, "").toLowerCase();
   const vendor = vendorLabel(file);
+  const support = fileSupportLabel(file);
   const pageCount = ext === "pdf" ? Math.max(1, Number(file.page_count || 1)) : 0;
   const showPages = pageCount > 0;
   return (
@@ -923,6 +1280,11 @@ function FileChild({
             </span>
           )}
           <span className="file-row-size">{formatSize(file.size_bytes)}</span>
+          {support && (
+            <span className={support.className} title={support.title}>
+              {support.text}
+            </span>
+          )}
           {vendor && (
             <span className={vendor.className} title={file.vendor_detection_reason}>
               {vendor.text}
@@ -944,19 +1306,49 @@ function FileChild({
             />
           </div>
         )}
-        <button
-          type="button"
-          className="file-row-delete"
-          title="Delete file"
-          aria-label={`Delete file "${file.filename}"`}
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete();
-          }}
-          data-testid="explorer-file-delete"
+        {/* Phase 2M — actions live inside a kebab (3-dots) menu so the
+            row stays minimalist. Single-file processing was added here
+            because, until now, the only way to re-run a vendor on
+            one bill was to delete the rest of the batch. */}
+        <span
+          className="file-row-kebab-wrap"
+          onClick={(e) => e.stopPropagation()}
         >
-          <TrashIcon />
-        </button>
+          <KebabMenu
+            ariaLabel={`More actions for "${file.filename}"`}
+            testId="explorer-file-menu"
+            className="file-row-kebab"
+            items={[
+              {
+                label: "New template from file",
+                hint: "Show only this document.",
+                icon: <PlayIcon />,
+                onClick: () => {
+                  if (onProcess) onProcess("replace");
+                },
+                hidden: !onProcess,
+                disabled: processingPhase === "active",
+              },
+              {
+                label: "Add to current template",
+                hint: "Append or refresh this file's rows.",
+                icon: <PlusIcon />,
+                onClick: () => {
+                  if (onProcess) onProcess("merge");
+                },
+                hidden: !onProcess,
+                disabled: processingPhase === "active",
+              },
+              {
+                label: "Delete file",
+                tone: "danger",
+                icon: <TrashIcon />,
+                testId: "explorer-file-delete",
+                onClick: onDelete,
+              },
+            ]}
+          />
+        </span>
       </div>
       {showPages && isPageListOpen && (
         <ul className="file-page-list" aria-label={`Pages in ${file.filename}`}>
@@ -1091,6 +1483,19 @@ function vendorLabel(f: FileEntry): { className: string; text: string } | null {
   return { className: "badge green", text: prettyVendor(f.vendor_key) };
 }
 
+function fileSupportLabel(f: FileEntry): { className: string; text: string; title: string } | null {
+  const text = (f.file_support_label || "").trim();
+  const sourceType = (f.source_type || "").trim();
+  if (!text && !sourceType) return null;
+  const status = (f.file_support_status || "supported").toLowerCase();
+  const label = text || sourceType.replace(/_/g, " ");
+  return {
+    className: status === "supported" ? "badge gray" : "badge yellow",
+    text: label,
+    title: f.file_support_reason || "Universal ingestion file type",
+  };
+}
+
 function prettyVendor(key: string): string {
   if (key === "richmond_utilities") return "Richmond";
   if (key === "hopkinsville_water_environment_authority") return "Hopkinsville";
@@ -1163,4 +1568,91 @@ function CheckMarkIcon() {
       <polyline points="20 6 9 17 4 12" />
     </svg>
   );
+}
+
+function modeIcon(mode: DocumentMode): string {
+  switch (mode) {
+    case "digital_pdf":
+      return "PDF";
+    case "scanned_pdf":
+      return "OCR";
+    case "screenshot_image":
+      return "IMG";
+    case "mixed_pdf":
+      return "Mix";
+    case "csv_excel":
+      return "CSV";
+    case "auto_detect":
+    default:
+      return "Auto";
+  }
+}
+
+function shortModeDescription(mode: DocumentMode): string {
+  switch (mode) {
+    case "auto_detect":
+      return "Safe default";
+    case "digital_pdf":
+      return "Text-based bills";
+    case "scanned_pdf":
+      return "Scanned bills";
+    case "screenshot_image":
+      return "Paste screenshots";
+    case "mixed_pdf":
+      return "Mixed PDFs";
+    case "csv_excel":
+      return "CSV or Excel";
+    default:
+      return DOCUMENT_MODE_DESCRIPTIONS[mode];
+  }
+}
+
+function filesFromClipboard(data: DataTransfer): File[] {
+  const out: File[] = [];
+  for (const item of Array.from(data.items || [])) {
+    if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+    const file = item.getAsFile();
+    if (file) out.push(file);
+  }
+  return out;
+}
+
+function isScreenshotFile(file: File): boolean {
+  return file.type.startsWith("image/") || SCREENSHOT_EXTENSIONS.has(extensionFromName(file.name));
+}
+
+function normalizeScreenshotFile(file: File): File {
+  const ext = extensionForImageType(file.type) || extensionFromName(file.name) || "png";
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\..+$/, "")
+    .replace("T", "_");
+  const name =
+    file.name && !/^image\./i.test(file.name)
+      ? file.name
+      : `screenshot_${stamp}.${ext}`;
+  return new File([file], name, { type: file.type || `image/${ext}` });
+}
+
+function extensionForImageType(type: string): string {
+  switch (type.toLowerCase()) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/png":
+      return "png";
+    case "image/webp":
+      return "webp";
+    case "image/gif":
+      return "gif";
+    case "image/bmp":
+      return "bmp";
+    default:
+      return "";
+  }
+}
+
+function extensionFromName(name: string): string {
+  const m = /\.([A-Za-z0-9]+)$/.exec(name || "");
+  return m ? m[1].toLowerCase() : "";
 }

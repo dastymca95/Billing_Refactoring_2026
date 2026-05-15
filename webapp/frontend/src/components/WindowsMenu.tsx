@@ -1,8 +1,8 @@
-// Phase 2F — topbar Windows menu for the desktop-style workspace shell.
+// Desktop-style Window menu for the workspace shell.
 //
-// The menu shows each major panel and whether it is visible, minimized
-// into the bottom dock, or closed. Visible panels can be closed from
-// here; docked/closed panels can be restored from here.
+// Shows each major panel and whether it is visible, minimized into the
+// bottom dock, or closed. Visible panels can be closed from here;
+// docked/closed panels can be restored from here.
 
 import { useEffect, useRef, useState } from "react";
 
@@ -68,11 +68,7 @@ export function WindowsMenu({
         title="Show, hide, or restore workspace panels"
         data-testid="windows-menu-toggle"
       >
-        <PanelsIcon />
-        <span>Windows</span>
-        <span className="windows-menu-caret" aria-hidden>
-          ▾
-        </span>
+        <span>Window</span>
       </button>
       {open && (
         <div
@@ -147,17 +143,6 @@ export function WindowsMenu({
         </div>
       )}
     </div>
-  );
-}
-
-function PanelsIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <rect x="3" y="3" width="7" height="7" rx="1" />
-      <rect x="14" y="3" width="7" height="7" rx="1" />
-      <rect x="3" y="14" width="7" height="7" rx="1" />
-      <rect x="14" y="14" width="7" height="7" rx="1" />
-    </svg>
   );
 }
 

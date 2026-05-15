@@ -1,0 +1,30 @@
+status: complete
+vendor_expected: Lowes Pro Supply
+category_expected: other_infrequent
+invoice_number_expected: "83690"
+account_number_expected: ""
+invoice_date_expected: 05/09/2026
+due_date_expected: 06/08/2026
+service_period_expected:
+  start: ""
+  end: ""
+  range: ""
+property_abbreviation_expected: OG-PPA
+location_expected: ""
+location_policy_expected: valid_unit_if_present
+invoice_description_expected: 05/09/26 - Lowes Pro Supply - 3-3/4-In (96mm) Bar Pull
+line_items_expected:
+  - line_item_number: 1
+    gl_account: "6651"
+    description: 3-3/4-In (96mm) Bar Pull
+    amount: 6.75
+merchandise_expected: 6.16
+tax_expected: 0.59
+expense_type_expected: General
+is_replacement_reserve_expected: false
+total_expected: 6.75
+expected_review_flags:
+  - location_unresolved
+  - zero_amount_line_excluded
+ignored_source_items:
+  - zero_amount_lines

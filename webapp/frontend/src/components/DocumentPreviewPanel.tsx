@@ -1,7 +1,8 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { api, getFriendlyErrorMessage } from "../api";
-import type { FilePreview } from "../types";
+import type { BatchProgress, FilePreview } from "../types";
+import { AiScanOverlay } from "./AiScanOverlay";
 
 const PdfWorkspace = lazy(() =>
   import("./pdf_workspace/PdfWorkspace").then((m) => ({ default: m.PdfWorkspace })),
@@ -39,6 +40,7 @@ type Props = {
   // through `onRemapDrawn` instead of being persisted as a region.
   remapActive?: boolean;
   onRemapDrawn?: (page: number, bbox: { x: number; y: number; w: number; h: number }) => void;
+  aiProgress?: BatchProgress | null;
 };
 
 type DisplayPreview = {
@@ -63,6 +65,7 @@ export function DocumentPreviewPanel({
   onTraceHover,
   remapActive,
   onRemapDrawn,
+  aiProgress,
 }: Props) {
   const [display, setDisplay] = useState<DisplayPreview | null>(null);
   const [loading, setLoading] = useState(false);
@@ -208,6 +211,7 @@ export function DocumentPreviewPanel({
             {isPdf ? (
               <Suspense fallback={<DocumentLoadingSkeleton />}>
                 <PdfWorkspace
+                  key={`${display.batchId}:${display.filename}`}
                   batchId={display.batchId}
                   fileUrl={api.fileContentUrl(display.batchId, display.filename)}
                   fileId={display.filename}
@@ -230,6 +234,7 @@ export function DocumentPreviewPanel({
                   onTraceHover={onTraceHover}
                   remapActive={remapActive}
                   onRemapDrawn={onRemapDrawn}
+                  aiProgress={aiProgress}
                 />
               </Suspense>
             ) : (
@@ -237,6 +242,7 @@ export function DocumentPreviewPanel({
                 url={api.fileContentUrl(display.batchId, display.filename)}
                 extension={activePreview.extension}
                 filename={activePreview.filename}
+                aiProgress={aiProgress}
               />
             )}
           </>
@@ -267,6 +273,11 @@ export function DocumentPreviewPanel({
             Could not load the selected document.
           </div>
         )}
+        <AiScanOverlay
+          progress={aiProgress}
+          currentFilename={display?.filename ?? filename}
+          variant="status"
+        />
       </div>
     </div>
   );
@@ -303,10 +314,12 @@ function BinaryPreview({
   url,
   extension,
   filename,
+  aiProgress,
 }: {
   url: string;
   extension: string;
   filename: string;
+  aiProgress?: BatchProgress | null;
 }) {
   const [iframeFailed, setIframeFailed] = useState(false);
 
@@ -332,7 +345,7 @@ function BinaryPreview({
     );
   }
   if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].includes(extension)) {
-    return <img src={url} alt={filename} />;
+    return <ImagePreview url={url} filename={filename} aiProgress={aiProgress} />;
   }
   return (
     <div className="empty-state small">
@@ -341,6 +354,262 @@ function BinaryPreview({
         Open file
       </a>
       .
+    </div>
+  );
+}
+
+function ImagePreview({
+  url,
+  filename,
+  aiProgress,
+}: {
+  url: string;
+  filename: string;
+  aiProgress?: BatchProgress | null;
+}) {
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const panRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startScrollLeft: number;
+    startScrollTop: number;
+  } | null>(null);
+  const zoomRef = useRef(1);
+  const targetZoomRef = useRef(1);
+  const lerpRafRef = useRef<number | null>(null);
+  const zoomAnchorRef = useRef<{
+    docX: number;
+    docY: number;
+    viewX: number;
+    viewY: number;
+  } | null>(null);
+  const [zoom, setZoom] = useState(1);
+  const [isPanning, setIsPanning] = useState(false);
+
+  useEffect(() => {
+    setZoom(1);
+    zoomRef.current = 1;
+    targetZoomRef.current = 1;
+    zoomAnchorRef.current = null;
+    if (lerpRafRef.current != null) {
+      window.cancelAnimationFrame(lerpRafRef.current);
+      lerpRafRef.current = null;
+    }
+    setIsPanning(false);
+    panRef.current = null;
+    const node = stageRef.current;
+    if (node) {
+      node.scrollLeft = 0;
+      node.scrollTop = 0;
+    }
+  }, [url]);
+
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  const clampZoom = useCallback((next: number) => {
+    return Math.min(4, Math.max(0.35, Number(next.toFixed(2))));
+  }, []);
+
+  const startZoomLerp = useCallback(() => {
+    if (lerpRafRef.current != null) return;
+    const tick = () => {
+      lerpRafRef.current = null;
+      const target = targetZoomRef.current;
+      const current = zoomRef.current;
+      if (Math.abs(target - current) < 0.002) {
+        zoomRef.current = target;
+        setZoom(target);
+        zoomAnchorRef.current = null;
+        return;
+      }
+      const next = Number((current + (target - current) * 0.3).toFixed(4));
+      zoomRef.current = next;
+      setZoom(next);
+      lerpRafRef.current = window.requestAnimationFrame(tick);
+    };
+    lerpRafRef.current = window.requestAnimationFrame(tick);
+  }, []);
+
+  const changeZoom = useCallback(
+    (delta: number) => {
+      zoomAnchorRef.current = null;
+      if (lerpRafRef.current != null) {
+        window.cancelAnimationFrame(lerpRafRef.current);
+        lerpRafRef.current = null;
+      }
+      const next = clampZoom(zoomRef.current + delta);
+      targetZoomRef.current = next;
+      zoomRef.current = next;
+      setZoom(next);
+    },
+    [clampZoom],
+  );
+
+  const resetZoom = useCallback(() => {
+    zoomAnchorRef.current = null;
+    if (lerpRafRef.current != null) {
+      window.cancelAnimationFrame(lerpRafRef.current);
+      lerpRafRef.current = null;
+    }
+    zoomRef.current = 1;
+    targetZoomRef.current = 1;
+    setZoom(1);
+    const node = stageRef.current;
+    if (node) {
+      node.scrollLeft = 0;
+      node.scrollTop = 0;
+    }
+  }, []);
+
+  useEffect(() => {
+    const onWheel = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const node = stageRef.current;
+      if (!node) return;
+      const target = e.target as Node | null;
+      if (!target || !node.contains(target)) return;
+
+      // Match the PDF viewer: capture Ctrl+wheel before Chrome can zoom
+      // the whole app window. React's synthetic onWheel can be passive in
+      // Chromium, so this native capture listener is intentional.
+      e.preventDefault();
+      e.stopPropagation();
+
+      const rect = node.getBoundingClientRect();
+      const viewX = e.clientX - rect.left;
+      const viewY = e.clientY - rect.top;
+      const liveZoom = Math.max(0.0001, zoomRef.current);
+      zoomAnchorRef.current = {
+        docX: (node.scrollLeft + viewX) / liveZoom,
+        docY: (node.scrollTop + viewY) / liveZoom,
+        viewX,
+        viewY,
+      };
+
+      const factor = Math.exp(-e.deltaY * 0.0008);
+      targetZoomRef.current = clampZoom(targetZoomRef.current * factor);
+      startZoomLerp();
+    };
+
+    document.addEventListener("wheel", onWheel, { passive: false, capture: true });
+    return () => {
+      document.removeEventListener(
+        "wheel",
+        onWheel as EventListener,
+        { capture: true } as EventListenerOptions,
+      );
+      if (lerpRafRef.current != null) {
+        window.cancelAnimationFrame(lerpRafRef.current);
+        lerpRafRef.current = null;
+      }
+    };
+  }, [clampZoom, startZoomLerp]);
+
+  useLayoutEffect(() => {
+    const node = stageRef.current;
+    const anchor = zoomAnchorRef.current;
+    if (!node || !anchor) return;
+    const desiredScrollX = anchor.docX * zoom - anchor.viewX;
+    const desiredScrollY = anchor.docY * zoom - anchor.viewY;
+    if (Math.abs(node.scrollLeft - desiredScrollX) > 0.5) {
+      node.scrollLeft = desiredScrollX;
+    }
+    if (Math.abs(node.scrollTop - desiredScrollY) > 0.5) {
+      node.scrollTop = desiredScrollY;
+    }
+  }, [zoom]);
+
+  const endPan = useCallback((pointerId?: number) => {
+    const node = stageRef.current;
+    if (pointerId != null) {
+      try {
+        node?.releasePointerCapture(pointerId);
+      } catch {
+        // Pointer capture can already be released by the browser.
+      }
+    }
+    panRef.current = null;
+    setIsPanning(false);
+  }, []);
+
+  return (
+    <div className="image-workspace" data-testid="image-preview-workspace">
+      <div className="viewer-toolbar image-viewer-toolbar">
+        <div className="toolbar-group toolbar-group-zoom">
+          <button
+            className="tool-btn tool-btn-icon"
+            type="button"
+            onClick={() => changeZoom(-0.15)}
+            title="Zoom out"
+            aria-label="Zoom out"
+          >
+            -
+          </button>
+          <button
+            className="tool-btn tool-btn-narrow"
+            type="button"
+            onClick={resetZoom}
+            title="Fit image"
+          >
+            {Math.round(zoom * 100)}%
+          </button>
+          <button
+            className="tool-btn tool-btn-icon"
+            type="button"
+            onClick={() => changeZoom(0.15)}
+            title="Zoom in"
+            aria-label="Zoom in"
+          >
+            +
+          </button>
+        </div>
+        <div className="toolbar-spacer" />
+        <div className="toolbar-meta">Drag to pan</div>
+      </div>
+
+      <div
+        ref={stageRef}
+        className={`image-preview-stage ${isPanning ? "is-panning" : ""}`}
+        onPointerDown={(e) => {
+          if (e.button !== 0) return;
+          const node = stageRef.current;
+          if (!node) return;
+          panRef.current = {
+            pointerId: e.pointerId,
+            startX: e.clientX,
+            startY: e.clientY,
+            startScrollLeft: node.scrollLeft,
+            startScrollTop: node.scrollTop,
+          };
+          node.setPointerCapture(e.pointerId);
+          setIsPanning(true);
+          e.preventDefault();
+        }}
+        onPointerMove={(e) => {
+          const pan = panRef.current;
+          const node = stageRef.current;
+          if (!pan || !node) return;
+          node.scrollLeft = pan.startScrollLeft - (e.clientX - pan.startX);
+          node.scrollTop = pan.startScrollTop - (e.clientY - pan.startY);
+        }}
+        onPointerUp={(e) => endPan(e.pointerId)}
+        onPointerCancel={(e) => endPan(e.pointerId)}
+      >
+        <div
+          className="image-preview-page"
+          style={{ width: `${Math.round(zoom * 100)}%` }}
+        >
+          <img src={url} alt={filename} draggable={false} />
+          <AiScanOverlay
+            progress={aiProgress}
+            currentFilename={filename}
+            variant="document"
+          />
+        </div>
+      </div>
     </div>
   );
 }

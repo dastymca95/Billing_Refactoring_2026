@@ -27,10 +27,19 @@ async function listBatches(request: APIRequestContext): Promise<BatchListEntry[]
   return data.batches;
 }
 
+function stableUiBatches(batches: BatchListEntry[]): BatchListEntry[] {
+  const stable = batches.filter(
+    (b) =>
+      !/^QA AI/i.test(b.batch_name) &&
+      !/^QA AI mapping\b/i.test(b.batch_name),
+  );
+  return stable.length > 0 ? stable : batches;
+}
+
 async function pickPreviewBatch(
   request: APIRequestContext,
 ): Promise<BatchListEntry | null> {
-  const batches = await listBatches(request);
+  const batches = stableUiBatches(await listBatches(request));
   return (
     batches.find((b) => b.batch_name === "QA Visual Fixture" && b.rows_count > 0) ??
     batches.find((b) => b.batch_name === "HWEA" && b.rows_count > 0) ??
@@ -42,9 +51,10 @@ async function pickPreviewBatch(
 async function pickFileBatch(
   request: APIRequestContext,
 ): Promise<BatchListEntry | null> {
-  const batches = await listBatches(request);
+  const batches = stableUiBatches(await listBatches(request));
   return (
     batches.find((b) => b.batch_name === "HWEA" && b.files_count > 0) ??
+    batches.find((b) => /HWEA|Richmond Utilities|Alabama Power/i.test(b.batch_name) && b.files_count > 0) ??
     batches.find((b) => b.files_count > 0) ??
     null
   );
@@ -53,7 +63,7 @@ async function pickFileBatch(
 async function pickPdfPreviewBatch(
   request: APIRequestContext,
 ): Promise<{ batch: BatchListEntry; file: FileEntry } | null> {
-  const batches = (await listBatches(request)).filter(
+  const batches = stableUiBatches(await listBatches(request)).filter(
     (b) => b.files_count > 0 && b.rows_count > 0,
   );
   for (const batch of batches) {
@@ -76,7 +86,9 @@ async function pickPdfPreviewBatch(
 async function pickMultiPagePdfBatch(
   request: APIRequestContext,
 ): Promise<{ batch: BatchListEntry; file: FileEntry } | null> {
-  const batches = (await listBatches(request)).filter((b) => b.files_count > 0);
+  const batches = stableUiBatches(await listBatches(request)).filter(
+    (b) => b.files_count > 0,
+  );
   for (const batch of batches) {
     const response = await request.get(`${API_BASE}/api/batches/${batch.batch_id}/files`);
     if (!response.ok()) continue;
@@ -98,6 +110,16 @@ function batchRow(page: Page, batchId: string) {
   );
 }
 
+async function expandBatch(page: Page, batchId: string) {
+  const row = batchRow(page, batchId);
+  const toggle = row.getByTestId("explorer-batch-toggle");
+  await expect(toggle).toBeVisible();
+  if ((await toggle.getAttribute("aria-expanded")) !== "true") {
+    await toggle.click();
+  }
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+}
+
 async function loadBatch(
   page: Page,
   request: APIRequestContext,
@@ -105,12 +127,18 @@ async function loadBatch(
   viewport?: { width: number; height: number },
 ) {
   if (viewport) await page.setViewportSize(viewport);
-  await page.goto("/");
-  await page.evaluate(
+  await page.addInitScript(
     ([key, value]) => window.localStorage.setItem(key, value),
     [ACTIVE_BATCH_KEY, batch.batch_id],
   );
-  await page.reload();
+  const batchesResponse = page.waitForResponse(
+    (res) =>
+      res.url().includes("/api/batches") &&
+      res.request().method() === "GET" &&
+      res.ok(),
+  );
+  await page.goto("/");
+  await batchesResponse.catch(() => undefined);
   await expect(page.getByTestId("batch-explorer")).toBeVisible();
   await expect(batchRow(page, batch.batch_id)).toBeVisible();
 }
@@ -123,24 +151,22 @@ async function loadPreviewBatch(
   const batch = await pickPreviewBatch(request);
   test.skip(!batch, "No processed batch with preview rows is available.");
   await loadBatch(page, request, batch!, viewport);
-  await expect(page.getByTestId("template-header")).toBeVisible();
+  await expect(page.getByTestId("template-window-chrome")).toBeVisible();
   await expect(page.getByTestId("template-grid-card")).toBeVisible();
   return batch!;
 }
 
 async function expectTemplateHeaderHealthy(page: Page) {
-  const header = page.getByTestId("template-header");
+  const header = page.getByTestId("template-window-chrome");
   const exportButton = page.getByTestId("template-export-button");
   const controls = page.getByTestId("template-controls");
   const gridScroll = page.getByTestId("template-grid-scroll");
-  const context = page.getByTestId("template-context");
   const revisions = page.getByTestId("template-revisions-btn");
 
   await expect(header).toBeVisible();
   await expect(exportButton).toBeVisible();
   await expect(controls).toBeVisible();
   await expect(gridScroll).toBeVisible();
-  await expect(context).toBeVisible();
   await expect(revisions).toBeVisible();
   await expect(revisions).not.toContainText("No runs");
 
@@ -153,7 +179,7 @@ async function expectTemplateHeaderHealthy(page: Page) {
   const headerBox = await header.boundingBox();
   expect(exportBox?.width ?? 0).toBeGreaterThan(60);
   expect(exportBox?.height ?? 0).toBeGreaterThan(20);
-  expect(headerBox?.height ?? 0).toBeGreaterThan(36);
+  expect(headerBox?.height ?? 0).toBeGreaterThan(24);
 }
 
 async function expectDesktopPanelChromeAligned(page: Page) {
@@ -231,12 +257,86 @@ test("batch explorer renders and disabled nav items are hidden", async ({
   await expect(nav.getByText("Settings", { exact: true })).toHaveCount(0);
 });
 
+test("AI mock provider status is visible without external calls", async ({ page }) => {
+  await page.route("**/api/ai/status", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        enabled: true,
+        provider: "mock",
+        model: "mock-invoice-v1",
+        configured: true,
+        supports_vision: false,
+        vision_enabled: false,
+        vision_model: null,
+        vision_mode: "fallback_only",
+        message: "AI invoice processing is configured with the mock provider.",
+        reason: "AI invoice processing is configured with the mock provider.",
+        policy: "invoice_extraction_candidates",
+        allowed_tasks: ["variable vendor invoice extraction"],
+      }),
+    });
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("ai-status-pill")).toHaveText("AI: Mock");
+});
+
+test("AI assisted processing shows the in-document scan overlay", async ({
+  page,
+  request,
+}) => {
+  const batch = await pickFileBatch(request);
+  test.skip(!batch, "No batch with files is available.");
+  const filesResponse = await request.get(`${API_BASE}/api/batches/${batch!.batch_id}/files`);
+  expect(filesResponse.ok()).toBeTruthy();
+  const filesData = (await filesResponse.json()) as { files: FileEntry[] };
+  const file = filesData.files.find((f) => f.extension === ".pdf") ?? filesData.files[0];
+  test.skip(!file, "Selected batch has no files.");
+
+  await page.route(`**/api/batches/${batch!.batch_id}/process**`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ status: "started", batch_id: batch!.batch_id }),
+    });
+  });
+  await page.route(`**/api/batches/${batch!.batch_id}/progress`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        batch_id: batch!.batch_id,
+        status: "processing",
+        percent: 42,
+        current_step: "Reading line items",
+        current_file: file.filename,
+        processing_mode: "ai_assisted",
+        ai_stage: "Reading line items",
+        ai_enabled: true,
+      }),
+    });
+  });
+
+  await loadBatch(page, request, batch!, { width: 1366, height: 768 });
+  await expandBatch(page, batch!.batch_id);
+  await batchRow(page, batch!.batch_id).getByTestId("explorer-batch-process").click();
+  const overlay = page.getByTestId("ai-scan-overlay");
+  await expect(overlay).toBeVisible();
+  await expect(overlay.getByText("Reading line items")).toBeVisible();
+  await expect(overlay.getByText(file.filename)).toBeVisible();
+});
+
 test("panel minimize uses the bottom dock and restores cleanly", async ({
   page,
   request,
 }) => {
   await loadPreviewBatch(page, request, { width: 1366, height: 768 });
-  await page.getByTestId("batches-minimize").click();
+  await expect(page.getByTestId("batches-minimize")).toHaveCount(0);
+  await expect(page.getByTestId("batches-maximize")).toHaveCount(0);
+  await expect(page.getByTestId("batches-close")).toHaveCount(0);
+  await page.getByTestId("windows-menu-toggle").click();
+  await page.getByTestId("windows-menu-minimize-all").click();
   await expect(page.getByTestId("panel-batches")).toHaveCount(0);
   await expect(page.getByTestId("workspace-dock")).toBeVisible();
   await expect(page.getByTestId("workspace-dock-batches")).toBeVisible();
@@ -277,25 +377,16 @@ test("Windows menu closes and restores panels", async ({ page, request }) => {
   await expect(page.getByTestId("panel-template")).toBeVisible();
 });
 
-test("maximized modules expose separate-window controls", async ({
+test("template exposes separate-window detach control", async ({
   page,
   request,
 }) => {
   await loadPreviewBatch(page, request, { width: 1366, height: 768 });
 
-  await page.getByTestId("template-maximize").click();
-  await expect(page.getByTestId("template-popout")).toBeVisible();
-  await expect(page.getByTestId("template-popout")).toHaveAttribute(
+  await expect(page.getByTestId("template-detach")).toBeVisible();
+  await expect(page.getByTestId("template-detach")).toHaveAttribute(
     "aria-label",
-    "Open Template in separate window",
-  );
-  await page.getByTestId("template-maximize").click();
-
-  await page.getByTestId("document-maximize").click();
-  await expect(page.getByTestId("document-popout")).toBeVisible();
-  await expect(page.getByTestId("document-popout")).toHaveAttribute(
-    "aria-label",
-    "Open Document Viewer in separate window",
+    "Detach Template to separate window",
   );
 });
 
@@ -324,7 +415,10 @@ test("batch row click switches the active batch", async ({ page, request }) => {
   await loadBatch(page, request, activeBatch!, { width: 1366, height: 768 });
 
   const targetBatch = (await listBatches(request)).find(
-    (b) => b.batch_id !== activeBatch!.batch_id,
+    (b) =>
+      b.batch_id !== activeBatch!.batch_id &&
+      !/^QA AI\b/i.test(b.batch_name) &&
+      !/^QA AI mapping\b/i.test(b.batch_name),
   );
   test.skip(!targetBatch, "Only one batch is available.");
 
@@ -333,14 +427,15 @@ test("batch row click switches the active batch", async ({ page, request }) => {
   await expect(target).toHaveClass(/active/);
 });
 
-test("new batch modal opens and validates long names", async ({ page, request }) => {
+test("inline new batch row opens and validates long names", async ({ page, request }) => {
   const batch = await pickFileBatch(request);
   test.skip(!batch, "No batch is available.");
   await loadBatch(page, request, batch!, { width: 1366, height: 768 });
   await page.getByTestId("explorer-add-batch").click();
-  await expect(page.getByTestId("new-batch-modal")).toBeVisible();
-  await page.getByTestId("new-batch-name-input").fill("A".repeat(85));
-  await page.getByTestId("create-batch-submit").click();
+  await expect(page.getByTestId("inline-new-batch-panel")).toBeVisible();
+  await expect(page.getByTestId("new-batch-modal")).toHaveCount(0);
+  await page.getByTestId("inline-new-batch-name-input").fill("A".repeat(85));
+  await page.getByTestId("inline-create-batch-submit").click();
   await expect(page.getByText("Batch name is too long")).toBeVisible();
   await page.keyboard.press("Escape");
 });
@@ -363,6 +458,8 @@ test("file delete opens app-native confirm and can be cancelled", async ({
   const batch = await pickFileBatch(request);
   test.skip(!batch, "No batch with files is available.");
   await loadBatch(page, request, batch!, { width: 1366, height: 768 });
+  await expandBatch(page, batch!.batch_id);
+  await page.getByTestId("explorer-file-menu").first().click();
   await page.getByTestId("explorer-file-delete").first().click();
   await expect(page.getByTestId("confirm-dialog")).toBeVisible();
   await expect(page.getByText("Delete file?")).toBeVisible();
@@ -374,6 +471,8 @@ test("file delete hover stays visually neutral", async ({ page, request }) => {
   const batch = await pickFileBatch(request);
   test.skip(!batch, "No batch with files is available.");
   await loadBatch(page, request, batch!, { width: 1366, height: 768 });
+  await expandBatch(page, batch!.batch_id);
+  await page.getByTestId("explorer-file-menu").first().click();
   const deleteButton = page.getByTestId("explorer-file-delete").first();
   await deleteButton.hover();
   const styles = await deleteButton.evaluate((el) => {
@@ -430,14 +529,84 @@ test("column view buttons are visible without duplicate optional controls", asyn
   await loadPreviewBatch(page, request, { width: 1366, height: 768 });
   const tabs = page.getByTestId("column-view-tabs");
   await expect(tabs.getByRole("tab", { name: "Required" })).toBeVisible();
-  await expect(tabs.getByRole("tab", { name: "Issues" })).toBeVisible();
+  await expect(tabs.getByRole("tab", { name: "Issues" })).toHaveCount(0);
   await expect(tabs.getByRole("tab", { name: "All" })).toBeVisible();
   await expect(page.getByText("Show optional cols")).toHaveCount(0);
+});
+
+test("single invoice mode renders and edits update the bulk grid", async ({
+  page,
+  request,
+}) => {
+  await loadPreviewBatch(page, request, { width: 1366, height: 768 });
+  await page.getByTestId("template-row").first().click();
+  await page.getByTestId("template-mode-single").click();
+  await expect(page.getByTestId("single-invoice-mode")).toBeVisible();
+  await expect(page.getByTestId("single-invoice-status")).toBeVisible();
+  await expect(page.getByTestId("single-invoice-totals")).toBeVisible();
+  await expect(page.getByTestId("single-review-tasks")).toBeVisible();
+  await expect(page.getByTestId("single-use-vision-assist")).toBeVisible();
+  await expect(page.getByTestId("single-ready-export")).toHaveAttribute("title", /Blocked by|Invoice ready/);
+  await expect(page.getByTestId("single-invoice-line-items")).toBeVisible();
+  await expect(page.getByText("Invoice History")).toBeVisible();
+
+  const editedDescription = `QA single invoice edit ${Date.now()}`;
+  const descriptionField = page.getByTestId(
+    "single-invoice-field-Description",
+  );
+  await descriptionField.fill(editedDescription);
+  await descriptionField.press("Enter");
+
+  await page.getByTestId("template-mode-bulk").click();
+  await page.getByTestId("column-view-tabs").getByRole("tab", { name: "All" }).click();
+  await expect(page.getByTestId("template-row").first()).toContainText(
+    editedDescription,
+  );
+});
+
+test("detached single invoice review renders the polished review layout", async ({
+  page,
+  request,
+}) => {
+  const batch = await pickPreviewBatch(request);
+  test.skip(!batch, "No processed batch with preview rows is available.");
+  await page.setViewportSize({ width: 1366, height: 768 });
+  await page.goto(`/#popout/template?batch=${batch!.batch_id}`);
+  await expect(page.getByText("Detached review")).toBeVisible();
+  await expect(page.getByTestId("template-window-chrome")).toBeVisible();
+  await page.getByTestId("template-row").first().click();
+  await page.getByTestId("template-mode-single").click();
+  await expect(page.getByTestId("single-invoice-mode")).toBeVisible();
+  await expect(page.getByTestId("single-property-resolver")).toBeVisible();
+  await expect(page.getByTestId("single-invoice-totals")).toBeVisible();
+  await expect(page.getByTestId("single-review-tasks")).toBeVisible();
+  await expect(page.getByTestId("single-mark-reviewed")).toBeVisible();
+  await expect(page.getByTestId("single-ready-export")).toBeVisible();
+});
+
+test("AI supplier single invoice shows invoice total separate from merchandise and tax", async ({
+  page,
+  request,
+}) => {
+  const lowesBatch = (await listBatches(request)).find(
+    (b) => /Lowes Pro Supply/i.test(b.batch_name) && b.rows_count > 0,
+  );
+  test.skip(!lowesBatch, "No Lowe's AI-assisted preview batch is available.");
+  await loadBatch(page, request, lowesBatch!, { width: 1600, height: 900 });
+  await page.getByTestId("template-row").first().click();
+  await page.getByTestId("template-mode-single").click();
+  await expect(page.getByTestId("single-invoice-mode")).toBeVisible();
+  await expect(page.getByTestId("single-total-invoice").getByLabel("Invoice total summary")).toHaveValue("6.75");
+  await expect(page.getByTestId("single-total-merchandise")).toContainText("$6.16");
+  await expect(page.getByTestId("single-total-tax")).toContainText("$0.59");
+  await expect(page.getByTestId("single-invoice-primary-total").getByLabel("Invoice total")).toHaveValue("6.75");
+  await expect(page.getByTestId("ai-mapping-review")).toHaveCount(0);
 });
 
 test("issues drawer opens and closes when issues exist", async ({ page, request }) => {
   await loadPreviewBatch(page, request, { width: 1366, height: 768 });
   const issuePill = page.getByTestId("issues-pill");
+  test.skip((await issuePill.count()) === 0, "Selected preview batch has no issue pill.");
   await expect(issuePill).toBeVisible();
   await issuePill.click();
   await expect(page.getByTestId("issues-drawer")).toBeVisible();
@@ -456,6 +625,7 @@ test("continuous document viewer syncs page tree and template rows", async ({
   test.skip(pageCount < 2, "No multi-page PDF is available for page navigation.");
 
   await loadBatch(page, request, batch, { width: 1366, height: 768 });
+  await expandBatch(page, batch.batch_id);
   const escapedFile = file.filename.replace(/"/g, '\\"');
   const fileNode = page.locator(
     `[data-testid="explorer-file-node"][data-filename="${escapedFile}"]`,
@@ -502,6 +672,7 @@ test("holding Space while panning does not trigger native page-scroll repeat", a
   test.skip(pageCount < 2, "No multi-page PDF is available for pan regression.");
 
   await loadBatch(page, request, batch, { width: 1366, height: 768 });
+  await expandBatch(page, batch.batch_id);
   const escapedFile = file.filename.replace(/"/g, '\\"');
   const fileNode = page.locator(
     `[data-testid="explorer-file-node"][data-filename="${escapedFile}"]`,
@@ -540,4 +711,44 @@ test("holding Space while panning does not trigger native page-scroll repeat", a
   await page.keyboard.up("Space");
   const afterPanScrollTop = await scroller.evaluate((el) => el.scrollTop);
   expect(afterPanScrollTop).toBeLessThanOrEqual(2);
+});
+
+test("canonical rules test bench returns the Capital Waste expected result", async ({
+  request,
+}) => {
+  test.setTimeout(90_000);
+  const list = await request.get(`${API_BASE}/api/canonical-rules`);
+  expect(list.ok()).toBeTruthy();
+  const rules = (await list.json()) as { categories: { key: string }[] };
+  expect(
+    rules.categories.some((category) => category.key === "trash_collection_services"),
+  ).toBeTruthy();
+
+  const fixtures = await request.get(`${API_BASE}/api/canonical-rules/test-fixtures`);
+  expect(fixtures.ok()).toBeTruthy();
+  const fixturePayload = (await fixtures.json()) as { fixtures: { key: string; status: string }[] };
+  expect(fixturePayload.fixtures.some((fixture) => fixture.key === "spectrum")).toBeTruthy();
+
+  const suite = await request.post(`${API_BASE}/api/canonical-rules/test-bench`, {
+    data: { run_all: true },
+  });
+  expect(suite.ok()).toBeTruthy();
+  const suiteResult = (await suite.json()) as {
+    ok: boolean;
+    results: {
+      fixture_key: string;
+      ok: boolean;
+      actual: { category?: string; gl_accounts?: string[]; property?: string };
+    }[];
+  };
+  expect(suiteResult.ok).toBeTruthy();
+  const capital = suiteResult.results.find((item) => item.fixture_key === "capital_waste");
+  const spectrum = suiteResult.results.find((item) => item.fixture_key === "spectrum");
+  expect(capital?.ok).toBeTruthy();
+  expect(capital?.actual.category).toBe("trash_collection_services");
+  expect(capital?.actual.property).toBe("RCC");
+  expect(capital?.actual.gl_accounts).toEqual(["6940", "6940"]);
+  expect(spectrum?.ok).toBeTruthy();
+  expect(spectrum?.actual.category).toBe("subscriptions");
+  expect(spectrum?.actual.gl_accounts).toEqual(["6905", "6905"]);
 });

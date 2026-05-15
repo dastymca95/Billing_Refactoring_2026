@@ -1,0 +1,70 @@
+version: 1
+updated_at: '2026-05-12T11:13:50'
+description: Configurable output-format rules for AI-assisted invoices and bills.
+rule_priority:
+- vendor
+- vendor_group
+- property
+- property_group
+- gl_account
+- gl_group
+- general
+groups:
+  vendor_groups:
+    utilities:
+      label: Utilities
+      vendors:
+      - City of Chattanooga Wastewater Department
+      - Pennyrile Electric
+      - Hopkinsville Water
+      - McMinnville Electric
+    variable_suppliers:
+      label: Variable suppliers
+      vendors:
+      - HD Supply
+      - Lowe's Pro Supply
+      - Home Depot
+  gl_groups:
+    utilities:
+      label: Utilities
+      gl_accounts:
+      - '6930'
+      - '6935'
+      - '6955'
+    repairs:
+      label: Repairs and maintenance
+      gl_accounts:
+      - '6470'
+      - '6530'
+      - '6615'
+      - '6651'
+      - '6675'
+  property_groups: {}
+rules:
+- id: general_bill_default
+  name: General bill default
+  enabled: true
+  priority: 10
+  scope:
+    type: general
+    value: ''
+  document_type: bill
+  templates:
+    invoice_number: '{account_number}-{invoice_date_yyyymmdd}'
+    invoice_description: '{service_period_range} - {service_address_or_property} -
+      {line_item_description_short}'
+    line_item_description: '{service_period_range} - {service_address_or_property}
+      - {line_item_description}'
+- id: general_invoice_default
+  name: General invoice default
+  enabled: true
+  priority: 1
+  scope:
+    type: general
+    value: ''
+  document_type: invoice
+  templates:
+    invoice_number: BILL-{account_number}-{invoice_date_yyyymmdd}
+    invoice_description: '{invoice_date_short} - {vendor_name} - {property_abbreviation}
+      - {line_item_description_short}'
+    line_item_description: '{line_item_description}'

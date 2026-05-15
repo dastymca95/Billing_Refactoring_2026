@@ -124,6 +124,10 @@ class CellExplainResponse(BaseModel):
     source_file: Optional[str] = None
     source_page: Optional[int] = None
     vendor_key: str = ""
+    ai_generated: bool = False
+    ai_confidence: Optional[float] = None
+    ai_validation_flags: list[str] = Field(default_factory=list)
+    ai_warnings: list[str] = Field(default_factory=list)
 
 
 class OverrideRequest(BaseModel):
@@ -211,6 +215,8 @@ def explain_cell_endpoint(
         cell_kind = "fallback"
     if (meta.get("learned_corrections_applied") or []):
         cell_kind = "user_edited"
+    elif meta.get("ai_generated"):
+        cell_kind = "ai_extracted"
 
     summary = _humanise_summary(
         column=column,
@@ -236,6 +242,14 @@ def explain_cell_endpoint(
         source_file=source_file,
         source_page=source_page if isinstance(source_page, int) else None,
         vendor_key=vendor_key,
+        ai_generated=bool(meta.get("ai_generated")),
+        ai_confidence=(
+            meta.get("ai_confidence")
+            if isinstance(meta.get("ai_confidence"), (int, float))
+            else None
+        ),
+        ai_validation_flags=list(meta.get("ai_validation_flags") or []),
+        ai_warnings=list(meta.get("ai_warnings") or []),
     )
 
 
@@ -305,6 +319,17 @@ def _humanise_summary(
     if meta.get("manual_review_reasons"):
         reasons = ", ".join(meta["manual_review_reasons"][:3])
         parts.append(f"Manual review flags on this row: {reasons}.")
+    if meta.get("ai_generated"):
+        conf = meta.get("ai_confidence")
+        if isinstance(conf, (int, float)):
+            parts.append(
+                f"This value came from AI extraction with {conf * 100:.0f}% confidence."
+            )
+        else:
+            parts.append("This value came from AI extraction.")
+        flags = meta.get("ai_validation_flags") or []
+        if flags:
+            parts.append("AI validation flags: " + ", ".join(map(str, flags[:4])) + ".")
     return " ".join(parts)
 
 

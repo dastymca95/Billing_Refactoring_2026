@@ -1,0 +1,5 @@
+status: incomplete
+vendor_expected: Servall Termite & Pest Control
+category_expected: pest_control
+skip_reason: Only a low-resolution conversation screenshot is available. Vendor matching is ambiguous between Servall Termite & Pest Control (Clarksville) and Servall, LLC (Martin), and invoice fields are not stable enough for a golden fixture.
+notes: Complete this fixture after saving a stable OCR/vision candidate payload for the difficult Servall ticket.

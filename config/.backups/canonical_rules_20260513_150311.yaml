@@ -1,0 +1,595 @@
+version: 1
+source:
+  excel_path: C:\Users\Dasty\PycharmProjects\Billing_Refactoring_2026\Canonica rules.xlsx
+  runtime_source: C:\Users\Dasty\PycharmProjects\Billing_Refactoring_2026\config\canonical_rules.yaml
+  notes: Generated from Canonica rules.xlsx and completed with runtime defaults.
+  imported_rows:
+  - column: Invoice Number
+    key: invoice_number
+    required: true
+    rules_by_category:
+      utilities: '{account number} {first 3 letters of the month of the period} {last 2 digits of the year of the service)'
+      pest_control: Invoice Number
+      landscaping: Invoice Number
+      marketing: Invoice Number
+      subscriptions: Invoice Number
+      trash_collection_services: Invoice Number
+      other_infrequent: Invoice Number
+  - column: Bill or Credit
+    key: bill_or_credit
+    required: true
+    rules_by_category: {}
+  - column: Invoice Date
+    key: invoice_date
+    required: true
+    rules_by_category:
+      utilities: Invoice date that appears in the bill, if not, use the last date of reading date
+      pest_control: Invoice date that appears in the bill, if not, use the last date of reading date
+      landscaping: Invoice date that appears in the bill, if not, use the last date of reading date
+      marketing: Invoice date that appears in the bill, if not, use the last date of reading date
+      subscriptions: Invoice date that appears in the bill, if not, use the last date of reading date
+      trash_collection_services: Invoice date that appears in the bill, if not, use the last date of reading date
+      other_infrequent: Invoice date that appears in the bill, if not, use the last date of reading date
+  - column: Accounting Date
+    key: accounting_date
+    required: true
+    rules_by_category:
+      utilities: Usually the same of invoice date
+      pest_control: Usually the same of invoice date
+      landscaping: Usually the same of invoice date
+      marketing: Usually the same of invoice date
+      subscriptions: Usually the same of invoice date
+      trash_collection_services: Usually the same of invoice date
+      other_infrequent: Usually the same of invoice date
+  - column: Vendor
+    key: vendor
+    required: true
+    rules_by_category:
+      utilities: Use what matche with the data
+  - column: Invoice Description
+    key: invoice_description
+    required: true
+    rules_by_category:
+      utilities: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the bill  Put
+        all the words with the first letter in uppercase, just the first letter'
+      pest_control: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill  Put all the words with the first letter in uppercase, just the first letter'
+      landscaping: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill  Put all the words with the first letter in uppercase, just the first letter'
+      marketing: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the bill  Put
+        all the words with the first letter in uppercase, just the first letter'
+      subscriptions: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill  Put all the words with the first letter in uppercase, just the first letter'
+      trash_collection_services: '{first reading date}-(last reading date) - Service Addres including the unit number if appears
+        in the bill  Put all the words with the first letter in uppercase, just the first letter'
+      other_infrequent: An explicative line the summarizies what is the invoice
+  - column: Line Item Number
+    key: line_item_number
+    required: true
+    rules_by_category:
+      utilities: Order of the line item of one invoice
+      pest_control: Order of the line item of one invoice
+      landscaping: Order of the line item of one invoice
+      marketing: Order of the line item of one invoice
+      subscriptions: Order of the line item of one invoice
+      trash_collection_services: Order of the line item of one invoice
+      other_infrequent: Order of the line item of one invoice
+  - column: Property Abbreviation
+    key: property_abbreviation
+    required: true
+    rules_by_category:
+      utilities: Use what matches with the date
+      pest_control: Use what matches with the date
+      landscaping: Use what matches with the date
+      marketing: Use what matches with the date
+      subscriptions: Use what matches with the date
+      trash_collection_services: Use what matches with the date
+      other_infrequent: Use what matches with the date
+  - column: Location
+    key: location
+    required: false
+    rules_by_category:
+      utilities: Put always if there is in the invoice
+      pest_control: Put always if there is in the invoice
+      landscaping: Put always if there is in the invoice
+      marketing: Put always if there is in the invoice
+      subscriptions: Put always if there is in the invoice
+      trash_collection_services: Put always if there is in the invoice
+      other_infrequent: Put always if there is in the invoice
+  - column: GL Account
+    key: gl_account
+    required: true
+    rules_by_category:
+      utilities: Use what matches with the date
+      pest_control: Use what matches with the date
+      landscaping: Use what matches with the date
+      marketing: Use what matches with the date
+      subscriptions: Use what matches with the date
+      trash_collection_services: Use what matches with the date
+      other_infrequent: Use what matches with the date
+  - column: Line Item Description
+    key: line_item_description
+    required: true
+    rules_by_category:
+      utilities: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the bill
+        - Detail of the line'
+      pest_control: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill - Detail of the line'
+      landscaping: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill - Detail of the line'
+      marketing: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the bill
+        - Detail of the line'
+      subscriptions: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill - Detail of the line'
+      trash_collection_services: '{first reading date}-(last reading date) - Service Addres including the unit number if appears
+        in the bill - Detail of the line'
+      other_infrequent: "Don\u2019t need to put the date, or the vendor, just a detail descriptios of what is the product\
+        \ and its category"
+  - column: Amount
+    key: amount
+    required: true
+    rules_by_category:
+      utilities: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put all the words with
+        the first letter in uppercase, just the first letter
+      pest_control: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put all the words
+        with the first letter in uppercase, just the first letter
+      landscaping: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put all the words
+        with the first letter in uppercase, just the first letter
+      marketing: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put all the words with
+        the first letter in uppercase, just the first letter
+      subscriptions: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put all the words
+        with the first letter in uppercase, just the first letter
+      trash_collection_services: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put
+        all the words with the first letter in uppercase, just the first letter
+      other_infrequent: "Don\u2019t need to put the date, or the vendor, just a detail descriptios of what is the product\
+        \ and its category"
+  - column: Expense Type
+    key: expense_type
+    required: true
+    rules_by_category:
+      utilities: General
+      pest_control: General
+      landscaping: General
+      marketing: General
+      subscriptions: General
+      trash_collection_services: General
+      other_infrequent: General
+  - column: Is Replacement Reserve
+    key: is_replacement_reserve
+    required: true
+    rules_by_category: {}
+  - column: Payment Date
+    key: payment_date
+    required: false
+    rules_by_category: {}
+  - column: Reference Number
+    key: reference_number
+    required: false
+    rules_by_category: {}
+  - column: Payment Method
+    key: payment_method
+    required: false
+    rules_by_category: {}
+  - column: Department
+    key: department
+    required: false
+    rules_by_category: {}
+  - column: Due Date
+    key: due_date
+    required: true
+    rules_by_category:
+      utilities: Use what is in the invoice or bill
+      pest_control: Use what is in the invoice or bill
+      landscaping: Use what is in the invoice or bill
+      marketing: Use what is in the invoice or bill
+      subscriptions: Use what is in the invoice or bill
+      trash_collection_services: Use what is in the invoice or bill
+      other_infrequent: Use what is in the invoice or bill
+  - column: Quantity
+    key: quantity
+    required: false
+    rules_by_category: {}
+  - column: Unit Price
+    key: unit_price
+    required: false
+    rules_by_category: {}
+  - column: Tax
+    key: tax
+    required: false
+    rules_by_category: {}
+  - column: Received Date
+    key: received_date
+    required: false
+    rules_by_category: {}
+  - column: Document Url
+    key: document_url
+    required: true
+    rules_by_category:
+      utilities: Dropbox (mandatory always)
+      pest_control: Dropbox (mandatory always)
+      landscaping: Dropbox (mandatory always)
+      marketing: Dropbox (mandatory always)
+      subscriptions: Dropbox (mandatory always)
+      trash_collection_services: Dropbox (mandatory always)
+      other_infrequent: Dropbox (mandatory always)
+template_requirements:
+  required_columns:
+  - Invoice Number
+  - Bill or Credit
+  - Invoice Date
+  - Accounting Date
+  - Vendor
+  - Invoice Description
+  - Line Item Number
+  - Property Abbreviation
+  - GL Account
+  - Line Item Description
+  - Amount
+  - Expense Type
+  - Is Replacement Reserve
+  - Due Date
+  - Document Url
+  optional_columns:
+  - Location
+  - Payment Date
+  - Reference Number
+  - Payment Method
+  - Department
+  - Quantity
+  - Unit Price
+  - Tax
+  - Received Date
+  location_policy: optional_valid_unit_only
+  document_url_policy: required_when_dropbox_available
+template_columns:
+  invoice_number:
+    required: true
+    source_priority:
+    - canonical_category_rule
+    - invoice_number_from_bill
+    - account_number_period_format
+    validation:
+      cannot_be_blank: true
+    canonical_matrix:
+      utilities: '{account number} {first 3 letters of the month of the period} {last 2 digits of the year of the service)'
+      pest_control: Invoice Number
+      landscaping: Invoice Number
+      marketing: Invoice Number
+      subscriptions: Invoice Number
+      trash_collection_services: Invoice Number
+      other_infrequent: Invoice Number
+  bill_or_credit:
+    required: true
+    default: Bill
+    credit_detection_keywords:
+    - credit memo
+    - credit
+    - refund
+  invoice_date:
+    required: true
+    source_priority:
+    - explicit_invoice_date
+    - statement_date
+    - purchase_date
+    - ship_date
+    if_inferred: flag_review
+    canonical_matrix:
+      utilities: Invoice date that appears in the bill, if not, use the last date of reading date
+      pest_control: Invoice date that appears in the bill, if not, use the last date of reading date
+      landscaping: Invoice date that appears in the bill, if not, use the last date of reading date
+      marketing: Invoice date that appears in the bill, if not, use the last date of reading date
+      subscriptions: Invoice date that appears in the bill, if not, use the last date of reading date
+      trash_collection_services: Invoice date that appears in the bill, if not, use the last date of reading date
+      other_infrequent: Invoice date that appears in the bill, if not, use the last date of reading date
+  accounting_date:
+    required: true
+    default_rule: same_as_invoice_date
+    canonical_matrix:
+      utilities: Usually the same of invoice date
+      pest_control: Usually the same of invoice date
+      landscaping: Usually the same of invoice date
+      marketing: Usually the same of invoice date
+      subscriptions: Usually the same of invoice date
+      trash_collection_services: Usually the same of invoice date
+      other_infrequent: Usually the same of invoice date
+  vendor:
+    required: true
+    source: vendor_list_exact_or_candidate_match
+    if_unmatched: vendor_mapping_required
+    canonical_matrix:
+      utilities: Use what matche with the data
+  invoice_description:
+    required: true
+    never_use_vague_ai_description: true
+    formats:
+      utilities: '{service_period} - {service_address_or_property}'
+      trash_collection_services: '{service_period} - {property_or_site_name}'
+      pest_control: '{service_period} - {property_or_site_name}'
+      landscaping: '{service_period} - {property_or_site_name}'
+      marketing: '{invoice_date_short} - {vendor_name} - {main_item_or_category}'
+      subscriptions: '{invoice_date_short} - {vendor_name} - {main_item_or_category}'
+      other_infrequent: '{invoice_date_short} - {vendor_name} - {main_item_or_category}'
+      unknown: '{invoice_date_short} - {vendor_name} - {main_item_or_category}'
+    canonical_matrix:
+      utilities: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the bill  Put
+        all the words with the first letter in uppercase, just the first letter'
+      pest_control: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill  Put all the words with the first letter in uppercase, just the first letter'
+      landscaping: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill  Put all the words with the first letter in uppercase, just the first letter'
+      marketing: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the bill  Put
+        all the words with the first letter in uppercase, just the first letter'
+      subscriptions: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill  Put all the words with the first letter in uppercase, just the first letter'
+      trash_collection_services: '{first reading date}-(last reading date) - Service Addres including the unit number if appears
+        in the bill  Put all the words with the first letter in uppercase, just the first letter'
+      other_infrequent: An explicative line the summarizies what is the invoice
+  line_item_number:
+    required: true
+    rule: sequential_per_invoice
+    canonical_matrix:
+      utilities: Order of the line item of one invoice
+      pest_control: Order of the line item of one invoice
+      landscaping: Order of the line item of one invoice
+      marketing: Order of the line item of one invoice
+      subscriptions: Order of the line item of one invoice
+      trash_collection_services: Order of the line item of one invoice
+      other_infrequent: Order of the line item of one invoice
+  property_abbreviation:
+    required: true
+    source: property_reference_match
+    if_unmatched: property_mapping_required
+    canonical_matrix:
+      utilities: Use what matches with the date
+      pest_control: Use what matches with the date
+      landscaping: Use what matches with the date
+      marketing: Use what matches with the date
+      subscriptions: Use what matches with the date
+      trash_collection_services: Use what matches with the date
+      other_infrequent: Use what matches with the date
+  location:
+    required: false
+    source: unit_info_valid_location_only
+    never_use_raw_address: true
+    canonical_matrix:
+      utilities: Put always if there is in the invoice
+      pest_control: Put always if there is in the invoice
+      landscaping: Put always if there is in the invoice
+      marketing: Put always if there is in the invoice
+      subscriptions: Put always if there is in the invoice
+      trash_collection_services: Put always if there is in the invoice
+      other_infrequent: Put always if there is in the invoice
+  gl_account:
+    required: true
+    source: chart_of_accounts_valid_numeric_only
+    if_unmatched: gl_mapping_required
+    canonical_matrix:
+      utilities: Use what matches with the date
+      pest_control: Use what matches with the date
+      landscaping: Use what matches with the date
+      marketing: Use what matches with the date
+      subscriptions: Use what matches with the date
+      trash_collection_services: Use what matches with the date
+      other_infrequent: Use what matches with the date
+  line_item_description:
+    required: true
+    formats:
+      utilities: '{service_period} - {service_address_or_property} - {line_item_description}'
+      trash_collection_services: '{service_period} - {property_or_site_name} - {line_item_description}'
+      pest_control: '{service_period} - {property_or_site_name} - {line_item_description}'
+      landscaping: '{service_period} - {property_or_site_name} - {line_item_description}'
+      marketing: '{vendor_name} - {line_item_description}'
+      subscriptions: '{vendor_name} - {line_item_description}'
+      other_infrequent: '{line_item_description}'
+      unknown: '{vendor_name} - {line_item_description}'
+    canonical_matrix:
+      utilities: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the bill
+        - Detail of the line'
+      pest_control: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill - Detail of the line'
+      landscaping: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill - Detail of the line'
+      marketing: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the bill
+        - Detail of the line'
+      subscriptions: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the
+        bill - Detail of the line'
+      trash_collection_services: '{first reading date}-(last reading date) - Service Addres including the unit number if appears
+        in the bill - Detail of the line'
+      other_infrequent: "Don\u2019t need to put the date, or the vendor, just a detail descriptios of what is the product\
+        \ and its category"
+  amount:
+    required: true
+    validation:
+      numeric: true
+      reconcile_to_invoice_total: true
+    canonical_matrix:
+      utilities: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put all the words with
+        the first letter in uppercase, just the first letter
+      pest_control: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put all the words
+        with the first letter in uppercase, just the first letter
+      landscaping: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put all the words
+        with the first letter in uppercase, just the first letter
+      marketing: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put all the words with
+        the first letter in uppercase, just the first letter
+      subscriptions: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put all the words
+        with the first letter in uppercase, just the first letter
+      trash_collection_services: what is in the bill or invoice.. Needs match exactly. Split the TAX proportionaly!!! Put
+        all the words with the first letter in uppercase, just the first letter
+      other_infrequent: "Don\u2019t need to put the date, or the vendor, just a detail descriptios of what is the product\
+        \ and its category"
+  expense_type:
+    required: true
+    default: General
+    canonical_matrix:
+      utilities: General
+      pest_control: General
+      landscaping: General
+      marketing: General
+      subscriptions: General
+      trash_collection_services: General
+      other_infrequent: General
+  is_replacement_reserve:
+    required: true
+    default: false
+  due_date:
+    required: true
+    source_priority:
+    - explicit_due_date
+    - autopay_date
+    - terms_plus_invoice_date
+    canonical_matrix:
+      utilities: Use what is in the invoice or bill
+      pest_control: Use what is in the invoice or bill
+      landscaping: Use what is in the invoice or bill
+      marketing: Use what is in the invoice or bill
+      subscriptions: Use what is in the invoice or bill
+      trash_collection_services: Use what is in the invoice or bill
+      other_infrequent: Use what is in the invoice or bill
+  document_url:
+    required: true
+    source: dropbox_after_upload
+    canonical_matrix:
+      utilities: Dropbox (mandatory always)
+      pest_control: Dropbox (mandatory always)
+      landscaping: Dropbox (mandatory always)
+      marketing: Dropbox (mandatory always)
+      subscriptions: Dropbox (mandatory always)
+      trash_collection_services: Dropbox (mandatory always)
+      other_infrequent: Dropbox (mandatory always)
+  payment_date: {}
+  reference_number: {}
+  payment_method: {}
+  department: {}
+  quantity: {}
+  unit_price: {}
+  tax: {}
+  received_date: {}
+categories:
+  utilities:
+    labels:
+    - Utilities
+    vendor_keywords:
+    - utility
+    - utilities
+    - water
+    - electric
+    - wastewater
+    - fiber
+    - internet
+    - gas
+    - power
+    service_keywords:
+    - water
+    - sewer
+    - electric
+    - internet
+    - fiber
+    - gas
+    - wastewater
+    default_gl_candidates:
+      water: '6955'
+      sewer: '6955'
+      wastewater: '6955'
+      internet: '6920'
+      fiber: '6920'
+      electric: '6950'
+      gas: '6995'
+    invoice_number_rule: account_number_service_period
+    location_policy: valid_unit_if_present
+  pest_control:
+    labels:
+    - Pest Control
+    vendor_keywords:
+    - pest
+    - termite
+    - exterminator
+    default_gl_candidates:
+      default: '6760'
+    location_policy: property_level_blank_location_allowed
+  landscaping:
+    labels:
+    - Landscaping
+    vendor_keywords:
+    - landscap
+    - lawn
+    - mulch
+    - tree
+    default_gl_candidates:
+      default: '6750'
+    location_policy: property_level_blank_location_allowed
+  marketing:
+    labels:
+    - Marketing
+    vendor_keywords:
+    - marketing
+    - advertising
+    - apartments.com
+    - costar
+    default_gl_candidates:
+      default: '6630'
+    location_policy: property_level_blank_location_allowed
+  subscriptions:
+    labels:
+    - Subscriptions
+    - Suscriptions
+    vendor_keywords:
+    - subscription
+    - software
+    - license
+    - saas
+    default_gl_candidates:
+      default: '6665'
+    location_policy: property_level_blank_location_allowed
+  trash_collection_services:
+    labels:
+    - Trash collections services
+    vendor_keywords:
+    - waste
+    - trash
+    - garbage
+    - refuse
+    - dumpster
+    - capital waste
+    - waste connections
+    service_keywords:
+    - trash
+    - waste
+    - container
+    - dumpster
+    - fuel recovery
+    - removal
+    default_gl_candidates:
+      default: '6940'
+      fuel_recovery: '6940'
+      environmental: '6940'
+    fee_handling:
+      fuel_recovery_adjustment: same_gl_as_service
+    ignore_line_keywords:
+    - previous balance
+    - balance forward
+    - payment received
+    - autopay
+    - amount enclosed
+    location_policy: property_level_blank_location_allowed
+  other_infrequent:
+    labels:
+    - Other infrequent / maintenance / supplies / purchases
+    - Other unfrequent like (manintenance, supplies purchases, punctual services, atorny, appliances, etc tools)
+    vendor_keywords:
+    - supply
+    - supplies
+    - maintenance
+    - repair
+    - materials
+    - appliance
+    - parts
+    use_ai: true
+    require_vendor_validation: true
+    require_gl_validation: true
+    location_policy: valid_unit_if_present
+  unknown:
+    labels:
+    - Unknown
+    vendor_keywords: []
+    use_ai: true
+    location_policy: valid_unit_if_present

@@ -1,0 +1,50 @@
+{
+  "key": "epb",
+  "vendor": "EPB Fiber Optics",
+  "category": "utilities",
+  "description": "Scanned EPB Fiber Optics bill with current internet charges, tax/surcharge, and prior-balance/payment lines.",
+  "status": "complete",
+  "requires_live_ai": false,
+  "source_document": "epb_fiber_optics_18547827.pdf",
+  "support_document_url": "https://dropbox.example/canonical/epb-fiber-optics-18547827.pdf",
+  "ignored_source_items": ["previous_balance", "payments"],
+  "extracted_candidates": {
+    "vendor_name": "EPB Fiber Optics",
+    "category": "utilities",
+    "invoice_number": "18547827",
+    "invoice_date": "05/07/2026",
+    "due_date": "05/22/2026",
+    "bill_or_credit": "Bill",
+    "account_number": "C10181446",
+    "service_address": "21752 River Canyon Rd, Chattanooga, TN 37405",
+    "service_period_start": "05/08/2026",
+    "service_period_end": "06/07/2026",
+    "property_candidate": "River Canyon",
+    "property_abbreviation": "RCC",
+    "line_items": [
+      {
+        "description": "Fi-Speed Internet",
+        "quantity": 1,
+        "unit_price": 67.98,
+        "amount": 67.98,
+        "gl_account_candidate": "6139",
+        "confidence": 0.94,
+        "reason": "Visible current internet service charge."
+      },
+      {
+        "description": "Tax and Surcharges",
+        "quantity": 1,
+        "unit_price": 0.97,
+        "amount": 0.97,
+        "gl_account_candidate": "6139",
+        "confidence": 0.9,
+        "reason": "Visible current tax/surcharge charge."
+      }
+    ],
+    "subtotal": 68.95,
+    "tax_amount": 0,
+    "total_amount": 68.95,
+    "confidence": 0.94,
+    "warnings": []
+  }
+}

@@ -64,6 +64,8 @@ function iconFor(mode: DocumentMode): string {
       return "📄";
     case "scanned_pdf":
       return "🖨";
+    case "screenshot_image":
+      return "IMG";
     case "mixed_pdf":
       return "🗂";
     case "csv_excel":

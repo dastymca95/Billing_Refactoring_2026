@@ -179,24 +179,19 @@ def _looks_like_hardin_county_water(path: Path) -> tuple[bool, float, str]:
     For digital PDFs the text layer carries "Hardin County Water
     District No. 2" / "hcwd2.org" / the office phone "270.737.1056".
     Scanned PDFs return empty text via the cheap pdfplumber probe;
-    those are accepted on a filename hint at lower confidence — OCR
-    will confirm during processing.
+    those are accepted only on a vendor-specific filename hint at lower
+    confidence — OCR will confirm during processing.
     """
     if path.suffix.lower() != ".pdf":
         return False, 0.0, ""
     name_lower = path.name.lower()
-    # UUID-named scanned bills (e.g. ``57b63f7e-0a96-4029-9976-9f38a9e125ff.pdf``)
-    # are produced by HCWD2's scan-import workflow; they're a reliable
-    # filename-only hint for this vendor.
-    is_uuid_filename = bool(
-        re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.pdf$",
-                 name_lower)
-    )
+    # Do not treat generic UUID download names as vendor evidence. Many
+    # scanned bills arrive as UUID PDFs; routing those to Hardin County
+    # caused unrelated vendors to bypass AI/vision extraction.
     fname_hint = (
         "hardin" in name_lower
         or "hcwd2" in name_lower
         or "billprint" in name_lower
-        or is_uuid_filename
     )
     text_sample = ""
     try:
@@ -364,6 +359,304 @@ def _looks_like_mcminnville_electric(path: Path) -> tuple[bool, float, str]:
     return False, 0.0, ""
 
 
+def _looks_like_alabama_power(path: Path) -> tuple[bool, float, str]:
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    hay = f"{path.name}\n{_pdf_text_sample(path, 3500)}".lower()
+    compact = re.sub(r"\s+", "", hay)
+    if "alabamapower" in compact or "alabamapower.com" in hay:
+        return True, 0.95, "PDF text mentions Alabama Power / AlabamaPower.com"
+    if "alabama power" in hay:
+        return True, 0.9, "PDF text mentions Alabama Power"
+    return False, 0.0, ""
+
+
+def _looks_like_epb_fiber_optics(path: Path) -> tuple[bool, float, str]:
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    hay = f"{path.name}\n{_pdf_text_sample(path, 3500)}".lower()
+    compact = re.sub(r"\s+", "", hay)
+    if "epbfiberoptics" in compact or "epb.com" in hay:
+        return True, 0.95, "PDF text mentions EPB Fiber Optics / epb.com"
+    if "fi-speed internet" in hay and "accountnumber" in compact:
+        return True, 0.9, "PDF text matches EPB fiber billing format"
+    return False, 0.0, ""
+
+
+def _looks_like_city_of_henderson(path: Path) -> tuple[bool, float, str]:
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    hay = f"{path.name}\n{_pdf_text_sample(path, 3500)}".lower()
+    if "city of henderson" in hay and ("current billing" in hay or "hendersonky.gov" in hay):
+        return True, 0.95, "PDF text mentions City of Henderson utility billing"
+    return False, 0.0, ""
+
+
+def _looks_like_cde_lightband(path: Path) -> tuple[bool, float, str]:
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    hay = f"{path.name}\n{_pdf_text_sample(path, 3500)}".lower()
+    if "cde lightband" in hay or "cdelightband" in hay:
+        return True, 0.95, "PDF text mentions CDE Lightband"
+    if "service period:" in hay and "electric energy charge" in hay and "date due:" in hay:
+        return True, 0.85, "PDF text matches CDE utility billing format"
+    return False, 0.0, ""
+
+
+def _looks_like_nolin_recc_smarthub(path: Path) -> tuple[bool, float, str]:
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    hay = f"{path.name}\n{_pdf_text_sample(path, 3500)}".lower()
+    compact = re.sub(r"\s+", "", hay)
+    if "nolin" in hay and ("recc" in hay or "rural electric" in hay or "smarthub" in hay):
+        return True, 0.95, "PDF text mentions Nolin RECC / SmartHub"
+    if "payment will draft" in hay and "masteraccount" in compact:
+        return True, 0.9, "PDF text matches Nolin master-billing statement"
+    return False, 0.0, ""
+
+
+def _looks_like_keyword_vendor(
+    path: Path,
+    *,
+    labels: tuple[str, ...],
+    reason: str,
+    secondary: tuple[str, ...] = (),
+) -> tuple[bool, float, str]:
+    hay = f"{path.name}\n{_document_text_sample(path, 3500)}".lower()
+    compact = re.sub(r"\s+", "", hay)
+    if any(label.lower() in hay or re.sub(r"\s+", "", label.lower()) in compact for label in labels):
+        if not secondary or any(s.lower() in hay or re.sub(r"\s+", "", s.lower()) in compact for s in secondary):
+            return True, 0.92, reason
+    return False, 0.0, ""
+
+
+def _looks_like_clarksville_gas_and_water(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("Clarksville Gas and Water", "Clarksville Gas & Water", "clarksvillegw.com"),
+        secondary=("Total Current", "Current Billing", "Account No"),
+        reason="PDF/OCR text matches Clarksville Gas and Water utility bill",
+    )
+
+
+def _looks_like_knoxville_utilities_board(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("Knoxville Utilities Board", "kub.org", "KUB Payment"),
+        secondary=("Billing Summary", "Summary of Charges by Address", "Account Number"),
+        reason="PDF text matches Knoxville Utilities Board bill",
+    )
+
+
+def _looks_like_kentucky_utilities(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("Kentucky Utilities", "lge-ku.com", "LG&E KU"),
+        secondary=("Current Electric Charges", "Total Current Charges", "Account #"),
+        reason="PDF text matches Kentucky Utilities bill",
+    )
+
+
+def _looks_like_tennessee_american_water(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("Tennessee American Water", "tennesseeamwater.com", "amwater.com"),
+        secondary=("ServiceRelatedCharges", "Account No", "Payment Due By"),
+        reason="PDF text matches Tennessee American Water bill",
+    )
+
+
+def _looks_like_union_city_energy_authority(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("Union City Energy Authority", "unioncityenergy.com", "Union City Energy"),
+        secondary=("METERED ELECTRIC", "NET AMOUNT DUE", "BANK DRAFT"),
+        reason="PDF/OCR text matches Union City Energy Authority bill",
+    )
+
+
+def _looks_like_weakley_county_electric(path: Path) -> tuple[bool, float, str]:
+    matched, score, reason = _looks_like_keyword_vendor(
+        path,
+        labels=("Weakley County Municipal Electric System", "wcmes.com"),
+        secondary=("Metered Electric", "ACCOUNTNUMBER", "TOTALCURRENTCHARGES"),
+        reason="PDF/OCR text matches Weakley County Municipal Electric System bill",
+    )
+    if matched:
+        return matched, score, reason
+    # OCR on photographed Weakley bills often breaks the heading across
+    # unrelated text, so the full normalized vendor label is not contiguous.
+    hay = f"{path.name}\n{_document_text_sample(path, 3500)}".lower()
+    compact = re.sub(r"\s+", "", hay)
+    if (
+        "weakley county" in hay
+        and "municipal electric system" in hay
+        and (
+            "totalcurrentcharges" in compact
+            or "netamountdue" in compact
+            or "pay by phone" in hay
+        )
+    ):
+        return True, 0.9, "OCR text matches Weakley County Municipal Electric System image bill"
+    return False, 0.0, ""
+
+
+def _looks_like_birmingham_water_works(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("Birmingham Water Works", "Central Alabama Water", "caw-al.gov"),
+        secondary=("CAW WATER SERVICE", "JEFFERSON COUNTY SEWER SERVICE", "ACCOUNT NUMBER"),
+        reason="PDF text matches Birmingham Water Works / Central Alabama Water bill",
+    )
+
+
+def _looks_like_city_of_mcminnville_water(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("City of McMinnville", "cityofmcminnvilletn.gov"),
+        secondary=("Account Number Service Period", "AMOUNT DUE NOW", "WA"),
+        reason="PDF text matches City of McMinnville Water/Sewer bill",
+    )
+
+
+def _looks_like_chattanooga_wastewater(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("City of Chattanooga Wastewater Department", "sewerpayments.com/chattanooga"),
+        secondary=("ACCOUNT=", "Sewer Usage Charges", "BILLDATE="),
+        reason="PDF text matches City of Chattanooga Wastewater bill",
+    )
+
+
+def _looks_like_city_of_martin(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("City of Martin", "cityofmartin.net"),
+        secondary=("Account Number Service Period", "AMOUNT DUE NOW", "WA"),
+        reason="PDF text matches City of Martin utility bill",
+    )
+
+
+def _looks_like_city_of_union_city(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("CITY OF UNION CITY - WATER", "CITY OF UNION CITY", "unioncitytn.gov/water"),
+        secondary=("CURRENT BILL", "SANITATION", "STORMWATER"),
+        reason="PDF text matches City of Union City water/sewer bill",
+    )
+
+
+def _looks_like_guardian_water_power(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("Guardian Water & Power", "Guardian Water and Power", "myguardianwp.com"),
+        secondary=("Invoice Number", "Customer Number", "BILLING FEE"),
+        reason="PDF text matches Guardian Water & Power invoice",
+    )
+
+
+def _looks_like_hopkinsville_electric(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("Hopkinsville Electric System", "hop-electric.com"),
+        secondary=("Electric Service", "ACCOUNTNUMBER", "TOTALCURRENTCHARGES"),
+        reason="PDF text matches Hopkinsville Electric System bill",
+    )
+
+
+def _pdf_text_sample(path: Path, limit: int = 2500) -> str:
+    if path.suffix.lower() != ".pdf":
+        return ""
+    try:
+        import pdfplumber  # type: ignore
+        with pdfplumber.open(path) as pdf:
+            if pdf.pages:
+                return (pdf.pages[0].extract_text() or "")[:limit]
+    except Exception:
+        return ""
+    return ""
+
+
+def _document_text_sample(path: Path, limit: int = 2500) -> str:
+    text = _pdf_text_sample(path, limit)
+    if text.strip():
+        return text
+    if path.suffix.lower() not in {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+        return ""
+    # Phase PERF-1 hotfix — fast-mode short-circuit.
+    #
+    # When the caller is `listFiles` (vendor detection at upload time),
+    # running 5 Tesseract variants per image is a 10-50 s blocker on
+    # screenshot uploads. The OCR_FAST_DETECTION_ONLY env flag (set by
+    # the listFiles endpoint via thread-local context) tells us to
+    # only consult the OCR cache, not run a fresh OCR. If the cache
+    # is empty, we return "" and the file is treated as unknown until
+    # the user actually processes it. The cache fills on the first
+    # processing pass so subsequent listFiles calls match instantly.
+    try:
+        import threading
+        flag = getattr(_DETECT_CTX, "fast_only", False)
+    except Exception:
+        flag = False
+    if flag:
+        try:
+            from utils import ocr_cache  # type: ignore
+            cached = ocr_cache.lookup(path, 0)
+            if cached and cached.get("pages"):
+                return (cached["pages"][0].get("text") or "")[:limit]
+        except Exception:
+            pass
+        return ""
+    try:
+        from .document_ingestion import ingest_document
+
+        return (ingest_document(path, max_pages=2).document_text or "")[:limit]
+    except Exception:
+        return ""
+
+
+# Thread-local context — set by callers (e.g. listFiles endpoint) to
+# request fast-mode vendor detection that doesn't run image OCR.
+import threading as _threading
+_DETECT_CTX = _threading.local()
+
+
+class fast_detection_context:
+    """Context manager: temporarily mark this thread as "fast detection
+    only" so image-OCR-dependent detectors fall back to cache lookups
+    only. Usage:
+
+        with fast_detection_context():
+            entries = _detect_files_cached(batch_id, files)
+    """
+    def __enter__(self):
+        _DETECT_CTX.fast_only = True
+        return self
+    def __exit__(self, *exc):
+        _DETECT_CTX.fast_only = False
+
+
+def _looks_like_hd_supply(path: Path) -> tuple[bool, float, str]:
+    hay = f"{path.name}\n{_pdf_text_sample(path)}".lower()
+    if "hd supply" in hay or "hdsupply" in hay:
+        return True, 0.85, "variable supplier invoice: HD Supply"
+    return False, 0.0, ""
+
+
+def _looks_like_lowes(path: Path) -> tuple[bool, float, str]:
+    hay = f"{path.name}\n{_pdf_text_sample(path)}".lower()
+    if "lowe's" in hay or "lowes" in hay or "lowe s" in hay:
+        return True, 0.85, "variable supplier invoice: Lowe's"
+    return False, 0.0, ""
+
+
+def _looks_like_home_depot(path: Path) -> tuple[bool, float, str]:
+    hay = f"{path.name}\n{_pdf_text_sample(path)}".lower()
+    if "home depot" in hay or "the home depot" in hay:
+        return True, 0.85, "variable supplier invoice: Home Depot"
+    return False, 0.0, ""
+
+
 _DETECTORS: list[tuple[str, Callable[[Path], tuple[bool, float, str]]]] = [
     ("richmond_utilities", _looks_like_richmond_utilities),
     ("hopkinsville_water_environment_authority", _looks_like_hopkinsville_water),
@@ -374,6 +667,27 @@ _DETECTORS: list[tuple[str, Callable[[Path], tuple[bool, float, str]]]] = [
     ("zillow_rentals", _looks_like_zillow_rentals),
     ("mcminnville_electric_system", _looks_like_mcminnville_electric),
     ("pennyrile_electric", _looks_like_pennyrile_electric),
+    ("alabama_power", _looks_like_alabama_power),
+    ("epb_fiber_optics", _looks_like_epb_fiber_optics),
+    ("the_city_of_henderson", _looks_like_city_of_henderson),
+    ("cde_lightband", _looks_like_cde_lightband),
+    ("nolin_recc_smarthub", _looks_like_nolin_recc_smarthub),
+    ("clarksville_gas_and_water", _looks_like_clarksville_gas_and_water),
+    ("knoxville_utilities_board", _looks_like_knoxville_utilities_board),
+    ("kentucky_utilities", _looks_like_kentucky_utilities),
+    ("tennessee_american_water", _looks_like_tennessee_american_water),
+    ("union_city_energy_authority", _looks_like_union_city_energy_authority),
+    ("weakley_county_municipal_electric_system", _looks_like_weakley_county_electric),
+    ("birmingham_water_works", _looks_like_birmingham_water_works),
+    ("city_of_mcminnville_water_sewer_dept", _looks_like_city_of_mcminnville_water),
+    ("city_of_chattanooga_wastewater_department", _looks_like_chattanooga_wastewater),
+    ("city_of_martin", _looks_like_city_of_martin),
+    ("city_of_union_city", _looks_like_city_of_union_city),
+    ("guardian_water_power", _looks_like_guardian_water_power),
+    ("hopkinsville_electric_system", _looks_like_hopkinsville_electric),
+    ("hd_supply", _looks_like_hd_supply),
+    ("lowes", _looks_like_lowes),
+    ("home_depot", _looks_like_home_depot),
 ]
 
 
@@ -387,7 +701,27 @@ SUPPORTED_VENDOR_KEYS = {
     "zillow_rentals",
     "mcminnville_electric_system",
     "pennyrile_electric",
+    "alabama_power",
+    "epb_fiber_optics",
+    "the_city_of_henderson",
+    "cde_lightband",
+    "nolin_recc_smarthub",
+    "clarksville_gas_and_water",
+    "knoxville_utilities_board",
+    "kentucky_utilities",
+    "tennessee_american_water",
+    "union_city_energy_authority",
+    "weakley_county_municipal_electric_system",
+    "birmingham_water_works",
+    "city_of_mcminnville_water_sewer_dept",
+    "city_of_chattanooga_wastewater_department",
+    "city_of_martin",
+    "city_of_union_city",
+    "guardian_water_power",
+    "hopkinsville_electric_system",
 }
+
+AI_ASSIST_VENDOR_KEYS = {"hd_supply", "lowes", "home_depot"}
 
 
 def detect_vendor_for_file(path: Path) -> dict:
@@ -405,12 +739,20 @@ def detect_vendor_for_file(path: Path) -> dict:
                 "confidence": conf,
                 "reason": reason,
                 "supported_in_phase_1": vendor_key in SUPPORTED_VENDOR_KEYS,
+                "processing_mode": (
+                    "ai_assisted"
+                    if vendor_key in AI_ASSIST_VENDOR_KEYS
+                    else "deterministic"
+                    if vendor_key in SUPPORTED_VENDOR_KEYS
+                    else "manual"
+                ),
             }
     return {
         "vendor_key": "unknown",
         "confidence": 0.0,
         "reason": "no_detector_claimed_this_file",
         "supported_in_phase_1": False,
+        "processing_mode": "ai_assisted",
     }
 
 

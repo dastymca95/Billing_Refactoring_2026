@@ -1,0 +1,36 @@
+{
+  "schema": "phase_perf1/profile_processing/v1",
+  "run_at": "2026-05-14T17:38:08",
+  "fixtures": [
+    {
+      "label": "pennyrile_simple_pdf",
+      "path": "Training Bills_Invoices\\Electricity - Power\\Pennyrile Electric\\Bills_Training\\0Q3yoN0wY06ribbqq7wYdA20.pdf",
+      "cold_ms": 241.45,
+      "cold_method": "digital_text",
+      "cold_pages": 1,
+      "cold_warnings": [],
+      "warm_ms": 230.3,
+      "warm_method": "digital_text",
+      "cache_hit": false,
+      "speedup_x": 1.05
+    },
+    {
+      "label": "mcminnville_collective_pdf",
+      "path": "Training Bills_Invoices\\Electricity - Power\\McMinnville Electric System\\Bills_Training\\045d79ac-b947-4d52-aa91-3b6a249d9f2a.pdf",
+      "cold_ms": 332.12,
+      "cold_method": "digital_text",
+      "cold_pages": 1,
+      "cold_warnings": [],
+      "warm_ms": 268.21,
+      "warm_method": "digital_text",
+      "cache_hit": false,
+      "speedup_x": 1.24
+    }
+  ],
+  "ocr_cache_stats": {
+    "enabled": true,
+    "count": 6,
+    "size_bytes": 1072081,
+    "directory": "C:\\Users\\Dasty\\PycharmProjects\\Billing_Refactoring_2026\\webapp_data\\cache\\ocr"
+  }
+}

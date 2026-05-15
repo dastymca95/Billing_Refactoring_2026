@@ -11,11 +11,8 @@ of which processor produced them:
      ResMan import wants "Columbia Power and Water System" exactly.
 
   2. **Description case** — "Invoice Description" and "Line Item
-     Description" are forced to *Sentence case*: the first
-     letter capitalised, every other letter lower-cased. This is the
-     project-wide convention for description fields. Punctuation,
-     numbers, and dates inside the description are preserved
-     character-for-character — only alphabetic case changes.
+     Description" are forced to ResMan-facing Proper Case while preserving
+     project acronyms and common street abbreviations.
 
   3. **Dates** — every column whose name ends in "Date" gets parsed
      into ``YYYY-MM-DD`` ISO format. The workbook writers then
@@ -43,12 +40,16 @@ try:
 except Exception:  # pragma: no cover
     canonical_vendor_name = None  # type: ignore
 try:
-    from utils.text_normalize import to_sentence_case as _shared_sentence_case
+    from utils.text_normalization import proper_case_preserve_acronyms as _shared_proper_case
 except Exception:  # pragma: no cover
-    _shared_sentence_case = None  # type: ignore
+    _shared_proper_case = None  # type: ignore
 
 
 _LOG = logging.getLogger(__name__)
+try:
+    from . import output_contract_validator
+except Exception:  # pragma: no cover
+    output_contract_validator = None  # type: ignore
 
 
 _DATE_COLUMNS = ("Invoice Date", "Accounting Date", "Due Date")
@@ -122,17 +123,12 @@ def to_sentence_case(value: Any) -> Any:
     """Backward-compatible re-export. The implementation lives in
     ``utils.text_normalize`` so vendor processors can use it without
     importing from the webapp package."""
-    if _shared_sentence_case is not None:
-        return _shared_sentence_case(value)
+    if _shared_proper_case is not None:
+        return _shared_proper_case(value)
     if value in (None, ""):
         return value
     s = str(value)
-    out = list(s.lower())
-    for i, ch in enumerate(out):
-        if _WORD_CHAR_RE.match(ch):
-            out[i] = ch.upper()
-            break
-    return "".join(out)
+    return " ".join(word[:1].upper() + word[1:].lower() for word in s.split(" "))
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +156,7 @@ def normalize_rows(
     if not rows:
         return 0
     canonical_name: Optional[str] = None
-    if vendor_key:
+    if vendor_key and vendor_key != "ai_assisted":
         canonical_name = _vendor_canonical(vendor_key, "")
     base_url: Optional[str] = _webapp_base_url() if batch_id else None
 
@@ -202,6 +198,8 @@ def normalize_rows(
 
         if changed:
             touched += 1
+    if output_contract_validator is not None:
+        output_contract_validator.annotate_rows(rows)
     return touched
 
 

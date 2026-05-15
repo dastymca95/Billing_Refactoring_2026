@@ -1,0 +1,33 @@
+status: complete
+vendor_expected: Spectrum Business & Community Services
+category_expected: subscriptions
+invoice_number_expected: "0310675042426"
+account_number_expected: "8363 29 023 0310675"
+invoice_date_expected: 04/24/2026
+due_date_expected: 05/11/2026
+service_period_expected:
+  start: 04/24/2026
+  end: 05/23/2026
+  range: 04/24/26-05/23/26
+property_abbreviation_expected: AMA
+location_expected: ""
+location_policy_expected: property_level_blank_location_allowed
+invoice_description_expected: 04/24/26 - Spectrum Business & Community Services - Community Solutions Services
+line_items_expected:
+  - line_item_number: 1
+    gl_account: "6905"
+    description: Spectrum Business & Community Services - Community Solutions Services
+    amount: 10836.00
+  - line_item_number: 2
+    gl_account: "6905"
+    description: Spectrum Business & Community Services - Taxes, Fees and Charges
+    amount: 235.51
+expense_type_expected: General
+is_replacement_reserve_expected: false
+total_expected: 11071.51
+expected_review_flags:
+  - zero_amount_line_excluded
+ignored_source_items:
+  - previous_balance
+  - payments
+  - zero_amount_lines

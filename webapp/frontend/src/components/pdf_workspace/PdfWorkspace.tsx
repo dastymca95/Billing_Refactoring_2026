@@ -15,11 +15,11 @@ import {
 } from "react";
 
 import { api, getFriendlyErrorMessage, isApiError } from "../../api";
-import type { RegionHint, RegionLabel } from "../../types";
+import type { BatchProgress, RegionHint, RegionLabel, TraceItem } from "../../types";
+import { AiScanOverlay } from "../AiScanOverlay";
 import { PdfOverlay } from "./PdfOverlay";
 import { loadPdfDocument, PdfPageCanvas } from "./PdfPageCanvas";
 import { TraceOverlay } from "./TraceOverlay";
-import type { TraceItem } from "../../types";
 import { ViewerToolbar } from "./ViewerToolbar";
 import type { Tool } from "./types";
 
@@ -46,6 +46,7 @@ type Props = {
     page: number,
     bbox: { x: number; y: number; w: number; h: number },
   ) => void;
+  aiProgress?: BatchProgress | null;
 };
 
 type PageSize = { width: number; height: number };
@@ -61,6 +62,7 @@ export function PdfWorkspace({
   onTraceHover,
   remapActive,
   onRemapDrawn,
+  aiProgress,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
@@ -68,6 +70,10 @@ export function PdfWorkspace({
   const [activePageNumber, setActivePageNumber] = useState(1);
   const [pageCount, setPageCount] = useState(0);
   const [pageSizes, setPageSizes] = useState<Record<number, PageSize>>({});
+  const [naturalPageSize, setNaturalPageSize] = useState<PageSize | null>(null);
+  const [firstFrameReady, setFirstFrameReady] = useState(false);
+  const [metadataFileUrl, setMetadataFileUrl] = useState<string | null>(null);
+  const [firstFrameFileUrl, setFirstFrameFileUrl] = useState<string | null>(null);
   const [focusedPageNumber, setFocusedPageNumber] = useState<number | null>(null);
   // ``userZoom`` is what the operator chose via the toolbar / Ctrl+wheel.
   // ``effectiveZoom`` (computed below) is what the canvas actually
@@ -102,7 +108,7 @@ export function PdfWorkspace({
   // Track the canvas-area width; recompute on every resize. We use a
   // ResizeObserver instead of window.resize so we react to layout
   // changes (sidebar collapse, panel maximize) too.
-  useEffect(() => {
+  useLayoutEffect(() => {
     const node = scrollRef.current;
     if (!node) return;
     setContainerWidth(node.clientWidth);
@@ -120,11 +126,11 @@ export function PdfWorkspace({
   // is unconstrained → display zoom equals userZoom.
   const FIT_HORIZONTAL_PADDING = 32; // matches the canvas-area gutter
   const fitZoom = useMemo(() => {
-    const natural = naturalPageWidthRef.current;
+    const natural = naturalPageSize?.width ?? naturalPageWidthRef.current;
     if (!natural || !containerWidth || containerWidth <= 0) return Infinity;
     const usable = Math.max(120, containerWidth - FIT_HORIZONTAL_PADDING);
     return usable / natural;
-  }, [containerWidth, pageSizes]);
+  }, [containerWidth, naturalPageSize?.width]);
 
   // Display zoom resolution.
   //
@@ -549,15 +555,33 @@ export function PdfWorkspace({
     let cancelled = false;
     setPageCount(0);
     setPageSizes({});
+    setNaturalPageSize(null);
+    setFirstFrameReady(false);
+    setMetadataFileUrl(null);
+    setFirstFrameFileUrl(null);
     ratiosRef.current.clear();
     // Phase 2I — natural width is per-file; reset when fileUrl changes.
     naturalPageWidthRef.current = null;
     (async () => {
       try {
         const { doc } = await loadPdfDocument(fileUrl);
-        if (!cancelled) setPageCount(doc.numPages || 1);
+        const firstPage = await doc.getPage(1);
+        const viewport = firstPage.getViewport({ scale: 1 });
+        if (!cancelled) {
+          const natural = { width: viewport.width, height: viewport.height };
+          naturalPageWidthRef.current = natural.width;
+          setNaturalPageSize(natural);
+          setPageCount(doc.numPages || 1);
+          setMetadataFileUrl(fileUrl);
+        }
       } catch (e) {
-        if (!cancelled) setPageCount(1);
+        if (!cancelled) {
+          const fallback = { width: 612, height: 792 };
+          naturalPageWidthRef.current = fallback.width;
+          setNaturalPageSize(fallback);
+          setPageCount(1);
+          setMetadataFileUrl(fileUrl);
+        }
         // eslint-disable-next-line no-console
         console.warn("PDF metadata load failed:", e);
       }
@@ -651,10 +675,17 @@ export function PdfWorkspace({
     setSelectedId(null);
   }, [fileId]);
 
+  const hasCurrentMetadata = metadataFileUrl === fileUrl;
+  const hasCurrentFirstFrame = firstFrameReady && firstFrameFileUrl === fileUrl;
+  const isPdfLayoutReady =
+    hasCurrentMetadata && pageCount > 0 && naturalPageSize != null && containerWidth != null;
+  const isDocumentReady = isPdfLayoutReady && hasCurrentFirstFrame;
+
   const pageNumbers = useMemo(() => {
+    if (!isPdfLayoutReady) return [];
     const count = Math.max(1, pageCount || 1);
     return Array.from({ length: count }, (_, i) => i + 1);
-  }, [pageCount]);
+  }, [isPdfLayoutReady, pageCount]);
 
   const regionsByPage = useMemo(() => {
     const grouped: Record<number, RegionHint[]> = {};
@@ -830,7 +861,7 @@ export function PdfWorkspace({
           active document has at least one trace; otherwise the toggle
           would be a dead control. Click toggles the overlay on/off; the
           subtle accent fill signals the active state. */}
-      {traces.length > 0 && (
+      {false && traces.length > 0 && (
         <button
           type="button"
           className={`pdf-trace-toggle ${tracesEnabled ? "is-on" : ""}`}
@@ -853,8 +884,6 @@ export function PdfWorkspace({
         </button>
       )}
       <ViewerToolbar
-        tool={tool}
-        onToolChange={setTool}
         zoom={zoom}
         // Phase 2I — toolbar now mutates ``userZoom`` (the *intent*).
         // The displayed zoom is still the auto-fit-clamped value, but
@@ -864,13 +893,15 @@ export function PdfWorkspace({
         onZoomIn={() => setUserZoom((z) => Math.min(4.0, +(z + 0.1).toFixed(2)))}
         onZoomOut={() => setUserZoom((z) => Math.max(0.25, +(z - 0.1).toFixed(2)))}
         onResetZoom={() => setUserZoom(1.0)}
-        drawLabel={drawLabel}
-        onDrawLabelChange={setDrawLabel}
         pageNumber={activePageNumber}
         pageCount={pageCount}
+        isLayoutReady={isDocumentReady}
         onPrevPage={() => scrollToPage(Math.max(1, activePageNumber - 1))}
         onNextPage={() => scrollToPage(Math.min(pageCount || activePageNumber + 1, activePageNumber + 1))}
         regionsCount={regionsOnActivePage.length}
+        traceCount={traces.length}
+        tracesEnabled={tracesEnabled}
+        onToggleTraces={() => setTracesEnabled((v) => !v)}
       />
       {/* Phase 1W cleanup — only render the status row when there's
           actually something to say (saving / error). The previous
@@ -902,7 +933,7 @@ export function PdfWorkspace({
               ? "is-space-panning"
               : "is-space-pan"
             : ""
-        }`}
+        } ${isDocumentReady ? "is-document-ready" : "is-preparing-document"}`}
         ref={scrollRef}
         data-testid="pdf-continuous-scroll"
         onPointerDown={handlePanPointerDown}
@@ -910,7 +941,26 @@ export function PdfWorkspace({
         onPointerUp={handlePanPointerUp}
         onPointerCancel={handlePanPointerUp}
       >
-        <div className="pdf-workspace-stack pdf-workspace-continuous">
+        {!isDocumentReady && (
+          <div className="pdf-document-preparing" data-testid="pdf-document-preparing">
+            <div className="pdf-document-preparing-card">
+              <span className="pdf-loading-dots" aria-hidden>
+                <span />
+                <span />
+                <span />
+              </span>
+              <span>Loading document</span>
+            </div>
+          </div>
+        )}
+        <div
+          className={`pdf-workspace-stack pdf-workspace-continuous ${
+            isDocumentReady ? "is-ready" : "is-hidden-until-frame"
+          }`}
+        >
+          {!isPdfLayoutReady && (
+            <div className="pdf-layout-reserve" data-testid="pdf-layout-reserve" />
+          )}
           {pageNumbers.map((n) => {
             const size = pageSizes[n];
             const isActive = n === activePageNumber;
@@ -930,6 +980,14 @@ export function PdfWorkspace({
                   fileUrl={fileUrl}
                   pageNumber={n}
                   zoom={zoom}
+                  initialNaturalSize={hasCurrentMetadata ? naturalPageSize : null}
+                  onFirstFrame={(pageNumber) => {
+                    if (pageNumber === 1) {
+                      setFirstFrameReady(true);
+                      setFirstFrameFileUrl(fileUrl);
+                    }
+                  }}
+                  suppressFirstFramePlaceholder
                   onPageRendered={(info) => {
                     // Phase 2I defensive: never accept pageCount <= 0
                     // from a child render. A bug in earlier code emitted
@@ -960,6 +1018,12 @@ export function PdfWorkspace({
                       const natural = info.pageWidth / zoom;
                       if (Number.isFinite(natural) && natural > 0) {
                         naturalPageWidthRef.current = natural;
+                        setNaturalPageSize((current) =>
+                          current ?? {
+                            width: natural,
+                            height: info.pageHeight / zoom,
+                          },
+                        );
                         // Force a re-evaluation of fitZoom by nudging
                         // pageSizes (already set above — useMemo will
                         // pick up the new ref value).
@@ -968,6 +1032,13 @@ export function PdfWorkspace({
                     }
                   }}
                 />
+                {n === activePageNumber && (
+                  <AiScanOverlay
+                    progress={aiProgress}
+                    currentFilename={fileId}
+                    variant="document"
+                  />
+                )}
                 {size && (
                   <PdfOverlay
                     pageWidth={size.width}

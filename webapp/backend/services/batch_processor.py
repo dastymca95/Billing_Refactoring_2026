@@ -12,6 +12,7 @@ import json
 import logging
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -22,7 +23,11 @@ from ..settings import (
     PROJECT_ROOT, RESMAN_TEMPLATE, VENDORS_DIR, batch_dir,
 )
 from . import batch_store
+from .template_rules import get_template_rules
 from .vendor_detection import detect_vendor_for_file
+
+
+_LOG = logging.getLogger(__name__)
 
 
 # Phase 1H — declared timeline stages. The batch processor declares
@@ -38,7 +43,7 @@ _DEFAULT_STAGES: list[tuple[str, str]] = [
     ("address_match", "Matching service address"),
     ("unit_match", "Matching Unit Info Clean"),
     ("gl_evidence", "Using General Ledger evidence"),
-    ("ai_fallback", "AI fallback (if enabled)"),
+    ("ai_fallback", "AI invoice assist (if enabled)"),
     ("reconcile", "Reconciling bill totals"),
     ("split_pdf", "Splitting support PDFs"),
     ("dropbox", "Uploading to Dropbox"),
@@ -161,6 +166,16 @@ def _import_pennyrile_processor():
     return importlib.import_module("process_pennyrile_electric")
 
 
+def _import_wave2_utility_processor():
+    """Import the shared Phase U2 utility processor module."""
+    return importlib.import_module("webapp.backend.services.utility_wave2_processors")
+
+
+def _import_wave3_utility_processor():
+    """Import the shared Phase U3 utility processor module."""
+    return importlib.import_module("webapp.backend.services.utility_wave3_processors")
+
+
 # vendor_key → (loader, entrypoint_name)
 _PROCESSOR_LOADERS: dict[str, tuple[Any, str]] = {
     "richmond_utilities": (_import_richmond_processor,
@@ -197,6 +212,78 @@ _PROCESSOR_LOADERS: dict[str, tuple[Any, str]] = {
         _import_pennyrile_processor,
         "process_pennyrile_electric_batch",
     ),
+    "alabama_power": (
+        _import_wave2_utility_processor,
+        "process_alabama_power_batch",
+    ),
+    "epb_fiber_optics": (
+        _import_wave2_utility_processor,
+        "process_epb_fiber_optics_batch",
+    ),
+    "the_city_of_henderson": (
+        _import_wave2_utility_processor,
+        "process_the_city_of_henderson_batch",
+    ),
+    "cde_lightband": (
+        _import_wave2_utility_processor,
+        "process_cde_lightband_batch",
+    ),
+    "nolin_recc_smarthub": (
+        _import_wave2_utility_processor,
+        "process_nolin_recc_smarthub_batch",
+    ),
+    "clarksville_gas_and_water": (
+        _import_wave3_utility_processor,
+        "process_clarksville_gas_and_water_batch",
+    ),
+    "knoxville_utilities_board": (
+        _import_wave3_utility_processor,
+        "process_knoxville_utilities_board_batch",
+    ),
+    "kentucky_utilities": (
+        _import_wave3_utility_processor,
+        "process_kentucky_utilities_batch",
+    ),
+    "tennessee_american_water": (
+        _import_wave3_utility_processor,
+        "process_tennessee_american_water_batch",
+    ),
+    "union_city_energy_authority": (
+        _import_wave3_utility_processor,
+        "process_union_city_energy_authority_batch",
+    ),
+    "weakley_county_municipal_electric_system": (
+        _import_wave3_utility_processor,
+        "process_weakley_county_municipal_electric_system_batch",
+    ),
+    "birmingham_water_works": (
+        _import_wave3_utility_processor,
+        "process_birmingham_water_works_batch",
+    ),
+    "city_of_mcminnville_water_sewer_dept": (
+        _import_wave3_utility_processor,
+        "process_city_of_mcminnville_water_sewer_dept_batch",
+    ),
+    "city_of_chattanooga_wastewater_department": (
+        _import_wave3_utility_processor,
+        "process_city_of_chattanooga_wastewater_department_batch",
+    ),
+    "city_of_martin": (
+        _import_wave3_utility_processor,
+        "process_city_of_martin_batch",
+    ),
+    "city_of_union_city": (
+        _import_wave3_utility_processor,
+        "process_city_of_union_city_batch",
+    ),
+    "guardian_water_power": (
+        _import_wave3_utility_processor,
+        "process_guardian_water_power_batch",
+    ),
+    "hopkinsville_electric_system": (
+        _import_wave3_utility_processor,
+        "process_hopkinsville_electric_system_batch",
+    ),
 }
 
 
@@ -208,6 +295,7 @@ def process_batch(
     *,
     dry_run: bool = False,
     rules_override_paths: dict[str, "Path"] | None = None,
+    only_filename: str | None = None,
 ) -> dict[str, Any]:
     """Run the appropriate vendor processor over every file in the batch.
 
@@ -243,10 +331,28 @@ def process_batch(
     file is written even on dry-run calls; nothing else on disk changes.)
     """
     rules_override_paths = rules_override_paths or {}
+    # Phase PERF-1 — optional perf timer. Safe import; no-op when the
+    # module is missing or PERF_TIMER_DISABLED=1.
+    try:
+        from . import perf_timer as _perf  # type: ignore
+    except Exception:  # pragma: no cover
+        _perf = None  # type: ignore
+    _t0_batch = time.perf_counter()
     bdir = batch_store.get_batch_dir(batch_id)
     in_dir = batch_store.get_input_dir(batch_id)
     processed_dir = batch_store.get_processed_dir(batch_id)
     files = batch_store.list_files_in_batch(batch_id)
+    # Phase 2M — single-file processing. When ``only_filename`` is set,
+    # narrow the file list to just that one file before vendor grouping
+    # so the rest of the pipeline runs verbatim. Raises if the requested
+    # filename isn't part of the batch (operator typo / stale UI).
+    if only_filename:
+        narrowed = [f for f in files if f.name == only_filename]
+        if not narrowed:
+            raise FileNotFoundError(
+                f"File '{only_filename}' is not in batch '{batch_id}'.",
+            )
+        files = narrowed
 
     # Phase 1H: pull batch-level mode + AI policy + region hints from disk.
     batch_meta = _read_batch_metadata(batch_id)
@@ -301,10 +407,23 @@ def process_batch(
     # Group files by detected vendor.
     grouped: dict[str, list[Path]] = {}
     detection: dict[str, dict] = {}
-    for f in files:
-        det = detect_vendor_for_file(f)
-        detection[f.name] = det
-        grouped.setdefault(det["vendor_key"], []).append(f)
+    # Phase PERF-1 — vendor detection is the first per-file hot spot;
+    # measure it so the audit can spot regressions on large batches.
+    _detect_cm = (
+        _perf.perf_step("vendor.detect_all", batch_id=batch_id,
+                        meta={"n_files": len(files)})
+        if _perf is not None else None
+    )
+    if _detect_cm is not None:
+        _detect_cm.__enter__()
+    try:
+        for f in files:
+            det = detect_vendor_for_file(f)
+            detection[f.name] = det
+            grouped.setdefault(det["vendor_key"], []).append(f)
+    finally:
+        if _detect_cm is not None:
+            _detect_cm.__exit__(None, None, None)
 
     if tracker is not None:
         tracker.complete_stage(
@@ -326,6 +445,59 @@ def process_batch(
         if should_cancel():
             break
         if vendor_key not in _PROCESSOR_LOADERS:
+            try:
+                from . import ai_invoice_processor
+                if ai_invoice_processor.should_route_to_ai(
+                    vendor_key,
+                    detection.get(vfiles[0].name) if vfiles else None,
+                ):
+                    ai_payload = ai_invoice_processor.process_ai_vendor_files(
+                        batch_id=batch_id,
+                        vendor_key=vendor_key,
+                        files=vfiles,
+                        detection=detection,
+                        tracker=tracker,
+                        should_cancel=should_cancel,
+                        dry_run=dry_run,
+                    )
+                    ai_key = ai_payload.get("vendor_key") or ai_invoice_processor.AI_VENDOR_KEY
+                    existing = by_vendor.get(ai_key)
+                    if existing:
+                        existing.setdefault("invoices", []).extend(
+                            ai_payload.get("invoices") or []
+                        )
+                        existing.setdefault("manual_review_rows", []).extend(
+                            ai_payload.get("manual_review_rows") or []
+                        )
+                        existing.setdefault("unsupported_files", []).extend(
+                            ai_payload.get("unsupported_files") or []
+                        )
+                        old_summary = dict(existing.get("summary") or {})
+                        new_summary = dict(ai_payload.get("summary") or {})
+                        for key in (
+                            "files_total",
+                            "files_processed",
+                            "files_unsupported",
+                            "invoices_produced",
+                            "rows_total",
+                            "line_items",
+                            "manual_review_total",
+                            "invoices_flagged_for_review",
+                        ):
+                            old_summary[key] = int(old_summary.get(key) or 0) + int(
+                                new_summary.get(key) or 0
+                            )
+                        old_summary["processing_mode"] = "ai_assisted"
+                        existing["summary"] = old_summary
+                    else:
+                        by_vendor[ai_key] = ai_payload
+                    unsupported.extend(ai_payload.get("unsupported_files") or [])
+                    overall_invoices.extend(ai_payload.get("invoices") or [])
+                    overall_review.extend(ai_payload.get("manual_review_rows") or [])
+                    continue
+            except Exception:
+                _LOG.exception("AI invoice routing failed for %s", vendor_key)
+
             for f in vfiles:
                 unsupported.append({
                     "filename": f.name,
@@ -341,19 +513,30 @@ def process_batch(
         vendor_in.mkdir(parents=True, exist_ok=True)
         vendor_out.mkdir(parents=True, exist_ok=True)
         # Stage files into the per-vendor input folder so the processor sees
-        # only its files. We HARDLINK / copy — never move — so the original
-        # batch input folder still has every uploaded file.
+        # only the files for THIS run. The staging folder is persistent
+        # under webapp_data; if we leave older staged PDFs in place, a
+        # single-file run will accidentally process the whole previous
+        # vendor batch. We remove only staged files inside this sandbox,
+        # never the operator's original uploads.
+        current_names = {f.name for f in vfiles}
+        for staged in vendor_in.iterdir():
+            if staged.is_file() and staged.name not in current_names:
+                try:
+                    staged.unlink()
+                except OSError:
+                    pass
         for f in vfiles:
             target = vendor_in / f.name
-            if not target.exists():
-                try:
-                    shutil.copy2(f, target)
-                except Exception as e:
-                    unsupported.append({
-                        "filename": f.name,
-                        "vendor_key": vendor_key,
-                        "reason": f"failed_to_stage_input:{type(e).__name__}",
-                    })
+            try:
+                if target.exists():
+                    target.unlink()
+                shutil.copy2(f, target)
+            except Exception as e:
+                unsupported.append({
+                    "filename": f.name,
+                    "vendor_key": vendor_key,
+                    "reason": f"failed_to_stage_input:{type(e).__name__}",
+                })
 
         # Call the processor via the registry tuple (loader, entrypoint_name).
         loader, entrypoint_name = _PROCESSOR_LOADERS[vendor_key]
@@ -436,7 +619,19 @@ def process_batch(
             for k in ("read_pdf", "ocr", "yaml_rules", "address_match",
                       "unit_match", "gl_evidence"):
                 tracker.start_stage(k, detail=f"{vendor_key}: {len(vfiles)} file(s)")
-        result = process_func(**kwargs)
+        # Phase PERF-1 — measure each vendor's total wall-clock.
+        _proc_cm = (
+            _perf.perf_step(f"processor.{vendor_key}", batch_id=batch_id,
+                            meta={"n_files": len(vfiles)})
+            if _perf is not None else None
+        )
+        if _proc_cm is not None:
+            _proc_cm.__enter__()
+        try:
+            result = process_func(**kwargs)
+        finally:
+            if _proc_cm is not None:
+                _proc_cm.__exit__(None, None, None)
         if tracker is not None:
             for k in ("read_pdf", "ocr", "yaml_rules", "address_match",
                       "unit_match", "gl_evidence"):
@@ -466,9 +661,17 @@ def process_batch(
         overall_review.extend(result.manual_review_rows)
 
     # Top-level summary
+    ai_supported_files = sum(
+        int((payload.get("summary") or {}).get("files_processed") or 0)
+        for payload in by_vendor.values()
+        if (payload.get("summary") or {}).get("processing_mode") == "ai_assisted"
+    )
     summary = {
         "files_total": len(files),
-        "files_supported": sum(len(v) for k, v in grouped.items() if k in _PROCESSOR_LOADERS),
+        "files_supported": (
+            sum(len(v) for k, v in grouped.items() if k in _PROCESSOR_LOADERS)
+            + ai_supported_files
+        ),
         "files_unsupported": len(unsupported),
         "invoices_total": len(overall_invoices),
         "manual_review_total": len(overall_review),
@@ -479,7 +682,10 @@ def process_batch(
             # Phase 1N — finalise as cancelled rather than completed.
             tracker.cancelled(
                 files_total=len(files),
-                files_done=sum(len(v) for k, v in grouped.items() if k in by_vendor),
+                files_done=sum(
+                    int((payload.get("summary") or {}).get("files_processed") or 0)
+                    for payload in by_vendor.values()
+                ),
                 invoices_created=len(overall_invoices),
                 rows_created=sum(
                     len(inv.get("rows", [])) for inv in overall_invoices
@@ -522,6 +728,18 @@ def process_batch(
             cancel_registry.unregister(batch_id)
         except Exception:
             pass
+
+    # Phase PERF-1 — record the batch total and flush timings to disk.
+    if _perf is not None:
+        try:
+            _total_ms = (time.perf_counter() - _t0_batch) * 1000.0
+            _perf.record(batch_id, "batch.total", _total_ms,
+                         meta={"files": len(files),
+                                "vendors": len(grouped),
+                                "cancelled": bool(should_cancel())})
+            _perf.flush_to_disk(batch_id, bdir / "audit")
+        except Exception:  # pragma: no cover
+            _LOG.exception("perf_timer flush failed for %s", batch_id)
 
     return {
         "batch_id": batch_id,
@@ -586,6 +804,42 @@ def _write_edited_rows_to_template(template_path: Path, dest: Path,
     return written
 
 
+def _validate_resman_export_required_rows(rows: list[dict[str, Any]]) -> None:
+    """Block exports that would create unusable ResMan rows.
+
+    Required columns are operator-configurable from the Formats workspace.
+    The preview/review UI can show missing values, but the actual exported
+    template must not be emitted until configured required fields are resolved.
+    """
+    required_columns = [
+        col for col in get_template_rules().get("required_columns", [])
+        if str(col or "").strip()
+    ]
+    missing: list[str] = []
+    for idx, row in enumerate(rows, start=1):
+        amount = row.get("Amount")
+        try:
+            payable = abs(float(str(amount).replace(",", "") or 0)) > 0.009
+        except (TypeError, ValueError):
+            payable = bool(str(amount or "").strip())
+        if not payable:
+            continue
+        row_missing = [
+            col for col in required_columns
+            if not str(row.get(col) or "").strip()
+        ]
+        if row_missing:
+            invoice = str(row.get("Invoice Number") or "").strip() or f"row {idx}"
+            missing.append(f"{invoice} line {row.get('Line Item Number') or idx}: {', '.join(row_missing)}")
+    if missing:
+        shown = "; ".join(missing[:6])
+        more = "" if len(missing) <= 6 else f"; +{len(missing) - 6} more"
+        raise ValueError(
+            "Required template fields are missing before export. Resolve: "
+            f"{shown}{more}"
+        )
+
+
 def _coerce_cell_value(value: Any) -> Any:
     """Light coercion so the resulting xlsx renders nicely:
     - strings that look like numbers stay as strings (we don't want to
@@ -612,6 +866,7 @@ def export_batch(batch_id: str, edited_rows: Optional[list[dict[str, Any]]] = No
 
     # ---- Path A: edited export (frontend sent the table state) ----
     if edited_rows is not None:
+        _validate_resman_export_required_rows(edited_rows)
         if not RESMAN_TEMPLATE.is_file():
             return {
                 "batch_id": batch_id, "exported": [],

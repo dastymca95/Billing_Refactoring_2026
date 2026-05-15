@@ -2,17 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api, getFriendlyErrorMessage, isApiError } from "./api";
 import { AiFallbackStatusBadge } from "./components/AiFallbackStatusBadge";
-import { BatchActionsBar } from "./components/BatchActionsBar";
-import { BatchDocumentModeSelector } from "./components/BatchDocumentModeSelector";
 import { BatchExplorer } from "./components/BatchExplorer";
 import {
   ConfirmDialog,
   type ConfirmDialogOptions,
 } from "./components/ConfirmDialog";
+import { DesktopMenu } from "./components/DesktopMenu";
 import { DocumentPreviewPanel } from "./components/DocumentPreviewPanel";
 // DropZone + FileList: superseded by BatchExplorer in Phase 1X.
 import { NavRail, type AppModule } from "./components/NavRail";
-import { VendorRulesStudio } from "./components/VendorRulesStudio";
+import { SettingsDialog } from "./components/SettingsDialog";
 import { WindowsMenu } from "./components/WindowsMenu";
 import { IssuesDrawer } from "./components/IssuesDrawer";
 import { IssuesPill } from "./components/IssuesPill";
@@ -35,10 +34,12 @@ import type {
   ManualReviewItem,
   PreviewResponse,
   PreviewRow,
+  UploadFileProgress,
 } from "./types";
 
 // localStorage key used to remember the active batch across page refreshes.
 const ACTIVE_BATCH_LS_KEY = "billing_refactoring_active_batch_id";
+const NAV_COLLAPSED_LS_KEY = "billing_refactoring_nav_collapsed";
 const BATCH_NAME_MAX = 80;
 
 // How often the frontend polls /progress while processing. Phase 1O —
@@ -46,6 +47,7 @@ const BATCH_NAME_MAX = 80;
 // per-page progress update from the backend OCR loop. Fast enough to
 // feel live, slow enough that a long batch doesn't hammer the API.
 const PROGRESS_POLL_MS = 500;
+const UPLOAD_PARALLEL_LIMIT = 4;
 
 // Maximum total time we'll wait for a background processing run before
 // showing a "still working" message. The poll never auto-aborts.
@@ -114,17 +116,86 @@ function rowDocumentRef(row: PreviewRow | null | undefined): {
   return { filename, pageNumber };
 }
 
+function extensionFromUploadName(name: string): string {
+  const match = /\.([A-Za-z0-9]+)$/.exec(name || "");
+  return match ? match[1].toLowerCase() : "";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, Math.max(0, ms)));
+}
+
+function mergeFilesPreserveAppend(previous: FileEntry[], incoming: FileEntry[]): FileEntry[] {
+  if (previous.length === 0 || incoming.length === 0) return incoming;
+  const incomingByName = new Map(incoming.map((file) => [file.filename, file]));
+  const ordered: FileEntry[] = [];
+  const seen = new Set<string>();
+
+  for (const oldFile of previous) {
+    const nextFile = incomingByName.get(oldFile.filename);
+    if (!nextFile) continue;
+    ordered.push(nextFile);
+    seen.add(nextFile.filename);
+  }
+
+  for (const file of incoming) {
+    if (seen.has(file.filename)) continue;
+    ordered.push(file);
+  }
+
+  return ordered;
+}
+
 export default function App() {
-  // Phase 1Z — top-level module router (Batches vs Rules studio).
+  // Top-level workspace stays focused on batches. Rules, fallback behavior,
+  // and output text rules now live in Settings.
   const [activeModule, setActiveModule] = useState<AppModule>("batches");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [navCollapsed, setNavCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(NAV_COLLAPSED_LS_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
   const [batchId, setBatchId] = useState<string | null>(null);
   const [files, setFiles] = useState<FileEntry[]>([]);
+  const filesRef = useRef<FileEntry[]>([]);
+  const [uploadItems, setUploadItems] = useState<UploadFileProgress[]>([]);
+  const uploadItemsRef = useRef<UploadFileProgress[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [documentTarget, setDocumentTarget] =
     useState<DocumentNavTarget | null>(null);
   const [activeDocumentPage, setActiveDocumentPage] =
     useState<ActiveDocumentPage | null>(null);
   const navNonceRef = useRef(0);
+
+  useEffect(() => {
+    uploadItemsRef.current = uploadItems;
+  }, [uploadItems]);
+
+  useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(NAV_COLLAPSED_LS_KEY, navCollapsed ? "1" : "0");
+    } catch {
+      /* localStorage unavailable; keep session state only */
+    }
+  }, [navCollapsed]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === ",") {
+        event.preventDefault();
+        setSettingsOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
@@ -296,11 +367,9 @@ export default function App() {
   const [batchList, setBatchList] = useState<BatchListEntry[]>([]);
   const [showBatchPicker, setShowBatchPicker] = useState<boolean>(false);
 
-  // Phase 1H: batch creation dialog state.
-  const [showCreateBatchDialog, setShowCreateBatchDialog] = useState(false);
-  const [createBatchName, setCreateBatchName] = useState("");
-  const [createBatchMode, setCreateBatchMode] =
-    useState<DocumentMode>("auto_detect");
+  // Inline batch creation lives inside BatchExplorer; this token lets
+  // desktop-menu shortcuts open that row without showing a modal.
+  const [createBatchRequestToken, setCreateBatchRequestToken] = useState(0);
 
   // Phase 1P — app-native rename modal (replaces window.prompt).
   const [showRenameDialog, setShowRenameDialog] = useState(false);
@@ -333,7 +402,14 @@ export default function App() {
       const r = await api.listBatches();
       setBatchList(r.batches);
     } catch {
-      /* non-fatal */
+      window.setTimeout(async () => {
+        try {
+          const r = await api.listBatches();
+          setBatchList(r.batches);
+        } catch {
+          /* non-fatal */
+        }
+      }, 500);
     }
   }, []);
 
@@ -355,6 +431,29 @@ export default function App() {
     },
     [],
   );
+
+  const handleAiMappingApplied = useCallback(async () => {
+    if (!batchId) return;
+    try {
+      const [prev, rev] = await Promise.all([
+        api.preview(batchId),
+        api.manualReview(batchId),
+      ]);
+      setPreview(prev);
+      setReview(rev.items);
+      void refreshRevisions(batchId);
+      pushToast({
+        tone: "success",
+        message: "AI mapping applied.",
+        ttl: 2500,
+      });
+    } catch (e) {
+      pushToast({
+        tone: "error",
+        message: getFriendlyErrorMessage(e, "Refresh AI mapping"),
+      });
+    }
+  }, [batchId, pushToast, refreshRevisions]);
 
   // Phase 2D — poll the cross-batch processing queue while anything is
   // running or queued so the BatchExplorer chips stay live.
@@ -892,14 +991,16 @@ export default function App() {
   );
 
   const handleCreateNewBatch = useCallback(() => {
-    setCreateBatchName("");
-    setCreateBatchMode("auto_detect");
-    setShowCreateBatchDialog(true);
+    setCreateBatchRequestToken((n) => n + 1);
     setShowBatchPicker(false);
   }, []);
 
-  const handleSubmitCreateBatch = useCallback(async () => {
-    const name = createBatchName.trim();
+  const handleSubmitCreateBatch = useCallback(async (params: {
+    batchName?: string;
+    documentMode: DocumentMode;
+  }) => {
+    const name = (params.batchName || "").trim();
+    const documentMode = params.documentMode || "auto_detect";
     if (name.length > BATCH_NAME_MAX) {
       pushToast({
         tone: "error",
@@ -910,7 +1011,7 @@ export default function App() {
     }
     try {
       const r = await api.createBatch(name || undefined, {
-        documentMode: createBatchMode,
+        documentMode,
       });
       setBatchId(r.batch_id);
       setBatchName(r.batch_name);
@@ -925,15 +1026,15 @@ export default function App() {
       setError(null);
       pushToast({
         tone: "success",
-        message: `Created batch "${r.batch_name}" · mode=${createBatchMode}.`,
+        message: `Created batch "${r.batch_name}" · mode=${documentMode}.`,
       });
       try {
         localStorage.setItem(ACTIVE_BATCH_LS_KEY, r.batch_id);
       } catch {
         /* non-fatal */
       }
-      setShowCreateBatchDialog(false);
       void refreshBatchList();
+      return r.batch_id;
     } catch (e) {
       pushToast({
         tone: "error",
@@ -942,15 +1043,17 @@ export default function App() {
       });
       // eslint-disable-next-line no-console
       console.warn("create batch failed:", e);
+      throw e;
     }
-  }, [createBatchMode, createBatchName, refreshBatchList, setDocumentPageTarget]);
+  }, [refreshBatchList, setDocumentPageTarget, pushToast]);
 
   const refreshFiles = useCallback(
     async (bid: string) => {
       const res = await api.listFiles(bid);
-      setFiles(res.files);
+      const orderedFiles = mergeFilesPreserveAppend(filesRef.current, res.files);
+      setFiles(orderedFiles);
       if (res.files.length > 0 && !selected) {
-        const nextSelected = res.files[0].filename;
+        const nextSelected = orderedFiles[0].filename;
         setSelected(nextSelected);
         setDocumentPageTarget(bid, nextSelected, 1);
       }
@@ -958,11 +1061,106 @@ export default function App() {
     [selected, setDocumentPageTarget],
   );
 
+  const enqueueUploadItems = useCallback((targetBatchId: string, newFiles: File[]) => {
+    const stamp = Date.now().toString(36);
+    const items: UploadFileProgress[] = newFiles.map((file, index) => ({
+      id: `${targetBatchId}:${stamp}:${index}:${file.name}:${file.size}`,
+      batchId: targetBatchId,
+      filename: file.name || `upload-${index + 1}`,
+      size_bytes: file.size,
+      extension: extensionFromUploadName(file.name),
+      percent: 0,
+      status: "queued",
+    }));
+
+    setUploadItems((prev) => {
+      const incoming = new Set(items.map((item) => item.id));
+      return [
+        ...prev.filter((item) => !incoming.has(item.id)),
+        ...items,
+      ];
+    });
+    return items;
+  }, []);
+
+  const updateUploadItem = useCallback(
+    (id: string, patch: Partial<UploadFileProgress>) => {
+      setUploadItems((prev) =>
+        prev.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+      );
+    },
+    [],
+  );
+
+  const startUploadAnimation = useCallback(
+    (id: string, getTargetPercent: () => number) => {
+      let frame = 0;
+      const startedAt = performance.now();
+      const visualMinMs = 1350;
+      const tick = () => {
+        setUploadItems((prev) =>
+          prev.map((item) => {
+            if (item.id !== id || item.status !== "uploading") return item;
+            const rawTarget = Math.max(0, Math.min(100, getTargetPercent()));
+            const elapsed = performance.now() - startedAt;
+            const timedCeiling =
+              rawTarget >= 100
+                ? Math.min(100, (elapsed / visualMinMs) * 100)
+                : Math.min(92, (elapsed / visualMinMs) * 92);
+            const target = Math.min(rawTarget, timedCeiling);
+            const delta = target - item.percent;
+            if (delta <= 0.05) return item;
+            const next = item.percent + Math.max(delta * 0.22, 0.35);
+            return { ...item, percent: Math.min(target, next) };
+          }),
+        );
+        frame = window.requestAnimationFrame(tick);
+      };
+      frame = window.requestAnimationFrame(tick);
+      return () => window.cancelAnimationFrame(frame);
+    },
+    [],
+  );
+
+  const waitForUploadAnimation = useCallback(async (id: string, target = 98) => {
+    for (let i = 0; i < 140; i += 1) {
+      const current = uploadItemsRef.current.find((item) => item.id === id);
+      if (!current || current.percent >= target) return;
+      await sleep(16);
+    }
+  }, []);
+
+  const clearUploadItem = useCallback((id: string, delayMs = 0) => {
+    const remove = () =>
+      setUploadItems((prev) => prev.filter((item) => item.id !== id));
+    if (delayMs > 0) {
+      window.setTimeout(remove, delayMs);
+    } else {
+      remove();
+    }
+  }, []);
+
+  const failUploadQueue = useCallback(
+    (queue: UploadFileProgress[], message: string) => {
+      const ids = new Set(queue.map((item) => item.id));
+      setUploadItems((prev) =>
+        prev.map((item) =>
+          ids.has(item.id) && item.status !== "done"
+            ? { ...item, status: "failed", error: message, percent: item.percent || 0 }
+            : item,
+        ),
+      );
+    },
+    [],
+  );
+
   const handleFiles = useCallback(
     async (newFiles: File[]) => {
+      let queue: UploadFileProgress[] = [];
       try {
         setError(null);
         const bid = await ensureBatch();
+        queue = enqueueUploadItems(bid, newFiles);
         const total = newFiles.length;
         const showProgress = total > 1;
         const progressId = "upload-progress";
@@ -975,21 +1173,67 @@ export default function App() {
           });
         }
         let done = 0;
-        for (const f of newFiles) {
-          await api.uploadFile(bid, f);
-          done += 1;
-          // Refresh after every upload so the file appears in the
-          // explorer immediately rather than waiting for the whole
-          // batch to finish.
-          await refreshFiles(bid);
-          if (showProgress) {
-            pushToast({
-              id: progressId,
-              tone: "info",
-              message: `Uploading ${done} of ${total}…`,
-              ttl: 0,
+        let cursor = 0;
+        let firstUploadError: unknown = null;
+        const uploadOne = async (index: number) => {
+          const f = newFiles[index];
+          const upload = queue[index];
+          updateUploadItem(upload.id, { status: "uploading", percent: 0 });
+          const startedAt = performance.now();
+          let targetPercent = 8;
+          const stopAnimation = startUploadAnimation(upload.id, () => targetPercent);
+          try {
+            await api.uploadFile(bid, f, (progress) => {
+              targetPercent = Math.max(
+                targetPercent,
+                Math.min(92, progress.percent * 0.92),
+              );
             });
+            targetPercent = 100;
+            const elapsed = performance.now() - startedAt;
+            if (elapsed < 800) {
+              await sleep(800 - elapsed);
+            }
+            await waitForUploadAnimation(upload.id, 96);
+            // Refresh before hiding the temporary upload row so the
+            // real file row replaces it without a visual gap.
+            await refreshFiles(bid);
+            updateUploadItem(upload.id, { status: "done", percent: 100 });
+            done += 1;
+            clearUploadItem(upload.id, 900);
+            if (showProgress) {
+              pushToast({
+                id: progressId,
+                tone: "info",
+                message: `Uploading ${done} of ${total}…`,
+                ttl: 0,
+              });
+            }
+          } catch (error) {
+            const message = getFriendlyErrorMessage(error, "Upload files");
+            updateUploadItem(upload.id, {
+              status: "failed",
+              error: message,
+              percent: upload.percent || 0,
+            });
+            if (!firstUploadError) firstUploadError = error;
+          } finally {
+            stopAnimation();
           }
+        };
+        const workerCount = Math.min(UPLOAD_PARALLEL_LIMIT, newFiles.length);
+        await Promise.all(
+          Array.from({ length: workerCount }, async () => {
+            while (cursor < newFiles.length) {
+              const index = cursor;
+              cursor += 1;
+              await uploadOne(index);
+            }
+          }),
+        );
+        await refreshFiles(bid);
+        if (firstUploadError) {
+          throw firstUploadError;
         }
         if (showProgress) {
           pushToast({
@@ -1005,22 +1249,38 @@ export default function App() {
         setSelectedRowIndex(null);
         setHasExport(false);
       } catch (e) {
+        failUploadQueue(queue, getFriendlyErrorMessage(e, "Upload files"));
         dismissToast("upload-progress");
         setError(getFriendlyErrorMessage(e, "Upload files"));
         // eslint-disable-next-line no-console
         console.warn("upload failed:", e);
       }
     },
-    [ensureBatch, refreshFiles, pushToast, dismissToast],
+    [
+      clearUploadItem,
+      enqueueUploadItems,
+      ensureBatch,
+      failUploadQueue,
+      refreshFiles,
+      pushToast,
+      dismissToast,
+      startUploadAnimation,
+      updateUploadItem,
+      waitForUploadAnimation,
+    ],
   );
 
   const handleFilesForBatch = useCallback(
     async (targetBatchId: string, newFiles: File[]) => {
       if (newFiles.length === 0) return;
+      const queue = enqueueUploadItems(targetBatchId, newFiles);
       try {
         setError(null);
         const switched = await handleSwitchBatch(targetBatchId);
-        if (switched === false) return;
+        if (switched === false) {
+          queue.forEach((item) => clearUploadItem(item.id));
+          return;
+        }
         const total = newFiles.length;
         const showProgress = total > 1;
         const progressId = "upload-progress";
@@ -1036,26 +1296,75 @@ export default function App() {
         }
         let done = 0;
         let nextSelected: string | null = null;
-        for (const f of newFiles) {
-          await api.uploadFile(targetBatchId, f);
-          done += 1;
-          // Refresh after each upload so files appear progressively
-          // in the explorer instead of all-at-once at the end.
-          const res = await api.listFiles(targetBatchId);
-          setFiles(res.files);
-          if (nextSelected === null && res.files[0]) {
-            nextSelected = res.files[0].filename;
-            setSelected(nextSelected);
-            setDocumentPageTarget(targetBatchId, nextSelected, 1);
-          }
-          if (showProgress) {
-            pushToast({
-              id: progressId,
-              tone: "info",
-              message: `Uploading ${done} of ${total} to "${friendly}"…`,
-              ttl: 0,
+        let cursor = 0;
+        let firstUploadError: unknown = null;
+        const uploadOne = async (index: number) => {
+          const f = newFiles[index];
+          const upload = queue[index];
+          updateUploadItem(upload.id, { status: "uploading", percent: 0 });
+          const startedAt = performance.now();
+          let targetPercent = 8;
+          const stopAnimation = startUploadAnimation(upload.id, () => targetPercent);
+          try {
+            await api.uploadFile(targetBatchId, f, (progress) => {
+              targetPercent = Math.max(
+                targetPercent,
+                Math.min(92, progress.percent * 0.92),
+              );
             });
+            targetPercent = 100;
+            const elapsed = performance.now() - startedAt;
+            if (elapsed < 800) {
+              await sleep(800 - elapsed);
+            }
+            await waitForUploadAnimation(upload.id, 96);
+            // Refresh before hiding the temporary upload row so the
+            // real file row replaces it without a visual gap.
+            const res = await api.listFiles(targetBatchId);
+            const orderedFiles = mergeFilesPreserveAppend(filesRef.current, res.files);
+            setFiles(orderedFiles);
+            if (nextSelected === null && orderedFiles[0]) {
+              nextSelected = orderedFiles[0].filename;
+              setSelected(nextSelected);
+              setDocumentPageTarget(targetBatchId, nextSelected, 1);
+            }
+            updateUploadItem(upload.id, { status: "done", percent: 100 });
+            done += 1;
+            clearUploadItem(upload.id, 900);
+            if (showProgress) {
+              pushToast({
+                id: progressId,
+                tone: "info",
+                message: `Uploading ${done} of ${total} to "${friendly}"…`,
+                ttl: 0,
+              });
+            }
+          } catch (error) {
+            const message = getFriendlyErrorMessage(error, "Upload files");
+            updateUploadItem(upload.id, {
+              status: "failed",
+              error: message,
+              percent: upload.percent || 0,
+            });
+            if (!firstUploadError) firstUploadError = error;
+          } finally {
+            stopAnimation();
           }
+        };
+        const workerCount = Math.min(UPLOAD_PARALLEL_LIMIT, newFiles.length);
+        await Promise.all(
+          Array.from({ length: workerCount }, async () => {
+            while (cursor < newFiles.length) {
+              const index = cursor;
+              cursor += 1;
+              await uploadOne(index);
+            }
+          }),
+        );
+        const finalFiles = await api.listFiles(targetBatchId);
+        setFiles(mergeFilesPreserveAppend(filesRef.current, finalFiles.files));
+        if (firstUploadError) {
+          throw firstUploadError;
         }
         setPreview(null);
         setReview([]);
@@ -1071,6 +1380,7 @@ export default function App() {
           ttl: 4000,
         });
       } catch (e) {
+        failUploadQueue(queue, getFriendlyErrorMessage(e, "Upload files"));
         dismissToast("upload-progress");
         setError(getFriendlyErrorMessage(e, "Upload files"));
         pushToast({
@@ -1082,7 +1392,20 @@ export default function App() {
         console.warn("targeted upload failed:", e);
       }
     },
-    [batchList, handleSwitchBatch, pushToast, dismissToast, refreshBatchList, setDocumentPageTarget],
+    [
+      batchList,
+      clearUploadItem,
+      enqueueUploadItems,
+      failUploadQueue,
+      handleSwitchBatch,
+      pushToast,
+      dismissToast,
+      refreshBatchList,
+      setDocumentPageTarget,
+      startUploadAnimation,
+      updateUploadItem,
+      waitForUploadAnimation,
+    ],
   );
 
   // ---- Phase 1F: progress polling ----
@@ -1260,6 +1583,152 @@ export default function App() {
     [batchId, handleSwitchBatch, isProcessing, runProcessBatch],
   );
 
+  // Phase 2M — single-file processing. Runs the active vendor processor
+  // synchronously over a single bill, then refreshes the preview so
+  // the new row is merged into the active workspace. The full-batch
+  // queue is untouched, so a long batch run on another id keeps going.
+  const handleProcessFile = useCallback(
+    async (
+      targetBatchId: string,
+      filename: string,
+      mode: "replace" | "merge" = "replace",
+    ) => {
+      const isMerge = mode === "merge";
+      if (isProcessing) {
+        pushToast({
+          id: `single-process-${filename}`,
+          tone: "info",
+          message: "Another process is already running. Wait for it to finish.",
+          ttl: 4000,
+        });
+        return;
+      }
+
+      if (editedCellCount > 0) {
+        const ok = await requestConfirm({
+          title: isMerge
+            ? "Discard edits and add this file?"
+            : "Discard edits and create a file template?",
+          message: `${isMerge ? "Adding this file" : "Creating a new file template"} will refresh the preview and discard ${editedCellCount} unsaved edit${editedCellCount === 1 ? "" : "s"}.`,
+          confirmLabel: isMerge ? "Add file" : "Create template",
+          tone: "warning",
+        });
+        if (!ok) return;
+      }
+
+      const isActiveTarget = targetBatchId === batchId;
+
+      if (!isActiveTarget) {
+        const switched = await handleSwitchBatch(targetBatchId);
+        if (switched === false) {
+          pushToast({
+            id: `single-process-${filename}`,
+            tone: "warning",
+            message: "Switch cancelled. File was not processed.",
+            ttl: 4000,
+          });
+          return;
+        }
+      }
+
+      setIsProcessing(true);
+      setIsCancelling(false);
+      setError(null);
+      setProgress({
+        batch_id: targetBatchId,
+        status: "processing",
+        percent: 0,
+        files_total: 1,
+        files_done: 0,
+        current_file: filename,
+        current_step: isMerge
+          ? `Adding ${filename} to template...`
+          : `Creating template from ${filename}...`,
+      });
+      startPolling(targetBatchId);
+      pushToast({
+        id: `single-process-${filename}`,
+        tone: "info",
+        message: isMerge
+          ? `Adding ${filename} to current template...`
+          : `Creating template from ${filename}...`,
+        ttl: 0,
+      });
+
+      try {
+        await api.process(targetBatchId, {
+          sync: true,
+          file: filename,
+          fileMode: mode,
+        });
+        stopPolling();
+        setProgress((prev) =>
+          prev?.batch_id === targetBatchId
+            ? {
+                ...prev,
+                status: "completed",
+                percent: 100,
+                files_done: 1,
+                current_step: "Done",
+              }
+            : prev,
+        );
+        setIsProcessing(false);
+        const prev = await api.preview(targetBatchId);
+        const rev = await api.manualReview(targetBatchId);
+        setPreview(prev);
+        setReview(rev.items);
+        setReviewedKeys(new Set());
+        setEdits({});
+        setSelectedRowIndex(null);
+        setHasExport(false);
+        void refreshBatchList();
+        void refreshRevisions(targetBatchId);
+        const invoices = prev.summary?.invoices_total ?? prev.invoice_count;
+        pushToast({
+          id: `single-process-${filename}`,
+          tone: "success",
+          message: isMerge
+            ? `Added "${filename}" to current template. Template now has ${invoices} invoice${invoices === 1 ? "" : "s"}.`
+            : `Created a new template from "${filename}" with ${invoices} invoice${invoices === 1 ? "" : "s"}.`,
+          ttl: 4000,
+        });
+      } catch (e) {
+        const message = getFriendlyErrorMessage(e, "Process file");
+        setError(message);
+        setProgress((prev) =>
+          prev
+            ? { ...prev, status: "failed", error_message: message, percent: 100 }
+            : null,
+        );
+        // eslint-disable-next-line no-console
+        console.warn("file process failed:", e);
+        pushToast({
+          id: `single-process-${filename}`,
+          tone: "error",
+          message,
+          ttl: 5000,
+        });
+      } finally {
+        setIsProcessing(false);
+        setIsCancelling(false);
+        stopPolling();
+      }
+    },
+    [
+      batchId,
+      editedCellCount,
+      handleSwitchBatch,
+      isProcessing,
+      pushToast,
+      refreshBatchList,
+      refreshRevisions,
+      requestConfirm,
+      startPolling,
+      stopPolling,
+    ],
+  );
+
   // Phase 1N — cancel processing.
   const handleCancel = useCallback(async () => {
     if (!batchId) return;
@@ -1334,8 +1803,38 @@ export default function App() {
         }
         return next;
       });
+      broadcastChannelRef.current?.postMessage({
+        type: "cell-edit",
+        rowIndex,
+        columnKey,
+        value: newValue,
+        source: "main",
+      });
     },
     [preview],
+  );
+
+  const handleAddPreviewRow = useCallback(
+    (row: PreviewRow, _afterRowIndex?: number, source: "main" | "popout" = "main") => {
+      setPreview((prev) => {
+        if (!prev) return prev;
+        const rows = [...prev.rows];
+        rows.push(row);
+        return {
+          ...prev,
+          rows,
+          row_count: rows.length,
+        };
+      });
+      if (source === "main") {
+        broadcastChannelRef.current?.postMessage({
+          type: "row-add",
+          row,
+          source: "main",
+        });
+      }
+    },
+    [],
   );
 
   const handleResetEdits = useCallback(() => {
@@ -1523,8 +2022,19 @@ export default function App() {
     ch.onmessage = (ev) => {
       const data = ev.data as
         | { type: "row-select"; rowIndex: number | null; source: string }
+        | { type: "cell-edit"; rowIndex: number; columnKey: string; value: unknown; source: string }
+        | { type: "row-add"; row: PreviewRow; source: string }
         | undefined;
-      if (!data || data.type !== "row-select" || data.source === "main") return;
+      if (!data || data.source === "main") return;
+      if (data.type === "cell-edit") {
+        handleCellEditRef.current?.(data.rowIndex, data.columnKey, data.value);
+        return;
+      }
+      if (data.type === "row-add") {
+        handleAddPreviewRow(data.row, undefined, "popout");
+        return;
+      }
+      if (data.type !== "row-select") return;
       lastBroadcastRowRef.current = data.rowIndex; // suppress echo
       handleSelectRowRef.current?.(data.rowIndex);
     };
@@ -2053,8 +2563,16 @@ export default function App() {
     <div className="app">
       <div className="topbar">
         <div className="topbar-brand">
-          <span className="topbar-title">Billing Refactoring</span>
-          <span className="topbar-subtitle">Web Console</span>
+          <button
+            type="button"
+            className={`shell-sidebar-toggle ${navCollapsed ? "is-collapsed" : ""}`}
+            onClick={() => setNavCollapsed((v) => !v)}
+            title={navCollapsed ? "Open sidebar" : "Hide sidebar"}
+            aria-label={navCollapsed ? "Open sidebar" : "Hide sidebar"}
+            data-testid="nav-rail-toggle"
+          >
+            <SidebarToggleIcon />
+          </button>
         </div>
         <WorkflowSteps
           fileCount={files.length}
@@ -2063,15 +2581,65 @@ export default function App() {
           manualReviewCount={review.length}
           hasExport={hasExport}
         />
-        <div className="topbar-command-area" aria-label="Workspace commands">
-          <button
-            type="button"
-            className={`topbar-menu-token ${activeModule === "batches" ? "is-active" : ""}`}
-            onClick={() => setActiveModule("batches")}
-            title="Open the batch workspace"
-          >
-            Workspace
-          </button>
+        <div className="topbar-command-area desktop-menu-bar" aria-label="Application menus">
+          <DesktopMenu
+            label="File"
+            items={[
+              { label: "New Batch", shortcut: "Ctrl+N", onSelect: handleCreateNewBatch },
+              {
+                label: isProcessing ? "Processing..." : "Process Batch",
+                disabled: !batchId || files.length === 0 || isProcessing,
+                onSelect: () => void handleProcess(),
+              },
+              {
+                label: isExporting ? "Exporting..." : "Export Template",
+                disabled: !batchId || !preview || isExporting,
+                onSelect: () => void handleExport(),
+              },
+              { kind: "separator" },
+              {
+                label: "Download Last Export",
+                disabled: !batchId || !hasExport,
+                onSelect: handleDownload,
+              },
+            ]}
+          />
+          <DesktopMenu
+            label="Edit"
+            items={[
+              {
+                label: "Rename Batch",
+                disabled: !batchId,
+                onSelect: handleRenameBatch,
+              },
+              {
+                label: "Reset Template Edits",
+                disabled: editedCellCount === 0,
+                onSelect: handleResetEdits,
+              },
+              { kind: "separator" },
+              {
+                label: "Settings",
+                shortcut: "Ctrl+,",
+                onSelect: () => setSettingsOpen(true),
+              },
+            ]}
+          />
+          <DesktopMenu
+            label="View"
+            items={[
+              {
+                label: "Batch Workspace",
+                checked: activeModule === "batches",
+                onSelect: () => setActiveModule("batches"),
+              },
+              { kind: "separator" },
+              { label: "Settings", shortcut: "Ctrl+,", onSelect: () => setSettingsOpen(true) },
+              { kind: "separator" },
+              { label: "Restore Panels", onSelect: restoreAllPanels },
+              { label: "Minimize All Panels", onSelect: minimizeAllPanels },
+            ]}
+          />
           {activeModule === "batches" && (
             <WindowsMenu
               closedPanels={closedPanels}
@@ -2082,14 +2650,24 @@ export default function App() {
               onMinimizeAll={minimizeAllPanels}
             />
           )}
-          <button
-            type="button"
-            className="topbar-menu-token"
-            onClick={restoreAllPanels}
-            title="Restore the normal workspace view"
-          >
-            View
-          </button>
+          <DesktopMenu
+            label="Help"
+            items={[
+              {
+                label: "About Web Console",
+                onSelect: () =>
+                  pushToast({
+                    tone: "info",
+                    message: "Billing Refactoring Web Console",
+                    ttl: 3000,
+                  }),
+              },
+              {
+                label: "Route verifier: scripts\\verify_backend_routes.py",
+                disabled: true,
+              },
+            ]}
+          />
         </div>
         <div className="topbar-actions">
           {review.length > 0 && (
@@ -2126,12 +2704,13 @@ export default function App() {
           minimizedPanels.has("template") ? "panel-minimized-template" : ""
         } ${templateDetached ? "template-detached" : ""}`}
       >
-        <NavRail active={activeModule} onSelect={setActiveModule} />
-        {activeModule === "rules" && (
-          <VendorRulesStudio pushToast={pushToast} requestConfirm={requestConfirm} />
-        )}
+        <NavRail
+          active={activeModule}
+          onSelect={setActiveModule}
+          collapsed={navCollapsed}
+        />
         {/* The original batch workspace JSX below is hidden via CSS when
-            activeModule === "rules"; this avoids reshuffling thousands of
+            activeModule is not "batches"; this avoids reshuffling thousands of
             lines and keeps batch-related effects/state intact for instant
             switch-back. */}
 
@@ -2144,59 +2723,23 @@ export default function App() {
           >
             <div className="file-sidebar-card">
               <div className="file-sidebar-header">
-                <div className="file-sidebar-header-actions">
-                  <BatchActionsBar
-                    hasFiles={files.length > 0}
-                    isProcessing={isProcessing}
-                    isCancelling={isCancelling}
-                    hasPreview={preview !== null}
-                    isExporting={isExporting}
-                    hasExport={hasExport}
-                    editedCellCount={editedCellCount}
-                    batchName={batchName}
-                    onProcess={handleProcess}
-                    onCancel={handleCancel}
-                    onPreview={handleRefreshPreview}
-                    onExport={handleExport}
-                    onDownload={handleDownload}
-                    onResetEdits={handleResetEdits}
-                    onClear={handleClear}
-                  />
-                  <div className="panel-window-controls">
-                    <button
-                      type="button"
-                      className="panel-window-btn"
-                      onClick={() => minimizePanel("batches")}
-                      title="Minimize"
-                      aria-label="Minimize Batches"
-                      data-testid="batches-minimize"
-                    >
-                      <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"><line x1="2.5" y1="9" x2="9.5" y2="9" /></svg>
-                    </button>
-                    <button
-                      type="button"
-                      className={`panel-window-btn ${maximizedPanel === "batches" ? "is-active" : ""}`}
-                      onClick={() =>
-                        setMaximizedPanel((m) => (m === "batches" ? null : "batches"))
-                      }
-                      title={maximizedPanel === "batches" ? "Restore" : "Maximize"}
-                      aria-label={maximizedPanel === "batches" ? "Restore Batches" : "Maximize Batches"}
-                      data-testid="batches-maximize"
-                    >
-                      <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round"><rect x="2.5" y="2.5" width="7" height="7" rx="0.6" /></svg>
-                    </button>
-                    <button
-                      type="button"
-                      className="panel-window-btn panel-window-btn-close"
-                      onClick={() => closePanel("batches")}
-                      title="Close"
-                      aria-label="Close Batches"
-                      data-testid="batches-close"
-                    >
-                      <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round"><line x1="3" y1="3" x2="9" y2="9" /><line x1="9" y1="3" x2="3" y2="9" /></svg>
-                    </button>
-                  </div>
-                </div>
+                <div className="file-sidebar-title">Batches</div>
+                {isProcessing && (
+                  <button
+                    type="button"
+                    className="file-sidebar-stop-btn"
+                    disabled={isCancelling}
+                    onClick={handleCancel}
+                    title={
+                      isCancelling
+                        ? "Cancellation already requested"
+                        : "Stop this batch at the next safe checkpoint"
+                    }
+                  >
+                    <span aria-hidden />
+                    {isCancelling ? "Stopping" : "Stop"}
+                  </button>
+                )}
               </div>
 
               {/* Phase 2I.14 — the floating ProgressBar card was
@@ -2208,7 +2751,8 @@ export default function App() {
                 batchList={batchList}
                 activeBatchId={batchId}
                 onSwitchBatch={handleSwitchBatch}
-                onCreateBatch={handleCreateNewBatch}
+                onCreateBatch={handleSubmitCreateBatch}
+                createRequestToken={createBatchRequestToken}
                 onRenameBatch={handleInlineRenameBatch}
                 onDeleteBatch={handleDeleteBatchById}
                 onRefreshBatchList={() => void refreshBatchList()}
@@ -2220,7 +2764,9 @@ export default function App() {
                 onDeleteFile={handleDeleteFile}
                 onUploadFiles={handleFiles}
                 onUploadFilesToBatch={handleFilesForBatch}
+                uploadItems={uploadItems}
                 onProcessBatch={handleProcessBatch}
+                onProcessFile={handleProcessFile}
                 processingBatchId={isProcessing ? progress?.batch_id ?? batchId : null}
                 isProcessing={isProcessing}
                 isSwitchingBatch={isSwitchingBatch}
@@ -2264,6 +2810,7 @@ export default function App() {
               onTraceClick={handleTraceClick}
               remapActive={remapTarget != null && remapDraft == null}
               onRemapDrawn={handleRemapDrawn}
+              aiProgress={progress}
             />
           </section>
         )}
@@ -2286,6 +2833,9 @@ export default function App() {
               preview={preview}
               edits={edits}
               onCellEdit={handleCellEdit}
+              onAddPreviewRow={handleAddPreviewRow}
+              batchId={batchId}
+              onAiMappingApplied={handleAiMappingApplied}
               fileCount={files.length}
               selectedRowIndex={selectedRowIndex}
               activeDocumentPage={activeDocumentPage}
@@ -2376,6 +2926,13 @@ export default function App() {
         onSubmit={handleSubmitRename}
       />
 
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        pushToast={pushToast}
+        requestConfirm={requestConfirm}
+      />
+
       <ConfirmDialog
         open={confirmDialog !== null}
         title={confirmDialog?.title ?? ""}
@@ -2390,72 +2947,6 @@ export default function App() {
       {/* Phase 1K — global toast queue (replaces in-page banners) */}
       <Toasts toasts={toasts} onDismiss={dismissToast} />
 
-      {/* Phase 1H — premium new-batch dialog (modal) */}
-      {showCreateBatchDialog && (
-        <div
-          className="modal-backdrop"
-          data-testid="new-batch-modal"
-          onClick={() => setShowCreateBatchDialog(false)}
-          role="presentation"
-        >
-          <div
-            className="modal-card"
-            onClick={(e) => e.stopPropagation()}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="new-batch-title"
-          >
-            <div className="modal-header">
-              <span id="new-batch-title">New batch</span>
-              <button
-                className="icon-button"
-                onClick={() => setShowCreateBatchDialog(false)}
-                title="Close"
-              >
-                ✕
-              </button>
-            </div>
-            <div className="modal-body">
-              <label className="modal-field">
-                <span className="modal-field-label">Batch name (optional)</span>
-                <input
-                  type="text"
-                  className="modal-input"
-                  data-testid="new-batch-name-input"
-                  placeholder="e.g. May 2026 Hopkinsville"
-                  value={createBatchName}
-                  maxLength={BATCH_NAME_MAX + 5}
-                  onChange={(e) => setCreateBatchName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void handleSubmitCreateBatch();
-                    if (e.key === "Escape") setShowCreateBatchDialog(false);
-                  }}
-                  autoFocus
-                />
-              </label>
-              <BatchDocumentModeSelector
-                value={createBatchMode}
-                onChange={setCreateBatchMode}
-              />
-            </div>
-            <div className="modal-footer">
-              <button
-                className="icon-button"
-                onClick={() => setShowCreateBatchDialog(false)}
-              >
-                Cancel
-              </button>
-              <button
-                className="primary"
-                data-testid="create-batch-submit"
-                onClick={() => void handleSubmitCreateBatch()}
-              >
-                Create batch
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
       {/* Phase 2K — cell-level affordances (right-click menu, explain
           modal, remap scope chooser). Mounted at the App root so they
           float over everything; state is owned here. */}
@@ -2605,6 +3096,25 @@ function panelLabel(panel: PanelKey): string {
     case "template":
       return "Template";
   }
+}
+
+function SidebarToggleIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 18 18"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="2.5" y="2.5" width="13" height="13" rx="3.2" />
+      <line x1="7" y1="4.9" x2="7" y2="13.1" />
+    </svg>
+  );
 }
 
 function DockPanelIcon({ panel }: { panel: PanelKey }) {

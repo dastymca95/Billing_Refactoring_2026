@@ -60,7 +60,7 @@ def _active_cache_path(batch_id: str) -> Path:
 
 def _generate_rev_id() -> str:
     now = _dt.datetime.now(tz=_dt.timezone.utc)
-    return "rev_" + now.strftime("%Y%m%dT%H%M%SZ")
+    return "rev_" + now.strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def _read_index(batch_id: str) -> list[dict[str, Any]]:

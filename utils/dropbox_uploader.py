@@ -51,6 +51,11 @@ from __future__ import annotations
 
 import logging
 import os
+import base64
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -226,8 +231,6 @@ class DropboxUploader:
     # --- introspection ---
     @property
     def is_configured(self) -> bool:
-        if not _HAS_DROPBOX:
-            return False
         # OAuth refresh-token flow needs all three; legacy flow needs an access token.
         if self.refresh_token and self.app_key and self.app_secret:
             return True
@@ -237,12 +240,12 @@ class DropboxUploader:
 
     @property
     def auth_mode(self) -> str:
-        if not _HAS_DROPBOX:
-            return "sdk_missing"
         if self.refresh_token and self.app_key and self.app_secret:
             return "refresh_token"
         if self.access_token:
             return "access_token"
+        if not _HAS_DROPBOX:
+            return "sdk_missing"
         return "credentials_missing"
 
     def credential_summary(self) -> dict:
@@ -279,12 +282,6 @@ class DropboxUploader:
         """Upload `local_path` to `dropbox_path`, then return a shareable URL.
         Reuses an existing shared link if one already exists, otherwise creates
         a new one. Always returns an UploadResult — never raises."""
-        if not _HAS_DROPBOX:
-            return UploadResult(
-                success=False,
-                error_kind="sdk_missing",
-                error_message="Dropbox SDK is not installed. `pip install dropbox` to enable uploads.",
-            )
         if not self.is_configured:
             return UploadResult(
                 success=False,
@@ -299,6 +296,9 @@ class DropboxUploader:
             )
         if not dropbox_path.startswith("/"):
             dropbox_path = "/" + dropbox_path
+
+        if not _HAS_DROPBOX:
+            return self._upload_with_stdlib(local_path=local_path, dropbox_path=dropbox_path, overwrite=overwrite)
 
         client = self._get_client()
         try:
@@ -315,8 +315,21 @@ class DropboxUploader:
             return UploadResult(success=False, dropbox_path=dropbox_path,
                                 error_kind="api", error_message=f"API error during upload: {type(e).__name__}")
         except Exception as e:
+            detail = "SSL verification" if _looks_like_ssl_error(e) else type(e).__name__
+            self.logger.warning(
+                "Dropbox SDK upload failed with %s; retrying with system HTTP fallback.",
+                detail,
+            )
+            fallback = self._upload_with_stdlib(
+                local_path=local_path,
+                dropbox_path=dropbox_path,
+                overwrite=overwrite,
+            )
+            if fallback.success:
+                return fallback
             return UploadResult(success=False, dropbox_path=dropbox_path,
-                                error_kind="io", error_message=f"Unexpected upload error: {type(e).__name__}")
+                                error_kind=fallback.error_kind or "io",
+                                error_message=fallback.error_message or f"Unexpected upload error: {type(e).__name__}")
 
         # Get or create a shared link
         try:
@@ -342,3 +355,133 @@ class DropboxUploader:
         # and keeps every vendor's links consistent.
         url = url.replace("?dl=0", "?dl=1")
         return UploadResult(success=True, dropbox_path=dropbox_path, shared_link=url)
+
+    def _upload_with_stdlib(self, *, local_path: Path, dropbox_path: str, overwrite: bool = True) -> UploadResult:
+        """Dropbox upload fallback that uses urllib + the OS certificate store.
+
+        On some Windows desktops, ``requests``/``certifi`` cannot validate the
+        local TLS chain while the standard library succeeds through the Windows
+        trust store. This fallback keeps the upload path working without
+        disabling TLS verification or logging credentials.
+        """
+        try:
+            token = self._stdlib_access_token()
+            mode = "overwrite" if overwrite else "add"
+            arg = {
+                "path": dropbox_path,
+                "mode": {".tag": mode},
+                "autorename": False,
+                "mute": False,
+                "strict_conflict": False,
+            }
+            upload_headers = {
+                "Authorization": f"Bearer {token}",
+                "Dropbox-API-Arg": json.dumps(arg),
+                "Content-Type": "application/octet-stream",
+            }
+            _stdlib_request(
+                "https://content.dropboxapi.com/2/files/upload",
+                headers=upload_headers,
+                data=local_path.read_bytes(),
+            )
+            list_payload = {"path": dropbox_path, "direct_only": True}
+            existing = _stdlib_request_json(
+                "https://api.dropboxapi.com/2/sharing/list_shared_links",
+                token=token,
+                payload=list_payload,
+            )
+            links = existing.get("links") if isinstance(existing, dict) else []
+            if links:
+                url = str((links[0] or {}).get("url") or "")
+            else:
+                created = _stdlib_request_json(
+                    "https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings",
+                    token=token,
+                    payload={"path": dropbox_path},
+                )
+                url = str((created or {}).get("url") or "")
+            if not url:
+                return UploadResult(
+                    success=False,
+                    dropbox_path=dropbox_path,
+                    error_kind="api",
+                    error_message="Dropbox did not return a shared link.",
+                )
+            return UploadResult(
+                success=True,
+                dropbox_path=dropbox_path,
+                shared_link=url.replace("?dl=0", "?dl=1"),
+            )
+        except urllib.error.HTTPError as e:
+            return UploadResult(
+                success=False,
+                dropbox_path=dropbox_path,
+                error_kind="api",
+                error_message=f"Dropbox HTTP error: {e.code}",
+            )
+        except urllib.error.URLError as e:
+            return UploadResult(
+                success=False,
+                dropbox_path=dropbox_path,
+                error_kind="api",
+                error_message=f"Dropbox network error: {type(e.reason).__name__}",
+            )
+        except Exception as e:
+            return UploadResult(
+                success=False,
+                dropbox_path=dropbox_path,
+                error_kind="io",
+                error_message=f"Unexpected Dropbox fallback error: {type(e).__name__}",
+            )
+
+    def _stdlib_access_token(self) -> str:
+        # Keep the same precedence as the SDK path: refresh-token auth is
+        # preferred because legacy access tokens can expire or be revoked even
+        # when the long-lived refresh token is valid.
+        if not (self.refresh_token and self.app_key and self.app_secret):
+            if self.access_token:
+                return self.access_token
+            raise RuntimeError("Dropbox credentials missing")
+        credentials = f"{self.app_key}:{self.app_secret}".encode("utf-8")
+        headers = {
+            "Authorization": "Basic " + base64.b64encode(credentials).decode("ascii"),
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        data = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token,
+        }).encode("utf-8")
+        payload = _stdlib_request(
+            "https://api.dropboxapi.com/oauth2/token",
+            headers=headers,
+            data=data,
+        )
+        token = str((json.loads(payload.decode("utf-8")) or {}).get("access_token") or "")
+        if not token:
+            raise RuntimeError("Dropbox token refresh returned no access token")
+        return token
+
+
+def _looks_like_ssl_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "ssl" in text or "certificate_verify_failed" in text or "certificateverifyfailed" in text
+
+
+def _stdlib_request(url: str, *, headers: dict[str, str], data: bytes, timeout: int = 100) -> bytes:
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def _stdlib_request_json(url: str, *, token: str, payload: dict, timeout: int = 100) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    body = _stdlib_request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        data=data,
+        timeout=timeout,
+    )
+    return json.loads(body.decode("utf-8") or "{}")

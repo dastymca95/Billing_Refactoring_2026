@@ -1,0 +1,11 @@
+{
+  "key": "servall_pest",
+  "vendor": "Servall",
+  "category": "pest_control",
+  "description": "Placeholder for degraded Servall pest control service ticket screenshot.",
+  "status": "incomplete",
+  "requires_live_ai": false,
+  "source_document": "servall_pest_placeholder.png",
+  "skip_reason": "Only a low-resolution conversation screenshot is available. Invoice number, dates, due date, property, total, and exact vendor entity cannot be verified reliably enough for a golden fixture.",
+  "extracted_candidates": {}
+}

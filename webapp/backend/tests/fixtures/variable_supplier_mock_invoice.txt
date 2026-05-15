@@ -1,0 +1,16 @@
+HD Supply Facilities Maintenance, Ltd
+Invoice HDS-104857
+Invoice Date 05/06/2026
+Due Date 06/05/2026
+Account 40293817
+Ship To 1732-Hillwood Manor
+1726 Stone Street
+Union City, TN 38261
+
+Items
+6  Angle stop valve, chrome, 1/2 inch         8.12      48.72
+1  LED exterior fixture, bronze             139.99     139.99
+
+Subtotal 188.71
+Tax 17.94
+Total 206.65

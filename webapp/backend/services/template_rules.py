@@ -33,6 +33,8 @@ from ..settings import PROJECT_ROOT, RESMAN_TEMPLATE
 
 
 _TEMPLATE_RULES_YAML = PROJECT_ROOT / "config" / "resman_template_rules.yaml"
+_CANONICAL_RULES_YAML = PROJECT_ROOT / "config" / "canonical_rules.yaml"
+_FORMAT_RULES_YAML = PROJECT_ROOT / "config" / "invoice_format_rules.yaml"
 
 _LOG = logging.getLogger("template_rules")
 _CACHED: dict[str, Any] | None = None
@@ -96,7 +98,10 @@ def get_template_rules() -> dict[str, Any]:
             "Unit Price", "Tax", "Received Date", "Document Url",
         ]
 
-    required = [c for c in (cfg.get("required_columns") or []) if c in columns]
+    canonical_requirements = _read_canonical_required_columns()
+    format_requirements = _read_format_required_columns()
+    configured_required = canonical_requirements or format_requirements or cfg.get("required_columns") or []
+    required = [c for c in configured_required if c in columns]
     recommended = [
         c for c in (cfg.get("recommended_columns") or [])
         if c in columns and c not in required
@@ -124,3 +129,58 @@ def reset_cache() -> None:
     """Force the next call to re-read the YAML + template (used by tests)."""
     global _CACHED
     _CACHED = None
+
+
+def _read_format_required_columns() -> list[str]:
+    """Return operator-configured export-required columns from Formats.
+
+    `resman_template_rules.yaml` remains the fallback/canonical default, but
+    the app's Formats screen is the operator-facing source for which template
+    fields are truly mandatory before export.
+    """
+    if not _FORMAT_RULES_YAML.is_file():
+        return []
+    try:
+        data = yaml.safe_load(_FORMAT_RULES_YAML.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    requirements = data.get("template_requirements")
+    if not isinstance(requirements, dict):
+        return []
+    required = requirements.get("required_columns")
+    if not isinstance(required, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in required:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _read_canonical_required_columns() -> list[str]:
+    """Return export-required columns from Canonical Rules when available."""
+    if not _CANONICAL_RULES_YAML.is_file():
+        return []
+    try:
+        data = yaml.safe_load(_CANONICAL_RULES_YAML.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    requirements = data.get("template_requirements")
+    if not isinstance(requirements, dict):
+        return []
+    required = requirements.get("required_columns")
+    if not isinstance(required, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in required:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out

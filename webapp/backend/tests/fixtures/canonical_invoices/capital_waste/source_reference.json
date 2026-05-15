@@ -1,0 +1,47 @@
+{
+  "key": "capital_waste",
+  "vendor": "Capital Waste Services",
+  "category": "trash_collection_services",
+  "description": "Capital Waste Services trash collection invoice with fuel recovery adjustment.",
+  "status": "complete",
+  "requires_live_ai": false,
+  "source_document": "CapitalWasteChattanoogaHauling_invoice_3150854.pdf",
+  "support_document_url": "https://dropbox.example/canonical/capital-waste-3150854.pdf",
+  "ignored_source_items": ["previous_balance", "payments"],
+  "extracted_candidates": {
+    "vendor_name": "Capital Waste Services",
+    "category": "trash_collection_services",
+    "invoice_number": "3150854",
+    "invoice_date": "04/30/2026",
+    "due_date": "05/30/2026",
+    "bill_or_credit": "Bill",
+    "account_number": "160243",
+    "service_address": "River Canyon Apartments, 21726 River Canyon Rd, Chattanooga, TN 37405",
+    "service_period_start": "05/01/2026",
+    "service_period_end": "05/31/2026",
+    "property_candidate": "River Canyon Apartments",
+    "line_items": [
+      {
+        "description": "6 Yard Trash Service",
+        "quantity": 1,
+        "unit_price": 365.4,
+        "amount": 365.4,
+        "confidence": 0.95,
+        "reason": "Visible service line."
+      },
+      {
+        "description": "Fuel Recovery Adjustment",
+        "quantity": 1,
+        "unit_price": 34.93,
+        "amount": 34.93,
+        "confidence": 0.95,
+        "reason": "Visible fee line."
+      }
+    ],
+    "subtotal": 400.33,
+    "tax_amount": 0,
+    "total_amount": 400.33,
+    "confidence": 0.95,
+    "warnings": []
+  }
+}

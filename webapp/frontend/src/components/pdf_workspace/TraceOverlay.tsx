@@ -92,6 +92,7 @@ export function TraceOverlay({
             key={it.trace_id}
             className={[
               "trace-box",
+              it.source_type === "ai_vision" ? "is-vision" : "",
               isHovered ? "is-hover" : "",
               isLinked ? "is-linked" : "",
             ]

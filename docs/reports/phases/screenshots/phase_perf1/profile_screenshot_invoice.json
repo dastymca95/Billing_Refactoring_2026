@@ -1,0 +1,41 @@
+{
+  "schema": "phase_perf1/profile_screenshot/v1",
+  "run_at": "2026-05-14T17:38:15",
+  "ocr_dependencies_available": true,
+  "fixtures": [
+    {
+      "path": "Training Bills_Invoices\\Electricity - Power\\Weakley County Municipal Electric System\\Bills_Training\\8c40c2c8-2521-4377-8868-217cfa77dbfc.png",
+      "cold": {
+        "ocr_ms": 1198.05,
+        "mean_confidence": 0.741,
+        "text_chars": 870
+      },
+      "warm": {
+        "lookup_ms": 2.31,
+        "hit": true,
+        "text_chars": 870
+      },
+      "speedup_x": 518.86
+    },
+    {
+      "path": "Training Bills_Invoices\\Electricity - Power\\Weakley County Municipal Electric System\\Bills_Training\\24b4b317-787e-4f1d-bbf1-cbc2012371a4.jpg",
+      "cold": {
+        "ocr_ms": 1142.59,
+        "mean_confidence": 0.635,
+        "text_chars": 746
+      },
+      "warm": {
+        "lookup_ms": 1.86,
+        "hit": true,
+        "text_chars": 746
+      },
+      "speedup_x": 613.21
+    }
+  ],
+  "ocr_cache_stats": {
+    "enabled": true,
+    "count": 6,
+    "size_bytes": 1072081,
+    "directory": "C:\\Users\\Dasty\\PycharmProjects\\Billing_Refactoring_2026\\webapp_data\\cache\\ocr"
+  }
+}

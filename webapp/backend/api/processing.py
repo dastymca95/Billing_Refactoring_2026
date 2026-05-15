@@ -76,6 +76,22 @@ def _result_cache_path(batch_id: str) -> Path:
     return batch_store.get_processed_dir(batch_id) / "_webapp_result.json"
 
 
+def _load_cached_result(batch_id: str, missing_detail: str) -> dict:
+    try:
+        cache_path = _result_cache_path(batch_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
+    if not cache_path.is_file():
+        raise HTTPException(status_code=404, detail=missing_detail)
+    with open(cache_path, "r", encoding="utf-8") as f:
+        result = json.load(f)
+    try:
+        row_normalizer.normalize_result(result)
+    except Exception:  # pragma: no cover - preview should stay available
+        _LOG.exception("Could not normalize cached preview for %s", batch_id)
+    return result
+
+
 def _pad_row_to_template(row: dict, columns: list[str]) -> dict:
     """Ensure every template column appears in the row dict, with `None`
     for any column the vendor processor didn't populate. Preserves the
@@ -99,6 +115,16 @@ def _int_or_none(value) -> int | None:
         return None
 
 
+def _float_or_none(value) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        n = float(value)
+        return n if n >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _invoice_source_file(inv: dict) -> str:
     debug = inv.get("debug_info") if isinstance(inv.get("debug_info"), dict) else {}
     for key in ("source_file", "file_name", "filename"):
@@ -115,6 +141,51 @@ def _invoice_source_page(inv: dict) -> int | None:
         if page is not None:
             return page
     return None
+
+
+def _invoice_total_metadata(inv: dict, raw_rows: list[dict]) -> dict:
+    """Return invoice-level totals for preview-only AI review metadata.
+
+    Older AI-assisted cached results stored `total_amount` and validation
+    summary on the invoice object, but not on each flattened row's
+    `_meta.ai_provenance`. The Single Invoice UI is row-driven, so attach a
+    non-export metadata copy during preview flattening. This does not change
+    vendor business logic or the workbook rows.
+    """
+    validation = inv.get("validation_summary")
+    validation = validation if isinstance(validation, dict) else {}
+    invoice_total = (
+        _float_or_none(inv.get("total_amount"))
+        or _float_or_none(validation.get("invoice_total"))
+        or _float_or_none(validation.get("reconciled_total"))
+    )
+    subtotal = _float_or_none(inv.get("subtotal"))
+    tax_amount = _float_or_none(inv.get("tax_amount"))
+    shipping_amount = _float_or_none(inv.get("shipping_amount"))
+    fees_amount = _float_or_none(inv.get("fees_amount"))
+    row_total = 0.0
+    for row in raw_rows:
+        amount = _float_or_none(row.get("Amount"))
+        if amount is not None:
+            row_total += amount
+    if subtotal is None and row_total > 0:
+        subtotal = round(row_total, 2)
+    if tax_amount is None and invoice_total is not None and subtotal is not None:
+        inferred_tax = round(invoice_total - subtotal, 2)
+        if inferred_tax > 0:
+            tax_amount = inferred_tax
+    out: dict = {}
+    if invoice_total is not None:
+        out["invoice_total"] = round(invoice_total, 2)
+    if subtotal is not None:
+        out["subtotal"] = round(subtotal, 2)
+    if tax_amount is not None:
+        out["tax_amount"] = round(tax_amount, 2)
+    if shipping_amount is not None:
+        out["shipping_amount"] = round(shipping_amount, 2)
+    if fees_amount is not None:
+        out["fees_amount"] = round(fees_amount, 2)
+    return out
 
 
 def _preview_rows_with_navigation(result: dict, columns: list[str]) -> list[dict]:
@@ -138,6 +209,7 @@ def _preview_rows_with_navigation(result: dict, columns: list[str]) -> list[dict
     out: list[dict] = []
     for invoice_index, inv in enumerate(invoices):
         raw_rows = list(inv.get("rows", []) or [])
+        invoice_totals = _invoice_total_metadata(inv, raw_rows)
         source_file = _invoice_source_file(inv)
         explicit_page = _invoice_source_page(inv)
         if source_file:
@@ -165,6 +237,12 @@ def _preview_rows_with_navigation(result: dict, columns: list[str]) -> list[dict
             meta.setdefault("source_page", source_page)
             meta.setdefault("invoice_group_id", invoice_group_id)
             meta.setdefault("invoice_number", invoice_number or None)
+            if invoice_totals:
+                provenance = meta.get("ai_provenance")
+                if not isinstance(provenance, dict):
+                    provenance = {}
+                provenance = {**invoice_totals, **provenance}
+                meta["ai_provenance"] = provenance
             meta["invoice_index"] = invoice_index
             meta["invoice_row_index"] = invoice_row_index
             meta["row_index"] = len(out)
@@ -172,6 +250,43 @@ def _preview_rows_with_navigation(result: dict, columns: list[str]) -> list[dict
             padded["_row_index"] = len(out)
             out.append(padded)
     return out
+
+
+def _row_contract_manual_review_items(result: dict) -> list[dict]:
+    """Expose row-contract blockers as review rows for cached/fresh previews."""
+
+    items: list[dict] = []
+    for inv in result.get("all_invoices") or []:
+        invoice_number = str(inv.get("invoice_number") or "").strip()
+        account_number = str(inv.get("account_number") or "").strip()
+        invoice_date = str(inv.get("billing_date") or inv.get("invoice_date") or "").strip()
+        service_address = str(inv.get("service_address") or "").strip()
+        total_amount = inv.get("total_amount") or 0
+        for row in inv.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+            reasons = list(meta.get("contract_blocking_reasons") or [])
+            if not reasons:
+                continue
+            items.append(
+                {
+                    "source_file": meta.get("source_file") or inv.get("source_file") or "",
+                    "account_number": account_number,
+                    "invoice_number": row.get("Invoice Number") or invoice_number,
+                    "invoice_date": row.get("Invoice Date") or invoice_date,
+                    "property_abbreviation": row.get("Property Abbreviation") or "",
+                    "location": row.get("Location") or "",
+                    "service_address": meta.get("service_address") or service_address,
+                    "total_amount": float(total_amount or row.get("Amount") or 0),
+                    "line_count": len(inv.get("rows") or []),
+                    "reasons": reasons,
+                    "match_strategy": "row_contract_validator",
+                    "match_confidence": "",
+                    "service_period_source": meta.get("service_period_source") or "",
+                }
+            )
+    return items
 
 
 def _read_export_name_from_metadata(batch_id: str) -> str | None:
@@ -253,6 +368,219 @@ def _record_revision_for_result(batch_id: str, result: dict) -> None:
         )
     except Exception:  # pragma: no cover - belt-and-braces
         _LOG.exception("Could not record revision for %s", batch_id)
+
+
+def _source_file_name(item: dict | None) -> str:
+    """Return the source filename carried by an invoice/review payload."""
+    if not isinstance(item, dict):
+        return ""
+    debug = item.get("debug_info") if isinstance(item.get("debug_info"), dict) else {}
+    meta = item.get("_meta") if isinstance(item.get("_meta"), dict) else {}
+    for payload in (item, debug, meta):
+        for key in ("source_file", "file_name", "filename"):
+            value = payload.get(key)
+            if value:
+                return Path(str(value)).name
+    return ""
+
+
+def _source_file_count(items: list[dict]) -> int:
+    return len({
+        src for src in (_source_file_name(item) for item in items) if src
+    })
+
+
+def _is_payload_for_file(item: dict | None, filename: str) -> bool:
+    return _source_file_name(item) == Path(filename).name
+
+
+def _row_count(invoices: list[dict]) -> int:
+    return sum(len((inv or {}).get("rows") or []) for inv in invoices)
+
+
+def _dedupe_repeated_source_blocks(items: list[dict]) -> list[dict]:
+    """Collapse duplicate source-file blocks, preserving latest results."""
+    blocks: list[tuple[str, list[dict]]] = []
+    current_key: str | None = None
+    current_block: list[dict] = []
+    anonymous_index = 0
+
+    for item in items:
+        source = _source_file_name(item)
+        key = source or f"__anonymous_{anonymous_index}"
+        if not source:
+            anonymous_index += 1
+        if current_key is None or key != current_key:
+            if current_block:
+                blocks.append((current_key or "", current_block))
+            current_key = key
+            current_block = [item]
+        else:
+            current_block.append(item)
+    if current_block:
+        blocks.append((current_key or "", current_block))
+
+    last_index_by_key: dict[str, int] = {}
+    for idx, (key, _block) in enumerate(blocks):
+        if key and not key.startswith("__anonymous_"):
+            last_index_by_key[key] = idx
+
+    deduped: list[dict] = []
+    for idx, (key, block) in enumerate(blocks):
+        if key.startswith("__anonymous_") or last_index_by_key.get(key) == idx:
+            deduped.extend(block)
+    return deduped
+
+
+def _dedupe_unsupported_files(items: list[dict]) -> list[dict]:
+    deduped_reversed: list[dict] = []
+    seen: set[str] = set()
+    for item in reversed(items):
+        name = Path(str((item or {}).get("filename") or "")).name
+        if name:
+            if name in seen:
+                continue
+            seen.add(name)
+        deduped_reversed.append(item)
+    return list(reversed(deduped_reversed))
+
+
+def _refresh_vendor_summary(payload: dict) -> dict:
+    invoices = list(payload.get("invoices") or [])
+    review = list(payload.get("manual_review_rows") or [])
+    summary = dict(payload.get("summary") or {})
+    source_count = _source_file_count(invoices)
+    if source_count:
+        summary["files_processed"] = source_count
+    summary["invoices_produced"] = len(invoices)
+    rows_total = _row_count(invoices)
+    summary["rows_total"] = rows_total
+    summary["line_items"] = rows_total
+    summary["invoices_flagged_for_review"] = len(review)
+    payload["summary"] = summary
+    return payload
+
+
+def _recompute_template_summary(result: dict, *, scope: str = "template") -> None:
+    invoices = list(result.get("all_invoices") or [])
+    review = list(result.get("all_manual_review") or [])
+    unsupported = _dedupe_unsupported_files(list(result.get("unsupported_files") or []))
+    result["unsupported_files"] = unsupported
+    source_count = _source_file_count(invoices)
+    summary = dict(result.get("summary") or {})
+    summary.update({
+        "scope": scope,
+        "files_total": max(1 if invoices or unsupported else 0, source_count + len(unsupported)),
+        "files_supported": source_count,
+        "files_unsupported": len(unsupported),
+        "invoices_total": len(invoices),
+        "manual_review_total": len(review),
+    })
+    result["summary"] = summary
+
+
+def _merge_single_file_result(batch_id: str, filename: str, fresh: dict) -> dict:
+    """Add/replace one file's extraction in the active template preview."""
+    target = Path(filename).name
+    try:
+        cache_path = _result_cache_path(batch_id)
+        if not cache_path.is_file():
+            return _mark_single_file_result(batch_id, target, fresh)
+        with open(cache_path, "r", encoding="utf-8") as f:
+            existing = json.load(f) or {}
+    except Exception:
+        return _mark_single_file_result(batch_id, target, fresh)
+
+    merged = dict(existing)
+    merged["batch_id"] = batch_id
+    merged["scope"] = {
+        "type": "template",
+        "last_added_file": target,
+    }
+    merged["all_invoices"] = _dedupe_repeated_source_blocks([
+        *[
+            inv for inv in (existing.get("all_invoices") or [])
+            if not _is_payload_for_file(inv, target)
+        ],
+        *list(fresh.get("all_invoices") or []),
+    ])
+    merged["all_manual_review"] = _dedupe_repeated_source_blocks([
+        *[
+            item for item in (existing.get("all_manual_review") or [])
+            if not _is_payload_for_file(item, target)
+        ],
+        *list(fresh.get("all_manual_review") or []),
+    ])
+    merged["unsupported_files"] = _dedupe_unsupported_files([
+        *[
+            item for item in (existing.get("unsupported_files") or [])
+            if Path(str((item or {}).get("filename") or "")).name != target
+        ],
+        *list(fresh.get("unsupported_files") or []),
+    ])
+    detection = dict(existing.get("detection") or {})
+    detection.update(fresh.get("detection") or {})
+    merged["detection"] = detection
+
+    by_vendor: dict[str, dict] = {}
+    for vendor_key, payload in (existing.get("by_vendor") or {}).items():
+        payload = dict(payload or {})
+        payload["invoices"] = _dedupe_repeated_source_blocks([
+            inv for inv in (payload.get("invoices") or [])
+            if not _is_payload_for_file(inv, target)
+        ])
+        payload["manual_review_rows"] = _dedupe_repeated_source_blocks([
+            item for item in (payload.get("manual_review_rows") or [])
+            if not _is_payload_for_file(item, target)
+        ])
+        if payload["invoices"] or payload["manual_review_rows"]:
+            by_vendor[vendor_key] = _refresh_vendor_summary(payload)
+
+    for vendor_key, fresh_payload in (fresh.get("by_vendor") or {}).items():
+        fresh_payload = dict(fresh_payload or {})
+        payload = dict(by_vendor.get(vendor_key) or {})
+        for key, value in fresh_payload.items():
+            if key not in {"invoices", "manual_review_rows", "summary"}:
+                payload[key] = value
+        payload["invoices"] = _dedupe_repeated_source_blocks([
+            *list(payload.get("invoices") or []),
+            *list(fresh_payload.get("invoices") or []),
+        ])
+        payload["manual_review_rows"] = _dedupe_repeated_source_blocks([
+            *list(payload.get("manual_review_rows") or []),
+            *list(fresh_payload.get("manual_review_rows") or []),
+        ])
+        by_vendor[vendor_key] = _refresh_vendor_summary(payload)
+
+    merged["by_vendor"] = by_vendor
+    _recompute_template_summary(merged, scope="template")
+    return merged
+
+
+def _mark_single_file_result(batch_id: str, filename: str, result: dict) -> dict:
+    """Stamp a single-file run as an isolated template revision."""
+    target = Path(filename).name
+    result["batch_id"] = batch_id
+    result["scope"] = {
+        "type": "file",
+        "source_file": target,
+    }
+    summary = dict(result.get("summary") or {})
+    invoices = list(result.get("all_invoices") or [])
+    review = list(result.get("all_manual_review") or [])
+    unsupported = list(result.get("unsupported_files") or [])
+    source_count = _source_file_count(invoices) or (0 if unsupported else 1)
+    summary.update({
+        "scope": "file",
+        "source_file": target,
+        "files_total": max(1, source_count + len(unsupported)),
+        "files_supported": source_count,
+        "files_unsupported": len(unsupported),
+        "invoices_total": len(invoices),
+        "manual_review_total": len(review),
+    })
+    result["summary"] = summary
+    return result
 
 
 def _was_cancelled(batch_id: str) -> bool:
@@ -388,7 +716,12 @@ def detect_endpoint(batch_id: str) -> dict:
 
 
 @router.post("/{batch_id}/process")
-def process_endpoint(batch_id: str, sync: bool = False) -> dict:
+def process_endpoint(
+    batch_id: str,
+    sync: bool = False,
+    file: str | None = None,
+    file_mode: str = "replace",
+) -> dict:
     """Kick off batch processing.
 
     By default the run happens in a background thread; the response is
@@ -396,18 +729,36 @@ def process_endpoint(batch_id: str, sync: bool = False) -> dict:
     `GET /progress` to track the run. Pass `?sync=1` to force a blocking
     request — used by tests and the CLI smoke tests where we want the
     final summary back in one call.
+
+    Phase 2M — pass ``?file=<filename>`` to process a single file
+    inside the batch instead of the whole batch. Single-file runs are
+    always synchronous (they're fast and the caller wants the result
+    back immediately), write an isolated one-file preview/revision,
+    and never touch the cross-batch queue, so a queued full-batch run
+    stays in line.
     """
     try:
         batch_store.get_batch_dir(batch_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
 
+    # Single-file path forces sync regardless of the ``sync`` flag.
+    if file:
+        sync = True
+        if file_mode not in {"replace", "merge"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file processing mode",
+            )
+
     if sync:
         if extraction_trace is not None:
             extraction_trace.start_batch(batch_id)
         try:
             try:
-                result = batch_processor.process_batch(batch_id)
+                result = batch_processor.process_batch(
+                    batch_id, only_filename=file,
+                )
             except FileNotFoundError as e:
                 raise HTTPException(status_code=404, detail=str(e))
         finally:
@@ -434,6 +785,12 @@ def process_endpoint(batch_id: str, sync: bool = False) -> dict:
         # writing the cache so the preview reflects the user's curated
         # state on first paint (no flicker, no separate refresh).
         _apply_learned_corrections_to_result(result)
+        if file:
+            result = (
+                _merge_single_file_result(batch_id, file, result)
+                if file_mode == "merge"
+                else _mark_single_file_result(batch_id, file, result)
+            )
         cache_path = _result_cache_path(batch_id)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "w", encoding="utf-8") as f:
@@ -465,6 +822,54 @@ def process_endpoint(batch_id: str, sync: bool = False) -> dict:
     }
 
 
+@router.get("/{batch_id}/performance")
+def performance_endpoint(batch_id: str) -> dict:
+    """Phase PERF-1 — return a step-by-step timing summary for the last
+    batch run plus, if present, the OCR cache stats and any audit
+    warnings (e.g. AI call > 8s, OCR > 5s).
+
+    The summary is built from:
+      * In-memory ``perf_timer`` state for the currently-running batch
+        (so the operator can see a live breakdown without waiting for
+        the run to finish).
+      * The persisted ``audit/performance.json`` file written when the
+        batch finishes.
+
+    Never echoes invoice content or API keys — only step names, ms,
+    counts, and small metadata fields the timer sanitises.
+    """
+    try:
+        bdir = batch_store.get_batch_dir(batch_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
+
+    from ..services import perf_timer  # local import keeps cold-load cheap
+
+    # Live in-memory timings take priority — they reflect the active run.
+    live_summary = perf_timer.summarize(batch_id)
+    persisted: dict[str, Any] | None = None
+    persisted_path = bdir / "audit" / "performance.json"
+    if persisted_path.is_file():
+        try:
+            with open(persisted_path, "r", encoding="utf-8") as f:
+                persisted = json.load(f)
+        except Exception:
+            persisted = None
+
+    out: dict[str, Any] = {
+        "batch_id": batch_id,
+        "live": live_summary if live_summary["step_count"] else None,
+        "persisted": persisted,
+    }
+    # OCR cache stats — useful to know how often the cache is hitting.
+    try:
+        from utils import ocr_cache  # type: ignore
+        out["ocr_cache"] = ocr_cache.cache_stats()
+    except Exception:
+        out["ocr_cache"] = None
+    return out
+
+
 @router.get("/{batch_id}/preview")
 def preview_endpoint(batch_id: str) -> dict:
     try:
@@ -478,6 +883,10 @@ def preview_endpoint(batch_id: str) -> dict:
         )
     with open(cache_path, "r", encoding="utf-8") as f:
         result = json.load(f)
+    try:
+        row_normalizer.normalize_result(result)
+    except Exception:  # pragma: no cover - preview should stay available
+        _LOG.exception("Could not normalize cached preview for %s", batch_id)
 
     rules = get_template_rules()
     columns = rules["columns"]
@@ -564,7 +973,13 @@ def manual_review_endpoint(batch_id: str) -> dict:
         )
     with open(cache_path, "r", encoding="utf-8") as f:
         result = json.load(f)
-    return {"batch_id": batch_id, "items": result.get("all_manual_review", [])}
+    try:
+        row_normalizer.normalize_result(result)
+    except Exception:  # pragma: no cover - review should stay available
+        _LOG.exception("Could not normalize cached manual review for %s", batch_id)
+    items = list(result.get("all_manual_review") or [])
+    items.extend(_row_contract_manual_review_items(result))
+    return {"batch_id": batch_id, "items": items}
 
 
 # ---------------------------------------------------------------------------

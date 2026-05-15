@@ -45,6 +45,27 @@ try:
 except Exception:  # pragma: no cover
     pdfplumber = None  # type: ignore
 
+# Phase PERF-1 — optional OCR cache + perf timer. Imports are
+# defensive so legacy CLI invocations (which don't have a webapp
+# context) keep working when the modules are absent.
+try:
+    from utils import ocr_cache as _ocr_cache  # type: ignore
+except Exception:  # pragma: no cover
+    _ocr_cache = None  # type: ignore
+try:
+    from webapp.backend.services import perf_timer as _perf_timer  # type: ignore
+except Exception:  # pragma: no cover
+    _perf_timer = None  # type: ignore
+
+
+def _perf(step: str, batch_id: Optional[str], meta: Optional[dict] = None):
+    """Best-effort perf wrapper that no-ops when batch_id or the
+    perf_timer module is absent (CLI mode)."""
+    if _perf_timer is None or not batch_id:
+        from contextlib import nullcontext
+        return nullcontext()
+    return _perf_timer.perf_step(step, batch_id=batch_id, meta=meta)
+
 # Importing pytesseract / pdf2image is deferred to the OCR helper so that
 # missing dependencies do not break the digital-text path.
 
@@ -426,6 +447,7 @@ def extract_pdf_text(
     logger: Optional[logging.Logger] = None,
     ocr_progress_callback: Optional[Callable[[int, int, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    batch_id: Optional[str] = None,
 ) -> PdfExtractionResult:
     """Extract text from a PDF, falling back from digital-text to OCR.
 
@@ -451,7 +473,8 @@ def extract_pdf_text(
 
     digital_pages: list[PdfPage] = []
     if digital_text_first:
-        digital_pages = _try_digital_text(pdf_path, log)
+        with _perf("pdf.digital_text", batch_id, {"file": pdf_path.name}):
+            digital_pages = _try_digital_text(pdf_path, log)
 
     # Phase 2L — relaxed text-availability check.
     #
@@ -497,15 +520,49 @@ def extract_pdf_text(
         return result
 
     # ---- OCR path ----
-    ocr_pages, ocr_warnings, mean_conf, ocr_ran = _try_ocr(
-        pdf_path,
-        dpi=ocr_dpi,
-        tesseract_cmd=tesseract_cmd,
-        poppler_path=poppler_path,
-        logger=log,
-        progress_callback=ocr_progress_callback,
-        should_cancel=should_cancel,
-    )
+    # Phase PERF-1 — short-circuit OCR when we already cached the
+    # exact same file's results at this DPI. Saves the entire
+    # Tesseract + pdf2image latency on re-processing (single-file
+    # mode, retries, repeated demos).
+    if _ocr_cache is not None:
+        try:
+            cached = _ocr_cache.lookup(pdf_path, ocr_dpi)
+        except Exception:
+            cached = None
+        if cached:
+            with _perf("ocr.cache_hit", batch_id, {"file": pdf_path.name}):
+                cached_pages = [
+                    PdfPage(
+                        page_number=int(pg.get("page_number") or i + 1),
+                        text=str(pg.get("text") or ""),
+                        extraction_method=EXTRACTION_OCR,
+                        width=int(pg.get("width") or 0),
+                        height=int(pg.get("height") or 0),
+                        words=list(pg.get("words") or []),
+                    )
+                    for i, pg in enumerate(cached.get("pages") or [])
+                ]
+            if cached_pages:
+                result.pages = cached_pages
+                result.pages_count = len(cached_pages)
+                result.text = "\f".join(p.text for p in cached_pages)
+                result.extraction_method = EXTRACTION_OCR
+                result.confidence = float(cached.get("confidence") or 0.0)
+                result.warnings.extend(cached.get("warnings") or [])
+                result.warnings.append("ocr_cache_hit")
+                return result
+
+    with _perf("ocr.tesseract", batch_id,
+               {"file": pdf_path.name, "dpi": ocr_dpi}):
+        ocr_pages, ocr_warnings, mean_conf, ocr_ran = _try_ocr(
+            pdf_path,
+            dpi=ocr_dpi,
+            tesseract_cmd=tesseract_cmd,
+            poppler_path=poppler_path,
+            logger=log,
+            progress_callback=ocr_progress_callback,
+            should_cancel=should_cancel,
+        )
     result.warnings.extend(ocr_warnings)
     if not ocr_ran:
         # Fall back to whatever digital text we have, with a manual-review flag.
@@ -529,6 +586,28 @@ def extract_pdf_text(
     result.confidence = mean_conf
     if mean_conf < 0.5:
         result.warnings.append(f"low_ocr_confidence:{mean_conf:.2f}")
+    # Phase PERF-1 — persist successful (non-cancelled) OCR runs so a
+    # follow-up single-file re-process is instant.
+    if (_ocr_cache is not None and ocr_pages
+            and "ocr_cancelled" not in ocr_warnings):
+        try:
+            _ocr_cache.store(pdf_path, ocr_dpi, {
+                "pages": [
+                    {
+                        "page_number": p.page_number,
+                        "text": p.text,
+                        "width": p.width,
+                        "height": p.height,
+                        "words": p.words,
+                    }
+                    for p in ocr_pages
+                ],
+                "extraction_method": EXTRACTION_OCR,
+                "confidence": mean_conf,
+                "warnings": ocr_warnings,
+            })
+        except Exception as e:  # pragma: no cover
+            log.debug("ocr_cache store failed for %s: %s", pdf_path.name, e)
     return result
 
 

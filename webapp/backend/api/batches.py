@@ -15,6 +15,7 @@ from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel, Field
 
 from ..services import batch_store
+from ..services import document_ingestion
 from ..services.document_preview import pdf_page_count
 from ..services.vendor_detection import detect_vendor_for_file
 
@@ -27,7 +28,7 @@ router = APIRouter(prefix="/api/batches", tags=["batches"])
 # Allowed values are mirrored on the frontend (src/types.ts:DocumentMode etc).
 # ---------------------------------------------------------------------------
 DOCUMENT_MODES = (
-    "digital_pdf", "scanned_pdf", "mixed_pdf", "csv_excel", "auto_detect",
+    "digital_pdf", "scanned_pdf", "screenshot_image", "mixed_pdf", "csv_excel", "auto_detect",
 )
 AI_FALLBACK_POLICIES = (
     "never", "only_low_confidence", "only_manual_review", "always_assist",
@@ -35,6 +36,7 @@ AI_FALLBACK_POLICIES = (
 DEFAULT_DOCUMENT_MODE = "auto_detect"
 DEFAULT_AI_FALLBACK_POLICY = "only_low_confidence"
 DEFAULT_UNTITLED_BATCH_NAME = "Untitled batch"
+DETECTION_CACHE_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +87,8 @@ def _display_batch_name(meta: dict) -> str:
 # /api/batches/<id>. The result is deterministic for an unchanged file
 # (same name + size + mtime), so we cache it inside batch_metadata.json
 # under a `file_detection_cache` key. The cache is keyed by filename and
-# invalidated whenever the file's size or mtime changes.
+# invalidated whenever the file's size or mtime changes, or when the
+# detector version changes after a routing bug fix.
 # ---------------------------------------------------------------------------
 def _detect_files_cached(batch_id: str, files: list) -> list[dict]:
     """Return file entries with vendor detection populated.
@@ -115,6 +118,7 @@ def _detect_files_cached(batch_id: str, files: list) -> list[dict]:
             isinstance(cached, dict)
             and cached.get("size_bytes") == size_bytes
             and cached.get("mtime") == mtime
+            and cached.get("detector_version") == DETECTION_CACHE_VERSION
             and "vendor_key" in cached
         ):
             det = {
@@ -123,12 +127,19 @@ def _detect_files_cached(batch_id: str, files: list) -> list[dict]:
                 "reason": cached.get("reason", ""),
                 "supported_in_phase_1": cached.get("supported_in_phase_1", False),
             }
+            support = {
+                "source_type": cached.get("source_type") or "unknown",
+                "file_support_status": cached.get("file_support_status") or "supported",
+                "file_support_label": cached.get("file_support_label") or "",
+                "file_support_reason": cached.get("file_support_reason") or "",
+            }
             page_count = cached.get("page_count")
             if p.suffix.lower() == ".pdf" and page_count is None:
                 page_count = pdf_page_count(p)
                 cache_dirty = True
         else:
             det = detect_vendor_for_file(p)
+            support = document_ingestion.detect_file_support(p)
             page_count = pdf_page_count(p)
             cache_dirty = True
         fresh_cache[cache_key] = {
@@ -138,6 +149,11 @@ def _detect_files_cached(batch_id: str, files: list) -> list[dict]:
             "confidence": det["confidence"],
             "reason": det["reason"],
             "supported_in_phase_1": det["supported_in_phase_1"],
+            "detector_version": DETECTION_CACHE_VERSION,
+            "source_type": support.get("source_type"),
+            "file_support_status": support.get("file_support_status"),
+            "file_support_label": support.get("file_support_label"),
+            "file_support_reason": support.get("file_support_reason"),
         }
         if page_count is not None:
             fresh_cache[cache_key]["page_count"] = page_count
@@ -149,6 +165,10 @@ def _detect_files_cached(batch_id: str, files: list) -> list[dict]:
             "vendor_confidence": det["confidence"],
             "vendor_detection_reason": det["reason"],
             "supported_in_phase_1": det["supported_in_phase_1"],
+            "source_type": support.get("source_type"),
+            "file_support_status": support.get("file_support_status"),
+            "file_support_label": support.get("file_support_label"),
+            "file_support_reason": support.get("file_support_reason"),
         }
         if page_count is not None:
             entry["page_count"] = page_count
@@ -425,8 +445,14 @@ def list_files_endpoint(batch_id: str) -> dict:
         files = batch_store.list_files_in_batch(batch_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
-    # Phase 1U — same cached-detection helper as the main endpoint.
-    out = _detect_files_cached(batch_id, files)
+    # Phase PERF-1 hotfix — `listFiles` is on the upload critical path
+    # and must NEVER trigger a fresh image-OCR pass (the Weakley image
+    # detector alone takes 10-50 seconds on a screenshot). Fast-mode
+    # skips heavy OCR; if the cache is empty the file shows as
+    # vendor=unknown and the real detection runs at process time.
+    from ..services.vendor_detection import fast_detection_context
+    with fast_detection_context():
+        out = _detect_files_cached(batch_id, files)
     return {"batch_id": batch_id, "files": out}
 
 

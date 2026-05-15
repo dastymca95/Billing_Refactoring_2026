@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from ..services.ai_fallback import get_service
+from ..services import ai_provider
 
 
 router = APIRouter(prefix="/api/ai", tags=["ai_fallback"])
@@ -17,14 +17,19 @@ router = APIRouter(prefix="/api/ai", tags=["ai_fallback"])
 
 @router.get("/status")
 def get_ai_status() -> dict:
-    svc = get_service()
-    s = svc.status()
+    payload = ai_provider.status_payload()
+    # Keep legacy keys used by the existing badge while adding the
+    # Phase AI-1 provider-neutral fields.
     return {
-        "enabled": s.enabled,
-        "provider": s.provider,
-        "configured": s.configured,
-        "reason": s.reason,
-        "policy": s.policy,
-        "max_cost_per_batch_usd": s.max_cost_per_batch_usd,
-        "allowed_tasks": s.allowed_tasks,
+        **payload,
+        "reason": payload["message"],
+        "policy": "invoice_extraction_candidates",
+        "max_cost_per_batch_usd": None,
+        "allowed_tasks": [
+            "variable vendor invoice extraction",
+            "line item reading",
+            "vendor matching",
+            "GL mapping suggestions",
+            "total validation",
+        ],
     }

@@ -1,134 +1,140 @@
-// Phase 1H — workspace toolbar.
-//
-// Tool buttons (select / draw / pan / delete / zoom in/out / reset zoom)
-// plus a region-label dropdown that controls which label new draws get.
-
-import type { RegionLabel } from "../../types";
-import { REGION_LABEL_OPTIONS, type Tool } from "./types";
-
 type Props = {
-  tool: Tool;
-  onToolChange: (t: Tool) => void;
   zoom: number;
   onZoomIn: () => void;
   onZoomOut: () => void;
   onResetZoom: () => void;
-  drawLabel: RegionLabel;
-  onDrawLabelChange: (l: RegionLabel) => void;
   pageNumber: number;
   pageCount: number;
+  isLayoutReady?: boolean;
   onPrevPage: () => void;
   onNextPage: () => void;
   regionsCount: number;
+  traceCount?: number;
+  tracesEnabled?: boolean;
+  onToggleTraces?: () => void;
 };
 
 export function ViewerToolbar({
-  tool,
-  onToolChange,
   zoom,
   onZoomIn,
   onZoomOut,
   onResetZoom,
-  drawLabel,
-  onDrawLabelChange,
   pageNumber,
   pageCount,
+  isLayoutReady = true,
   onPrevPage,
   onNextPage,
   regionsCount,
+  traceCount = 0,
+  tracesEnabled = false,
+  onToggleTraces,
 }: Props) {
+  const hasTraces = traceCount > 0 && onToggleTraces;
+
   return (
     <div className="viewer-toolbar">
-      <div className="toolbar-group">
+      <div className="toolbar-group toolbar-group-page">
         <button
-          className={`tool-btn ${tool === "select" ? "active" : ""}`}
-          onClick={() => onToolChange("select")}
-          title="Select / move regions"
-        >
-          ↖ Select
-        </button>
-        <button
-          className={`tool-btn ${tool === "draw" ? "active" : ""}`}
-          onClick={() => onToolChange("draw")}
-          title="Mark a field on the page"
-        >
-          ▭ Draw
-        </button>
-        <button
-          className={`tool-btn ${tool === "pan" ? "active" : ""}`}
-          onClick={() => onToolChange("pan")}
-          title="Pan the page"
-        >
-          ✋ Pan
-        </button>
-        <button
-          className={`tool-btn ${tool === "delete" ? "active" : ""}`}
-          onClick={() => onToolChange("delete")}
-          title="Click a region to delete it"
-        >
-          ✕ Delete
-        </button>
-      </div>
-
-      <div className="toolbar-group">
-        <label className="toolbar-label">
-          Field:
-          <select
-            className="toolbar-select"
-            value={drawLabel}
-            onChange={(e) => onDrawLabelChange(e.target.value as RegionLabel)}
-          >
-            {REGION_LABEL_OPTIONS.map((o) => (
-              <option key={o.label} value={o.label}>
-                {o.title}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      <div className="toolbar-group">
-        <button
-          className="tool-btn"
+          className="tool-btn tool-btn-icon"
           onClick={onPrevPage}
-          disabled={pageNumber <= 1}
+          disabled={!isLayoutReady || pageNumber <= 1}
           title="Previous page"
+          aria-label="Previous page"
         >
-          ‹
+          &lt;
         </button>
         <span className="toolbar-page">
           Page {pageNumber} / {pageCount || "?"}
         </span>
         <button
-          className="tool-btn"
+          className="tool-btn tool-btn-icon"
           onClick={onNextPage}
-          disabled={pageNumber >= pageCount}
+          disabled={!isLayoutReady || pageNumber >= pageCount}
           title="Next page"
+          aria-label="Next page"
         >
-          ›
+          &gt;
         </button>
       </div>
 
-      <div className="toolbar-group">
-        <button className="tool-btn" onClick={onZoomOut} title="Zoom out">
-          −
+      <div className="toolbar-group toolbar-group-zoom">
+        <button
+          className="tool-btn tool-btn-icon"
+          onClick={onZoomOut}
+          disabled={!isLayoutReady}
+          title="Zoom out"
+          aria-label="Zoom out"
+        >
+          -
         </button>
         <button
           className="tool-btn tool-btn-narrow"
           onClick={onResetZoom}
+          disabled={!isLayoutReady}
           title="Reset zoom"
         >
-          {Math.round(zoom * 100)}%
+          {isLayoutReady ? (
+            `${Math.round(zoom * 100)}%`
+          ) : (
+            <span className="toolbar-zoom-loading" aria-hidden />
+          )}
         </button>
-        <button className="tool-btn" onClick={onZoomIn} title="Zoom in">
+        <button
+          className="tool-btn tool-btn-icon"
+          onClick={onZoomIn}
+          disabled={!isLayoutReady}
+          title="Zoom in"
+          aria-label="Zoom in"
+        >
           +
         </button>
       </div>
 
       <div className="toolbar-spacer" />
-      <div className="toolbar-meta">
-        {regionsCount} mark{regionsCount === 1 ? "" : "s"} on this page
-      </div>
+
+      {regionsCount > 0 && (
+        <div className="toolbar-meta">
+          {regionsCount} mark{regionsCount === 1 ? "" : "s"}
+        </div>
+      )}
+
+      {hasTraces && (
+        <button
+          type="button"
+          className={`pdf-trace-toggle ${tracesEnabled ? "is-on" : ""}`}
+          onClick={onToggleTraces}
+          title={
+            tracesEnabled
+              ? `Hide extraction traces (${traceCount})`
+              : `Show extraction traces (${traceCount})`
+          }
+          aria-label={
+            tracesEnabled
+              ? `Hide extraction traces (${traceCount})`
+              : `Show extraction traces (${traceCount})`
+          }
+          aria-pressed={tracesEnabled}
+          data-testid="pdf-trace-toggle"
+        >
+          <svg
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M4 7h10" />
+            <path d="M4 12h16" />
+            <path d="M4 17h7" />
+          </svg>
+          <span>Traces</span>
+          <span className="pdf-trace-count">{traceCount}</span>
+        </button>
+      )}
     </div>
   );
 }

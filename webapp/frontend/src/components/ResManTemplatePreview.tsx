@@ -8,6 +8,19 @@ function isMissing(value: unknown) {
 }
 
 export type CellEdits = Record<number, Record<string, unknown>>;
+export type GridCellSuggestion = {
+  label: string;
+  value: string;
+  detail?: string;
+  disabled?: boolean;
+};
+export type GridCellSuggestionConfig = {
+  title: string;
+  items: GridCellSuggestion[];
+  emptyText?: string;
+  onApply: (value: string, item: GridCellSuggestion) => void;
+  onRegenerate?: () => void;
+};
 
 type Props = {
   preview: PreviewResponse | null;
@@ -40,6 +53,18 @@ type Props = {
   // bounding rect so the popover can position itself.
   onColumnFilterClick?: (column: string, anchorRect: DOMRect) => void;
   filteredColumns?: Set<string> | null;
+  getCellAiSuggestions?: (
+    rowIndex: number,
+    column: string,
+    row: PreviewRow,
+  ) => GridCellSuggestionConfig | null;
+  getCellDisplayValue?: (
+    rowIndex: number,
+    column: string,
+    row: PreviewRow,
+    value: unknown,
+  ) => unknown;
+  getDocumentUrl?: (row: PreviewRow) => string;
 };
 
 type ColumnCategory = "required" | "recommended" | "optional";
@@ -58,6 +83,9 @@ export function ResManTemplatePreview({
   onSelectCell,
   onColumnFilterClick,
   filteredColumns = null,
+  getCellAiSuggestions,
+  getCellDisplayValue,
+  getDocumentUrl,
 }: Props) {
   const [editing, setEditing] = useState<{ row: number; col: string } | null>(
     null,
@@ -180,6 +208,11 @@ export function ResManTemplatePreview({
               if (visibleRowIndexes && !visibleRowIndexes.has(i)) return null;
               const reasons = r._meta?.manual_review_reasons ?? [];
               const isFlagged = reasons.length > 0;
+              const isAiGenerated = r._meta?.ai_generated === true;
+              const isAiLowConfidence =
+                r._meta?.ai_confidence_low === true ||
+                (typeof r._meta?.ai_confidence === "number" &&
+                  r._meta.ai_confidence < 0.7);
               const rowEdits = edits[i] ?? {};
               const isSelected = selectedRowIndex === i;
               const isCurrentDocumentPage =
@@ -188,6 +221,8 @@ export function ResManTemplatePreview({
                 isFlagged ? "review-row" : "",
                 isSelected ? "selected-row" : "",
                 isCurrentDocumentPage ? "document-page-row" : "",
+                isAiGenerated ? "ai-generated-row" : "",
+                isAiLowConfidence ? "ai-low-confidence-row" : "",
               ]
                 .filter(Boolean)
                 .join(" ");
@@ -198,7 +233,11 @@ export function ResManTemplatePreview({
                 <tr
                   key={i}
                   className={rowClasses}
-                  title={reasons.join("; ")}
+                  title={[
+                    ...reasons,
+                    isAiGenerated ? "AI extracted candidate" : "",
+                    isAiLowConfidence ? "Low AI confidence" : "",
+                  ].filter(Boolean).join("; ")}
                   onClick={handleRowClick}
                   data-testid="template-row"
                   data-source-file={
@@ -217,14 +256,31 @@ export function ResManTemplatePreview({
                     const cellMissing = isRequired && isMissing(value);
                     const isAmount = c === "Amount";
                     const isUrl = c === "Document Url";
+                    const fallbackDocumentUrl =
+                      isUrl && getDocumentUrl ? getDocumentUrl(r) : "";
                     const isEditingCell =
                       editing?.row === i && editing?.col === c;
+                    const displayValue =
+                      !isEditingCell && getCellDisplayValue
+                        ? getCellDisplayValue(i, c, r, value)
+                        : value;
+                    const aiSuggestions =
+                      !isEditingCell && getCellAiSuggestions
+                        ? getCellAiSuggestions(i, c, r)
+                        : null;
 
+                    const aiFlags = r._meta?.ai_validation_flags ?? [];
+                    const isAiIssueCell =
+                      isAiGenerated &&
+                      (isAiLowConfidence ||
+                        (isRequired && aiFlags.some((flag) =>
+                          /missing|invalid|mapping|ambiguous|failed/.test(flag),
+                        )));
                     const baseClass = `${isAmount ? "num" : ""} ${
                       cellMissing ? "error-row" : ""
-                    } cell-${cat}`;
+                    } cell-${cat} ${isAiIssueCell ? "ai-low-confidence-cell" : ""}`;
                     const style: React.CSSProperties = {
-                      ...(cellMissing ? { background: "#ffebe9" } : null),
+                      ...(cellMissing ? { background: "rgba(245, 158, 11, 0.10)" } : null),
                       ...(overridden && !cellMissing
                         ? {
                             background: "#dafbe1",
@@ -234,7 +290,7 @@ export function ResManTemplatePreview({
                         : null),
                       cursor: isEditingCell ? "text" : "cell",
                       maxWidth: 280,
-                      overflow: "hidden",
+                      overflow: aiSuggestions ? "visible" : "hidden",
                       textOverflow: "ellipsis",
                     };
 
@@ -243,7 +299,9 @@ export function ResManTemplatePreview({
                     return (
                       <td
                         key={c}
-                        className={`${baseClass} ${isSelectedCell ? "selected-cell" : ""}`}
+                        className={`${baseClass} ${isSelectedCell ? "selected-cell" : ""} ${
+                          aiSuggestions ? "cell-has-ai-suggestions" : ""
+                        }`}
                         style={style}
                         onClick={() => {
                           // Single click selects the cell so right-click /
@@ -268,7 +326,11 @@ export function ResManTemplatePreview({
                           });
                         }}
                         title={
-                          overridden ? `Original: ${original ?? ""}` : undefined
+                          [
+                            overridden ? `Original: ${original ?? ""}` : "",
+                            isAiGenerated ? `AI extracted${typeof r._meta?.ai_confidence === "number" ? ` · confidence ${(r._meta.ai_confidence * 100).toFixed(0)}%` : ""}` : "",
+                            isAiIssueCell && aiFlags.length ? aiFlags.join("; ") : "",
+                          ].filter(Boolean).join("\n") || undefined
                         }
                       >
                         {isEditingCell ? (
@@ -293,25 +355,40 @@ export function ResManTemplatePreview({
                               font: "inherit",
                             }}
                           />
-                        ) : isUrl && typeof value === "string" && value ? (
-                          <a
-                            className="doc-url-icon"
-                            href={value as string}
-                            target="_blank"
-                            rel="noreferrer"
-                            onClick={(e) => e.stopPropagation()}
-                            title="Open support document"
-                          >
-                            Open
-                          </a>
-                        ) : isUrl ? (
-                          <span className="doc-url-empty">-</span>
-                        ) : isAmount && typeof value === "number" ? (
-                          value.toFixed(2)
-                        ) : value == null ? (
-                          ""
                         ) : (
-                          String(value)
+                          <div className="template-cell-shell">
+                            <span
+                              className={`template-cell-value ${
+                                isMissing(value) && !isMissing(displayValue)
+                                  ? "is-provisional"
+                                  : ""
+                              }`}
+                            >
+                              {isUrl && ((typeof value === "string" && value) || fallbackDocumentUrl) ? (
+                                <a
+                                  className="doc-url-icon"
+                                  href={(typeof value === "string" && value ? value : fallbackDocumentUrl) as string}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  title={typeof value === "string" && value ? "Open Dropbox/support document" : "Open source document"}
+                                >
+                                  {typeof value === "string" && value ? "Open" : "Source"}
+                                </a>
+                              ) : isUrl ? (
+                                <span className="doc-url-empty">-</span>
+                              ) : isAmount && typeof displayValue === "number" ? (
+                                displayValue.toFixed(2)
+                              ) : displayValue == null ? (
+                                ""
+                              ) : (
+                                String(displayValue)
+                              )}
+                            </span>
+                            {aiSuggestions && (
+                              <GridCellAiControl config={aiSuggestions} />
+                            )}
+                          </div>
                         )}
                       </td>
                     );
@@ -323,6 +400,76 @@ export function ResManTemplatePreview({
         </table>
       </div>
     </div>
+  );
+}
+
+function GridCellAiControl({ config }: { config: GridCellSuggestionConfig }) {
+  const [open, setOpen] = useState(false);
+  const items = config.items || [];
+  return (
+    <span className="grid-cell-ai" onClick={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        className={`grid-cell-ai-trigger ${open ? "is-open" : ""}`}
+        title={config.title}
+        aria-label={config.title}
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3z" />
+          <path d="M19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14z" />
+        </svg>
+      </button>
+      {open && (
+        <div className="grid-cell-ai-menu" role="menu">
+          <div className="grid-cell-ai-head">
+            <span>{config.title}</span>
+            {config.onRegenerate && (
+              <button
+                type="button"
+                onClick={() => config.onRegenerate?.()}
+                title="Generate another suggestion set"
+              >
+                New set
+              </button>
+            )}
+          </div>
+          <div className="grid-cell-ai-list">
+            {items.length === 0 ? (
+              <span className="grid-cell-ai-empty">
+                {config.emptyText || "No suggestions available"}
+              </span>
+            ) : (
+              items.map((item, idx) => (
+                <button
+                  type="button"
+                  key={`${item.value}-${idx}`}
+                  disabled={item.disabled}
+                  onClick={() => {
+                    config.onApply(item.value, item);
+                    setOpen(false);
+                  }}
+                >
+                  <strong>{item.label}</strong>
+                  {item.detail && <span>{item.detail}</span>}
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </span>
   );
 }
 

@@ -3,6 +3,7 @@
 import type {
   AiFallbackPolicy,
   AiStatus,
+  AiVisionAssistResponse,
   BatchListEntry,
   BatchProgress,
   BatchStatus,
@@ -10,6 +11,7 @@ import type {
   ExportResponse,
   FilePreview,
   FilesResponse,
+  IngestionPreviewResponse,
   ManualReviewResponse,
   PreviewResponse,
   ProcessResult,
@@ -95,6 +97,77 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
     });
   }
   return (await res.json()) as T;
+}
+
+type UploadProgressEvent = {
+  loaded: number;
+  total: number;
+  percent: number;
+};
+
+function uploadWithProgress<T>(
+  url: string,
+  body: FormData,
+  onProgress: (progress: UploadProgressEvent) => void,
+  fallbackTotal: number,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.responseType = "text";
+
+    xhr.upload.onprogress = (event) => {
+      const total =
+        event.lengthComputable && event.total > 0 ? event.total : fallbackTotal;
+      const loaded = Math.min(event.loaded || 0, total || event.loaded || 0);
+      const percent = total > 0 ? Math.round((loaded / total) * 100) : 0;
+      onProgress({ loaded, total, percent });
+    };
+
+    xhr.onload = () => {
+      const rawBody = typeof xhr.responseText === "string" ? xhr.responseText : "";
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const { detail } = parseErrorBody(rawBody);
+        const message =
+          detailMessage(detail) ||
+          (xhr.status === 422
+            ? "Some information is invalid. Please review and try again."
+            : xhr.statusText || "Request failed.");
+        reject(
+          new ApiError(message, {
+            status: xhr.status,
+            statusText: xhr.statusText,
+            detail,
+            rawBody,
+          }),
+        );
+        return;
+      }
+
+      try {
+        resolve(rawBody ? (JSON.parse(rawBody) as T) : ({} as T));
+      } catch {
+        reject(
+          new ApiError("Backend returned an invalid upload response.", {
+            status: xhr.status,
+            statusText: xhr.statusText,
+            detail: rawBody,
+            rawBody,
+          }),
+        );
+      }
+    };
+
+    xhr.onerror = () => {
+      reject(new TypeError("Could not reach the backend."));
+    };
+
+    xhr.onabort = () => {
+      reject(new Error("Upload was cancelled."));
+    };
+
+    xhr.send(body);
+  });
 }
 
 export function getFriendlyErrorMessage(error: unknown, context?: string): string {
@@ -216,9 +289,21 @@ export const api = {
     return jsonOrThrow<BatchProgress>(res);
   },
 
-  async uploadFile(batchId: string, file: File) {
+  async uploadFile(
+    batchId: string,
+    file: File,
+    onProgress?: (progress: UploadProgressEvent) => void,
+  ) {
     const fd = new FormData();
     fd.append("file", file);
+    if (onProgress) {
+      return uploadWithProgress<{ filename: string; size_bytes: number }>(
+        `/api/batches/${batchId}/upload`,
+        fd,
+        onProgress,
+        file.size,
+      );
+    }
     const res = await fetch(`/api/batches/${batchId}/upload`, {
       method: "POST",
       body: fd,
@@ -247,6 +332,13 @@ export const api = {
     return jsonOrThrow<FilePreview>(res);
   },
 
+  async ingestionPreview(batchId: string, filename: string) {
+    const res = await fetch(
+      `/api/batches/${batchId}/files/${encodeURIComponent(filename)}/ingestion-preview`,
+    );
+    return jsonOrThrow<IngestionPreviewResponse>(res);
+  },
+
   fileRawUrl(batchId: string, filename: string) {
     return `/api/batches/${batchId}/files/${encodeURIComponent(filename)}/raw`;
   },
@@ -263,9 +355,19 @@ export const api = {
   // frontend polls /progress until status=completed|failed, then re-fetches
   // /preview and /manual-review. Pass `sync=true` for the legacy blocking
   // behaviour (used by tests).
-  async process(batchId: string, opts: { sync?: boolean } = {}) {
-    const url = opts.sync
-      ? `/api/batches/${batchId}/process?sync=1`
+  async process(
+    batchId: string,
+    opts: { sync?: boolean; file?: string; fileMode?: "replace" | "merge" } = {},
+  ) {
+    // Phase 2M — pass ``file`` to process a single file inside the
+    // batch. Single-file runs are always sync on the server.
+    const params = new URLSearchParams();
+    if (opts.sync || opts.file) params.set("sync", "1");
+    if (opts.file) params.set("file", opts.file);
+    if (opts.fileMode) params.set("file_mode", opts.fileMode);
+    const qs = params.toString();
+    const url = qs
+      ? `/api/batches/${batchId}/process?${qs}`
       : `/api/batches/${batchId}/process`;
     const res = await fetch(url, { method: "POST" });
     return jsonOrThrow<ProcessResult | { status: string; polling_url: string }>(
@@ -319,6 +421,25 @@ export const api = {
   },
 
   // ---- Phase 1H — region hints ----------------------------------------
+  async aiVisionAssist(
+    batchId: string,
+    body: {
+      filename: string;
+      page_numbers?: number[];
+      vendor_hint?: string;
+      document_text?: string;
+      current_extraction?: Record<string, unknown> | null;
+      dry_run?: boolean;
+    },
+  ) {
+    const res = await fetch(`/api/batches/${batchId}/ai-invoice/vision-assist`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dry_run: true, ...body }),
+    });
+    return jsonOrThrow<AiVisionAssistResponse>(res);
+  },
+
   async listRegions(batchId: string) {
     const res = await fetch(`/api/batches/${batchId}/regions`);
     return jsonOrThrow<RegionHintsResponse>(res);
@@ -451,6 +572,254 @@ export const api = {
       vendor_key: string;
       correction_id: string;
       deleted: true;
+    }>(res);
+  },
+
+  async aiVendorCandidates(detectedVendor: string) {
+    const res = await fetch(
+      `/api/ai-review/vendor-candidates?detected_vendor=${encodeURIComponent(detectedVendor)}`,
+    );
+    return jsonOrThrow<import("./types").AiVendorCandidatesResponse>(res);
+  },
+
+  async aiGlCandidates(params: {
+    line_item_description: string;
+    vendor_name?: string;
+    ai_suggested_gl?: string;
+  }) {
+    const qs = new URLSearchParams({
+      line_item_description: params.line_item_description,
+      vendor_name: params.vendor_name || "",
+      ai_suggested_gl: params.ai_suggested_gl || "",
+      limit: "8",
+    });
+    const res = await fetch(`/api/ai-review/gl-candidates?${qs.toString()}`);
+    return jsonOrThrow<import("./types").AiGlCandidatesResponse>(res);
+  },
+
+  async applyAiVendorMapping(
+    batchId: string,
+    body: {
+      detected_vendor: string;
+      selected_vendor_name: string;
+      vendor_id?: string;
+      row_index?: number | null;
+      save_for_future?: boolean;
+      apply_scope?: "current_invoice" | "batch";
+    },
+  ) {
+    const res = await fetch(`/api/batches/${batchId}/ai-review/vendor-mapping`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return jsonOrThrow<{
+      batch_id: string;
+      applied_rows: number;
+      selected_vendor_name: string;
+      saved_mapping: Record<string, unknown> | null;
+    }>(res);
+  },
+
+  async applyAiGlMapping(
+    batchId: string,
+    body: {
+      row_index: number;
+      gl_account: string;
+      gl_name?: string;
+      save_for_future?: boolean;
+      apply_to_similar?: boolean;
+      pattern?: string;
+    },
+  ) {
+    const res = await fetch(`/api/batches/${batchId}/ai-review/gl-mapping`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return jsonOrThrow<{
+      batch_id: string;
+      applied_rows: number;
+      gl_account: string;
+      gl_name: string;
+      saved_mapping: Record<string, unknown> | null;
+    }>(res);
+  },
+
+  async aiPropertyCandidates(params: {
+    query?: string;
+    service_address?: string;
+  }) {
+    const qs = new URLSearchParams({
+      query: params.query || "",
+      service_address: params.service_address || "",
+    });
+    const res = await fetch(`/api/ai-review/property-candidates?${qs.toString()}`);
+    return jsonOrThrow<import("./types").AiPropertyCandidatesResponse>(res);
+  },
+
+  async aiLocationCandidates(params: {
+    property_abbreviation: string;
+    query?: string;
+  }) {
+    const qs = new URLSearchParams({
+      property_abbreviation: params.property_abbreviation,
+      query: params.query || "",
+    });
+    const res = await fetch(`/api/ai-review/location-candidates?${qs.toString()}`);
+    return jsonOrThrow<import("./types").AiLocationCandidatesResponse>(res);
+  },
+
+  async invoiceFormatRules() {
+    const res = await fetch("/api/invoice-format-rules");
+    return jsonOrThrow<import("./types").InvoiceFormatRulesPayload>(res);
+  },
+
+  async saveInvoiceFormatRules(config: import("./types").InvoiceFormatRulesConfig) {
+    const res = await fetch("/api/invoice-format-rules", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config }),
+    });
+    return jsonOrThrow<{ ok: true; config: import("./types").InvoiceFormatRulesConfig }>(res);
+  },
+
+  async previewInvoiceFormatRules(body: {
+    config?: import("./types").InvoiceFormatRulesConfig;
+    sample?: Record<string, unknown>;
+  }) {
+    const res = await fetch("/api/invoice-format-rules/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return jsonOrThrow<{ preview: Record<string, string> }>(res);
+  },
+
+  async canonicalRules() {
+    const res = await fetch("/api/canonical-rules");
+    return jsonOrThrow<import("./types").CanonicalRulesPayload>(res);
+  },
+
+  async canonicalRuleCategory(category: string) {
+    const res = await fetch(`/api/canonical-rules/${encodeURIComponent(category)}`);
+    return jsonOrThrow<import("./types").CanonicalCategoryPayload>(res);
+  },
+
+  async validateCanonicalRules(body: {
+    config?: Record<string, unknown>;
+    category?: string;
+    patch?: Record<string, unknown>;
+  }) {
+    const res = await fetch("/api/canonical-rules/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return jsonOrThrow<import("./types").CanonicalRulesValidationResponse>(res);
+  },
+
+  async patchCanonicalRuleCategory(category: string, patch: Record<string, unknown>) {
+    const res = await fetch(`/api/canonical-rules/${encodeURIComponent(category)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ patch }),
+    });
+    return jsonOrThrow<{
+      result: Record<string, unknown>;
+      category: import("./types").CanonicalCategoryPayload;
+    }>(res);
+  },
+
+  async restoreCanonicalRules() {
+    const res = await fetch("/api/canonical-rules/restore", { method: "POST" });
+    return jsonOrThrow<{ ok: true; restored_from: string }>(res);
+  },
+
+  async previewCanonicalRulesImport() {
+    const res = await fetch("/api/canonical-rules/import-preview", { method: "POST" });
+    return jsonOrThrow<import("./types").CanonicalRulesImportPreview>(res);
+  },
+
+  async applyCanonicalRulesImport() {
+    const res = await fetch("/api/canonical-rules/import-apply", { method: "POST" });
+    return jsonOrThrow<{ ok: true; backup_path: string; preview: import("./types").CanonicalRulesImportPreview }>(res);
+  },
+
+  async canonicalRulesTestFixtures() {
+    const res = await fetch("/api/canonical-rules/test-fixtures");
+    return jsonOrThrow<import("./types").CanonicalRulesFixtureList>(res);
+  },
+
+  async runCanonicalRulesTestBench(body: {
+    test_case?: string;
+    fixture_key?: string;
+    category?: string;
+    draft_patch?: Record<string, unknown>;
+    run_all?: boolean;
+  }) {
+    const res = await fetch("/api/canonical-rules/test-bench", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return jsonOrThrow<import("./types").CanonicalRulesTestBenchResponse>(res);
+  },
+
+  async runAllCanonicalRulesFixtures(body: {
+    category?: string;
+    draft_patch?: Record<string, unknown>;
+  } = {}) {
+    const res = await fetch("/api/canonical-rules/test-bench", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, run_all: true }),
+    });
+    return jsonOrThrow<import("./types").CanonicalRulesRunAllResponse>(res);
+  },
+
+  async applyAiPropertyLocation(
+    batchId: string,
+    body: {
+      row_index: number;
+      property_abbreviation: string;
+      location?: string;
+      service_address?: string;
+      save_for_future?: boolean;
+      apply_scope?: "current_invoice" | "batch";
+      leave_location_blank?: boolean;
+    },
+  ) {
+    const res = await fetch(`/api/batches/${batchId}/ai-review/property-location`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return jsonOrThrow<{
+      batch_id: string;
+      applied_rows: number;
+      property_abbreviation: string;
+      location: string;
+      saved_mapping: Record<string, unknown> | null;
+    }>(res);
+  },
+
+  async applyAiTaxPolicy(
+    batchId: string,
+    body: {
+      row_index: number;
+      policy: "manual_review" | "distribute_proportionally" | "separate_tax_line" | "exclude_tax";
+    },
+  ) {
+    const res = await fetch(`/api/batches/${batchId}/ai-review/tax-policy`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return jsonOrThrow<{
+      batch_id: string;
+      applied_rows: number;
+      policy: string;
     }>(res);
   },
 
