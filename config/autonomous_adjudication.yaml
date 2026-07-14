@@ -1,0 +1,12 @@
+schema_version: autonomous-adjudication-policy/1.0
+autonomous_adjudication:
+  required_field_confidence: 0.90
+  property_confidence: 0.92
+  responsibility_confidence: 0.90
+  gl_confidence: 0.88
+  supported_single_source_confidence: 0.95
+  arithmetic_tolerance: 0.01
+  arithmetic_must_pass: true
+  unresolved_material_conflicts_allowed: 0
+  independent_model_voting_max_calls: 2
+  strong_reasoner_shadow_only: true

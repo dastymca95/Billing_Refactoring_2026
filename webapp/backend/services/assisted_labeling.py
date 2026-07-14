@@ -13,7 +13,7 @@ from .private_labeling_workspace import PrivateLabelingWorkspace, WorkspaceError
 from .reviewer_1_pilot import Reviewer1Pilot
 
 
-PROFILE_VERSION = "assisted-labeling/deterministic-extraction-accounting-v2-1.2"
+PROFILE_VERSION = "assisted-labeling/deterministic-extraction-accounting-v2-1.3"
 FIELD_ACTIONS = {"accept", "correct", "reject", "unknown", "unreadable", "not_applicable"}
 
 
@@ -230,7 +230,8 @@ class AssistedLabelingService:
             if decision.get("selected_gl_code"):
                 gl = {"gl_code": decision["selected_gl_code"], "gl_name": decision.get("selected_gl_name"),
                       "source": "AccountingDecisionEngine", "decision_version": decision.get("decision_version"),
-                      "review_required": decision.get("review_required", True), "status": "unverified"}
+                      "review_required": decision.get("review_required", True),
+                      "confidence": decision.get("confidence", 0), "status": "unverified"}
             return meta.get("semantic_classification"), gl
         except Exception:
             return None, None
