@@ -368,9 +368,17 @@ def select_stratified(items: list[dict[str, Any]], duplicate_members: set[str]) 
     reserve_used = set(used)
     reserve_vendor: Counter[str] = Counter()
     reserve_template: Counter[str] = Counter()
-    reserve_candidates = [item for item in eligible if item["benchmark_id"] not in reserve_used]
-    reserve_candidates.sort(key=lambda item: (item["complexity_tier"], item["benchmark_id"]))
-    reserve = pick(reserve_candidates, 20, "reserve", reserve_used, reserve_vendor, reserve_template)
+    reserve = []
+    for bucket in SELECTION_TARGETS:
+        reserve_candidates = [item for item in eligible if item["benchmark_id"] not in reserve_used
+                              and bucket in item["selection_bucket_candidates"]]
+        reserve_candidates.sort(key=lambda item: selection_rank(item, bucket))
+        reserve.extend(pick(reserve_candidates, 2, bucket, reserve_used, reserve_vendor, reserve_template))
+    if len(reserve) < 20:
+        reserve_candidates = [item for item in eligible if item["benchmark_id"] not in reserve_used]
+        reserve_candidates.sort(key=lambda item: (item["complexity_tier"], item["benchmark_id"]))
+        reserve.extend(pick(reserve_candidates, 20 - len(reserve), "unknown_unusual",
+                            reserve_used, reserve_vendor, reserve_template))
     return selected, reserve, warnings
 
 
