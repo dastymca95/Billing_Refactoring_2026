@@ -866,6 +866,11 @@ def export_batch(batch_id: str, edited_rows: Optional[list[dict[str, Any]]] = No
 
     # ---- Path A: edited export (frontend sent the table state) ----
     if edited_rows is not None:
+        from .validated_export_bridge import ExportAuthorizationError, ReadinessValidatedExporter
+        try:
+            readiness = ReadinessValidatedExporter().authorize(batch_id, edited_rows)
+        except ExportAuthorizationError as exc:
+            return {"batch_id": batch_id, "exported": [], "reason": exc.code, "blockers": exc.blockers}
         _validate_resman_export_required_rows(edited_rows)
         if not RESMAN_TEMPLATE.is_file():
             return {
@@ -886,6 +891,7 @@ def export_batch(batch_id: str, edited_rows: Optional[list[dict[str, Any]]] = No
             "export_used_edited_rows": True,
             "edited_rows_count": len(edited_rows),
             "rows_written": rows_written,
+            "accounting_readiness": readiness,
         }
 
     # ---- Path B: legacy export (copy latest per-vendor processed xlsx) ----
@@ -900,15 +906,8 @@ def export_batch(batch_id: str, edited_rows: Optional[list[dict[str, Any]]] = No
         candidates = sorted(vendor_dir.glob("*_resman_import_*.xlsx"))
         if not candidates:
             continue
-        latest = candidates[-1]
-        dest = export_dir / latest.name
-        shutil.copy2(latest, dest)
-        exported.append({
-            "vendor_key": vendor_dir.name,
-            "source_path": str(latest),
-            "export_path": str(dest),
-            "filename": dest.name,
-        })
+        return {"batch_id": batch_id, "exported": [], "reason": "legacy_export_disabled",
+                "export_used_edited_rows": False}
 
     return {
         "batch_id": batch_id,
