@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .gl_payability import is_payable_gl_account
+from .economic_responsibility import FilenameFolderContextParser
 
 
 TRIAGE_DECISIONS = {
@@ -37,6 +38,9 @@ REQUIRED_LINE_FIELDS = {
     "capital_context", "expected_gl", "acceptable_alternative_gls", "should_review",
     "should_block", "reasoning_notes", "evidence",
 }
+RESPONSIBILITY_FIELDS = {"payment_source", "economic_bearer", "settlement_treatment", "allocation_scope", "evidence"}
+LINE_RESPONSIBILITY_FIELDS = {"economic_bearer", "settlement_treatment", "allocation_scope", "allocation_targets",
+                              "responsibility_evidence"}
 
 
 class WorkspaceError(RuntimeError):
@@ -109,9 +113,20 @@ class PrivateLabelingWorkspace:
             "preview_url": f"/api/private-workspace/document/{benchmark_id}/preview",
             "preview_rotation_degrees": self.preview_rotation(benchmark_id),
             "reserve_candidates": self.replacement_candidates(benchmark_id, limit=5),
+            "filename_folder_candidates": self._filename_folder_candidates(benchmark_id),
         }
         self._assert_blind(payload)
         return payload
+
+    def _filename_folder_candidates(self, benchmark_id: str) -> list[dict[str, Any]]:
+        item = self._inventory.get(benchmark_id, {})
+        relative = Path(item.get("private_relative_path", ""))
+        if not relative.name:
+            return []
+        facts = FilenameFolderContextParser().parse(benchmark_id, relative.name, relative.parent.parts)
+        return [{"candidate_type": candidate.candidate_type, "normalized_value": candidate.normalized_value,
+                 "source_kind": candidate.source_kind, "confidence": candidate.confidence,
+                 "authoritative": False} for candidate in facts.candidates]
 
     def private_document_path(self, benchmark_id: str) -> Path:
         item = self._inventory.get(benchmark_id)
@@ -287,7 +302,7 @@ class PrivateLabelingWorkspace:
         history = list(previous.get("audit_history", []))
         history.append({"timestamp": now, "reviewer_id": reviewer_id, "action": "autosave",
                         "previous_completion_status": previous.get("completion_status")})
-        payload = {"schema_version": "reviewer-1-label/1.0", "benchmark_id": benchmark_id,
+        payload = {"schema_version": "reviewer-1-label/2.0", "benchmark_id": benchmark_id,
                    "dataset_version": dataset_version, "reviewer_id": reviewer_id,
                    "created_at": previous.get("created_at") or now, "updated_at": now,
                    "completion_status": completion_status,
@@ -299,6 +314,43 @@ class PrivateLabelingWorkspace:
         self._atomic_json(self.labels_dir / ".crash_recovery.json",
                           {"last_saved_benchmark_id": benchmark_id, "updated_at": now})
         return payload
+
+    def migrate_reviewer_1_drafts_v2(self) -> dict[str, int]:
+        migrated = 0; already_current = 0
+        backup_dir = self.labels_dir / "_schema_v1_backup"
+        for path in self.labels_dir.glob("bench-*.json"):
+            payload = self._read_json(path, {})
+            if payload.get("schema_version") == "reviewer-1-label/2.0":
+                already_current += 1; continue
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup = backup_dir / path.name
+            if not backup.exists():
+                self._atomic_json(backup, payload)
+            unknown = {"status": "unknown", "reason": "requires reviewer_1 assessment after schema migration"}
+            document = dict(payload.get("document") or {})
+            document.setdefault("economic_responsibility", {
+                "payment_source": unknown, "economic_bearer": unknown, "settlement_treatment": unknown,
+                "allocation_scope": unknown, "allocation_targets": [], "evidence": []})
+            lines = []
+            for line in payload.get("line_items") or []:
+                migrated_line = dict(line)
+                migrated_line.setdefault("economic_bearer", unknown)
+                migrated_line.setdefault("settlement_treatment", unknown)
+                migrated_line.setdefault("allocation_scope", unknown)
+                migrated_line.setdefault("allocation_targets", [])
+                migrated_line.setdefault("responsibility_evidence", [])
+                lines.append(migrated_line)
+            now = utc_now(); history = list(payload.get("audit_history") or [])
+            history.append({"timestamp": now, "reviewer_id": "schema_migration",
+                            "action": "migrate_reviewer_1_label_1.0_to_2.0",
+                            "previous_schema_version": payload.get("schema_version")})
+            payload.update({"schema_version": "reviewer-1-label/2.0", "document": document,
+                            "line_items": lines, "updated_at": now, "validation_status": "invalid",
+                            "audit_history": history})
+            validation = validate_reviewer_1_label(payload, self.gl_catalog)
+            payload["validation_errors"] = validation
+            self._atomic_json(path, payload); migrated += 1
+        return {"migrated": migrated, "already_current": already_current}
 
     def latest_triage_decisions(self) -> dict[str, dict[str, Any]]:
         latest = {}
@@ -428,6 +480,13 @@ def validate_reviewer_1_label(label: Mapping[str, Any], gl_catalog) -> list[str]
     for field in REQUIRED_DOCUMENT_FIELDS:
         if not explicit_value(document.get(field)):
             errors.append(f"document.{field}:value_or_explicit_unknown_required")
+    responsibility = document.get("economic_responsibility") if isinstance(document.get("economic_responsibility"), Mapping) else {}
+    for field in RESPONSIBILITY_FIELDS:
+        value = responsibility.get(field)
+        if field == "evidence":
+            if not isinstance(value, list): errors.append("document.economic_responsibility.evidence:list_required")
+        elif not explicit_value(value):
+            errors.append(f"document.economic_responsibility.{field}:value_or_explicit_unknown_required")
     if not lines:
         errors.append("line_items:at_least_one_required")
     line_total = Decimal("0")
@@ -437,6 +496,12 @@ def validate_reviewer_1_label(label: Mapping[str, Any], gl_catalog) -> list[str]
             errors.append(f"line_items[{index}]:invalid"); continue
         for field in REQUIRED_LINE_FIELDS:
             if field not in line or not explicit_value(line.get(field)):
+                errors.append(f"line_items[{index}].{field}:value_or_explicit_unknown_required")
+        for field in LINE_RESPONSIBILITY_FIELDS:
+            value = line.get(field)
+            if field in {"allocation_targets", "responsibility_evidence"}:
+                if not isinstance(value, list): errors.append(f"line_items[{index}].{field}:list_required")
+            elif not explicit_value(value):
                 errors.append(f"line_items[{index}].{field}:value_or_explicit_unknown_required")
         gl = unwrap_value(line.get("expected_gl"))
         exceptional = bool(line.get("exceptional_gl"))

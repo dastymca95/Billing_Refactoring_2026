@@ -57,11 +57,18 @@ def valid_label(gl="6500", line_amount="10.00", total="10.00"):
             "vendor_normalization": "Private Vendor", "invoice_number": "I-1", "invoice_date": unknown,
             "due_date": unknown, "property": unknown, "service_address": unknown,
             "bill_or_credit": "bill", "total": total, "expected_route": "ai_vision",
-            "document_completeness": "complete", "reviewer_confidence": .9},
+            "document_completeness": "complete", "reviewer_confidence": .9,
+            "economic_responsibility": {"payment_source": "unpaid_vendor_invoice",
+                "economic_bearer": "property", "settlement_treatment": "property_direct_expense",
+                "allocation_scope": "single_property", "allocation_targets": [],
+                "evidence": [{"page": 1, "region": [0, 0, 1, 1]}]}},
             "line_items": [{"line_item_number": 1, "raw_description": "repair", "normalized_description": "repair",
                 "quantity": unknown, "unit_price": unknown, "amount": line_amount, "tax": unknown,
                 "location_unit": unknown, "line_family": "labor_service", "trade_family": "general",
                 "work_mode": "labor_service", "capital_context": "expense", "expected_gl": gl,
+                "economic_bearer": "property", "settlement_treatment": "property_direct_expense",
+                "allocation_scope": "single_property", "allocation_targets": [],
+                "responsibility_evidence": [{"page": 1, "region": [0, 0, 1, 1]}],
                 "acceptable_alternative_gls": [], "should_review": False, "should_block": False,
                 "reasoning_notes": "Service evidence on page one", "evidence": [{"page": 1, "region": [0, 0, 1, 1]}]}],
             "unresolved_questions": []}
@@ -183,3 +190,17 @@ def test_git_safe_status_contains_only_aggregates(tmp_path):
     rendered = workspace.safe_status_markdown()
     assert "bench-" not in rendered and "documents/" not in rendered and "Private Vendor" not in rendered
     assert "Selected documents: 120" in rendered
+
+
+def test_schema_v1_draft_migrates_to_v2_with_backup_and_audit(tmp_path):
+    workspace = build_workspace(tmp_path)
+    path = workspace.labels_dir / "bench-000.json"
+    path.write_text(json.dumps({"schema_version": "reviewer-1-label/1.0", "benchmark_id": "bench-000",
+                                "document": {}, "line_items": [], "audit_history": []}))
+    result = workspace.migrate_reviewer_1_drafts_v2()
+    migrated = json.loads(path.read_text())
+    assert result["migrated"] == 1
+    assert migrated["schema_version"] == "reviewer-1-label/2.0"
+    assert migrated["document"]["economic_responsibility"]["payment_source"]["status"] == "unknown"
+    assert migrated["audit_history"][-1]["action"] == "migrate_reviewer_1_label_1.0_to_2.0"
+    assert (workspace.labels_dir / "_schema_v1_backup/bench-000.json").is_file()
