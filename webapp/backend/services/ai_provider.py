@@ -287,7 +287,10 @@ def _send_chat_completion(
         except urllib.error.HTTPError as exc:
             safe_body = exc.read(1000).decode("utf-8", "replace")
             last_http_error = (exc.code, safe_body)
-            _LOG.warning("%s HTTP error %s: %s", label, exc.code, safe_body)
+            # Provider error bodies can echo masked or partial credentials.
+            # Preserve the body only in-process for capability/error handling;
+            # never emit it to normal logs.
+            _LOG.warning("%s HTTP error %s", label, exc.code)
             if vision and ("image_url" in safe_body or "expected `text`" in safe_body or "expected text" in safe_body):
                 raise AIProviderNotConfigured(
                     "The configured AI vision provider/model does not accept image input. "

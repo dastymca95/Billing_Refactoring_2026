@@ -58,19 +58,30 @@ class ModelRegistry:
 def default_registry() -> ModelRegistry:
     """Build policy from explicit environment configuration, not guesses."""
     provider = os.environ.get("AI_PROVIDER", "").strip().lower() or "unconfigured"
-    specs: list[ModelSpec] = []
+    specs: dict[str, ModelSpec] = {}
+
+    def add(model_id: str, model_provider: str, role: ModelRole, *,
+            supports_vision: bool = False, strong_reasoner: bool = False) -> None:
+        previous = specs.get(model_id)
+        roles = set(previous.roles) if previous else set()
+        roles.add(role)
+        specs[model_id] = ModelSpec(
+            model_id, model_provider, frozenset(roles),
+            supports_vision=supports_vision or bool(previous and previous.supports_vision),
+            strong_reasoner=strong_reasoner or bool(previous and previous.strong_reasoner),
+        )
     text = os.environ.get("AI_MODEL", "").strip()
     vision = os.environ.get("AI_VISION_MODEL", "").strip()
     strong = os.environ.get("AI_ACCOUNTING_REASONING_MODEL", "").strip()
     if text:
-        specs.append(ModelSpec(text, provider, frozenset({ModelRole.EXTRACTION_TEXT})))
+        add(text, provider, ModelRole.EXTRACTION_TEXT)
     if vision:
-        specs.append(ModelSpec(vision, os.environ.get("AI_VISION_PROVIDER", "").strip().lower() or provider,
-                               frozenset({ModelRole.EXTRACTION_VISION}), supports_vision=True))
+        add(vision, os.environ.get("AI_VISION_PROVIDER", "").strip().lower() or provider,
+            ModelRole.EXTRACTION_VISION, supports_vision=True)
     if strong:
-        specs.append(ModelSpec(strong, os.environ.get("AI_ACCOUNTING_REASONING_PROVIDER", "").strip().lower() or provider,
-                               frozenset({ModelRole.ACCOUNTING_REASONING}), strong_reasoner=True))
-    return ModelRegistry(specs)
+        add(strong, os.environ.get("AI_ACCOUNTING_REASONING_PROVIDER", "").strip().lower() or provider,
+            ModelRole.ACCOUNTING_REASONING, strong_reasoner=True)
+    return ModelRegistry(specs.values())
 
 
 class CapabilityDiscovery:

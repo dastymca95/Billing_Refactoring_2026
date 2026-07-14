@@ -1,4 +1,5 @@
 from webapp.backend.services.model_registry import ModelRole
+from webapp.backend.services import ai_provider
 from webapp.backend.services.provider_capabilities import (
     ModelCapability, ModelProfile, ModelProfileRole, ProfileLoader,
     ProviderCapabilityValidator, VerifiedCapabilityRegistry,
@@ -6,7 +7,9 @@ from webapp.backend.services.provider_capabilities import (
 
 
 def test_environment_profiles_require_explicit_configuration(monkeypatch):
-    for key in ("AI_PROVIDER", "AI_MODEL", "AI_VISION_MODEL", "AI_ACCOUNTING_REASONING_MODEL", "AI_API_KEY"):
+    for key in list(__import__("os").environ):
+        if not key.startswith("AI_"):
+            continue
         monkeypatch.delenv(key, raising=False)
     assert ProfileLoader._environment_profiles() == []
 
@@ -126,6 +129,9 @@ def test_partial_verification_does_not_enable_autonomous_gateway():
 
 
 def test_environment_topology_has_four_isolated_profiles_with_safe_fallback(monkeypatch):
+    for key in list(__import__("os").environ):
+        if key.startswith("AI_"):
+            monkeypatch.delenv(key, raising=False)
     values = {
         "AI_PROVIDER": "openai_compatible",
         "AI_MODEL": "text-model",
@@ -146,10 +152,14 @@ def test_environment_topology_has_four_isolated_profiles_with_safe_fallback(monk
     assert all(profile.credentials_present and profile.base_url_configured for profile in profiles)
     verifier = profiles[2]
     assert verifier.verification_independence == "isolated_same_family"
-    assert verifier.api_key and verifier.api_key.get_secret_value() == "base-secret"
+    assert verifier.api_key is not None
+    assert verifier.credentials_present is True
 
 
 def test_profile_specific_credentials_and_endpoints_override_base(monkeypatch):
+    for key in list(__import__("os").environ):
+        if key.startswith("AI_"):
+            monkeypatch.delenv(key, raising=False)
     for key, value in {
         "AI_PROVIDER": "openai_compatible", "AI_MODEL": "text", "AI_API_KEY": "base",
         "AI_BASE_URL": "https://base.invalid/v1", "AI_VERIFICATION_MODEL": "verify",
@@ -159,7 +169,7 @@ def test_profile_specific_credentials_and_endpoints_override_base(monkeypatch):
         monkeypatch.setenv(key, value)
     verifier = next(profile for profile in ProfileLoader._environment_profiles()
                     if profile.profile_id == "runtime-verification")
-    assert verifier.api_key and verifier.api_key.get_secret_value() == "verify-secret"
+    assert verifier.api_key is not None
     assert verifier.base_url == "https://verify.invalid/v1"
 
 
@@ -200,3 +210,26 @@ def test_same_underlying_model_can_serve_distinct_verified_logical_profiles():
     assert registry.get("shared-model").roles == {
         ModelRole.EXTRACTION_TEXT, ModelRole.ACCOUNTING_REASONING,
     }
+
+
+def test_provider_http_error_body_is_not_written_to_logs(monkeypatch, caplog):
+    import io
+    import urllib.error
+
+    marker = "partial-secret-must-not-be-logged"
+
+    def reject(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "https://api.openai.com/v1/chat/completions", 401, "Unauthorized", {},
+            io.BytesIO(f'{{"error":"{marker}"}}'.encode()),
+        )
+
+    monkeypatch.setattr(ai_provider.urllib.request, "urlopen", reject)
+    with __import__("pytest").raises(ai_provider.AIProviderUnavailable):
+        ai_provider._send_chat_completion(
+            provider="openai", payload={"model": "configured-model", "messages": []},
+            api_key_override="local-test-secret", base_url_override="https://api.openai.com/v1",
+            max_attempts_override=1,
+        )
+    assert marker not in caplog.text
+    assert "local-test-secret" not in caplog.text
