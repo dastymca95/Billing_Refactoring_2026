@@ -10,6 +10,8 @@ from typing import Any
 from .accounting_contracts import DocumentFacts, EvidenceReference, GLCandidate, LineItemFacts, model_dict
 from .accounting_decision_engine import AccountingDecisionEngine
 from .gl_catalog import load_gl_catalog
+from .model_registry import CapabilityDiscovery, default_registry
+from .reasoning_router import RoutingSignals, RoutingStateMachine
 from .semantic_classifier import classify_line
 
 
@@ -82,6 +84,19 @@ def decide_row(row: dict[str, Any], *, document_id: str, line_item_id: str, extr
     meta["semantic_classification"] = model_dict(semantics)
     meta["accounting_decision"] = model_dict(decision)
     meta["ai_gl_accounting_reasoning"] = model_dict(decision)  # temporary UI adapter
+    phase3_route = RoutingStateMachine(
+        CapabilityDiscovery(default_registry()), text_available=False, vision_available=False
+    ).decide_accounting_shadow(RoutingSignals(
+        deterministic_parser_succeeded=True,
+        facts_complete=True,
+        accounting_ambiguity=bool(decision.review_required),
+    ))
+    meta["phase3_accounting_route"] = {
+        "route": phase3_route.route.value,
+        "reason_code": phase3_route.reason_code,
+        "model_id": phase3_route.model_id,
+        "shadow_only": phase3_route.shadow_only,
+    }
     meta["gl_shadow_comparison"] = {"legacy_selected_gl": legacy_gl or None,
         "v2_selected_gl": decision.selected_gl_code, "same": legacy_gl == (decision.selected_gl_code or ""),
         "difference_reason": None if legacy_gl == (decision.selected_gl_code or "") else decision.why_selected}

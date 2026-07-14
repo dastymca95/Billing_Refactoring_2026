@@ -1,0 +1,4 @@
+SANITIZED TEST DOCUMENT
+Invoice SYN-002
+Electrical breakers and wiring materials
+Total 80.00

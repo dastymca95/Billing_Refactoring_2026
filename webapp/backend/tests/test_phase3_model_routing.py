@@ -37,3 +37,18 @@ def test_extraction_routing_is_deterministic_and_capability_aware():
 def test_no_capability_routes_to_manual_review():
     router = RoutingStateMachine(CapabilityDiscovery(_registry(), []), text_available=False, vision_available=False)
     assert router.decide_extraction(RoutingSignals(False, False)).route is Route.MANUAL_REVIEW
+
+
+def test_real_accounting_pipeline_records_non_authoritative_phase3_route(monkeypatch):
+    from webapp.backend.services.accounting_pipeline_v2 import capture_source_fields, decide_row
+
+    monkeypatch.delenv("AI_ACCOUNTING_REASONING_MODEL", raising=False)
+    monkeypatch.delenv("AI_AVAILABLE_MODELS", raising=False)
+    row = {"Invoice Number": "R-1", "Vendor": "Synthetic", "Property Abbreviation": "RCC",
+           "GL Account": "6540", "Line Item Description": "Electrical labor service", "Amount": 10,
+           "_meta": {"raw_description": "Electrical labor service"}}
+    capture_source_fields(row, document_id="doc", line_item_id="line")
+    decide_row(row, document_id="doc", line_item_id="line", extraction_route="test")
+    route = row["_meta"]["phase3_accounting_route"]
+    assert route == {"route": "deterministic", "reason_code": "central_engine_authoritative",
+                     "model_id": None, "shadow_only": False}

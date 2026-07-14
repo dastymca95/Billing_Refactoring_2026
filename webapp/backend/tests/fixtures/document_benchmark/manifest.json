@@ -1,0 +1,21 @@
+{
+  "schema_version": "document-benchmark-manifest/1.0",
+  "cases": [
+    {
+      "case_id": "synthetic-digital-service-001",
+      "document_class": "clean_digital_service_invoice",
+      "document_path": "documents/synthetic-digital-service-001.txt",
+      "expected_path": "expected/synthetic-digital-service-001.json",
+      "sanitized": true,
+      "tags": ["synthetic", "service"]
+    },
+    {
+      "case_id": "synthetic-materials-001",
+      "document_class": "materials_invoice",
+      "document_path": "documents/synthetic-materials-001.txt",
+      "expected_path": "expected/synthetic-materials-001.json",
+      "sanitized": true,
+      "tags": ["synthetic", "materials"]
+    }
+  ]
+}

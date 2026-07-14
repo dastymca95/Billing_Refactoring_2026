@@ -1,0 +1,4 @@
+SANITIZED TEST DOCUMENT
+Invoice SYN-001
+Electrical labor service
+Total 100.00
