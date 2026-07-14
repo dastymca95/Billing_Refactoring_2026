@@ -28,8 +28,10 @@ def build_workspace(tmp_path: Path, *, tier_d=1, duplicate_reserve=False) -> Pri
         selected.append({"benchmark_id": benchmark_id, "selection_cohort": "scanned_bills" if index < tier_d else "digital_vendor_invoices",
                          "quality_tier": quality, "vendor_token": f"vendor-{index // 4}",
                          "template_signature": f"template-{index // 2}", "page_count": 1})
-        document = root / "documents" / f"{benchmark_id}.pdf"; document.write_bytes(b"private fixture")
-        inventory.append({"benchmark_id": benchmark_id, "private_relative_path": f"documents/{benchmark_id}.pdf",
+        relative_path = ("documents/Manager Folder/Property North/reimbursement $10.00 2026-01-02.pdf"
+                         if index == 0 else f"documents/{benchmark_id}.pdf")
+        document = root / relative_path; document.parent.mkdir(parents=True, exist_ok=True); document.write_bytes(b"private fixture")
+        inventory.append({"benchmark_id": benchmark_id, "private_relative_path": relative_path,
                           "page_count": 1, "complexity_tier": quality, "estimated_ocr_quality": .2,
                           "blur_score": 2, "contrast_score": .3, "orientation": "portrait",
                           "inventory_warnings": ["low_visual_quality"]})
@@ -147,6 +149,61 @@ def test_blind_payload_excludes_app_and_reviewer_2_outputs(tmp_path):
     assert "accounting_decision" not in payload and "suggested_gl" not in payload
     assert "reviewer_2" not in payload and "historical_resman" not in payload
     assert "private_relative_path" not in payload
+
+
+def test_private_workspace_shows_filename_and_relevant_folders_without_absolute_path(tmp_path):
+    workspace = build_workspace(tmp_path)
+    evidence = workspace.blind_document_payload("bench-000")["source_metadata_evidence"]
+    assert evidence["original_filename"] == "reimbursement $10.00 2026-01-02.pdf"
+    assert evidence["filename_stem"] == "reimbursement $10.00 2026-01-02"
+    assert evidence["relevant_parent_folders"] == ["documents", "Manager Folder", "Property North"]
+    serialized = json.dumps(evidence)
+    assert str(workspace.root) not in serialized and ":\\" not in serialized
+
+
+def test_source_candidate_review_is_auditable_and_raw_filename_immutable(tmp_path):
+    workspace = build_workspace(tmp_path)
+    before = workspace.private_source_metadata("bench-000")
+    amount = next(row for row in before["candidates"] if row["candidate_type"] == "amount")
+    confirmed = workspace.review_source_metadata_candidate("bench-000", amount["candidate_id"],
+        reviewer_id="reviewer-a", disposition="confirmed")
+    rejected = workspace.review_source_metadata_candidate("bench-000", amount["candidate_id"],
+        reviewer_id="reviewer-a", disposition="rejected")
+    after = workspace.private_source_metadata("bench-000")
+    assert confirmed["previous_disposition"] is None
+    assert rejected["previous_disposition"] == "confirmed"
+    assert before["original_filename"] == after["original_filename"]
+    assert before["raw_metadata_sha256"] == after["raw_metadata_sha256"]
+    assert next(row for row in after["candidates"] if row["candidate_id"] == amount["candidate_id"])["disposition"] == "rejected"
+
+
+def test_raw_source_metadata_snapshot_detects_mutation(tmp_path):
+    workspace = build_workspace(tmp_path)
+    workspace.private_source_metadata("bench-000")
+    snapshot = workspace.source_metadata_facts_dir / "bench-000.json"
+    altered = json.loads(snapshot.read_text()); altered["original_filename"] = "changed.pdf"
+    snapshot.write_text(json.dumps(altered))
+    with pytest.raises(WorkspaceError, match="changed after private preservation"):
+        workspace.private_source_metadata("bench-000")
+
+
+def test_filename_never_enters_git_safe_status_or_public_trace_shape(tmp_path):
+    workspace = build_workspace(tmp_path)
+    filename = workspace.private_source_metadata("bench-000")["original_filename"]
+    assert filename not in workspace.safe_status_markdown()
+    public_trace = {"route": "deterministic", "success": True, "latency_ms": 1}
+    assert filename not in json.dumps(public_trace)
+
+
+def test_source_metadata_review_does_not_change_frozen_dataset_hash(tmp_path):
+    workspace = build_workspace(tmp_path)
+    workspace.record_triage("bench-000", reviewer="r", decision="keep_for_labeling", reason="adjudicable")
+    frozen = workspace.freeze_dataset("v1")
+    candidate = workspace.private_source_metadata("bench-000")["candidates"][0]
+    workspace.review_source_metadata_candidate("bench-000", candidate["candidate_id"],
+        reviewer_id="r", disposition="ambiguous")
+    snapshot = workspace.selection_dir / "selected_120_v1.json"
+    assert hashlib.sha256(snapshot.read_bytes().rstrip(b"\n")).hexdigest() == frozen["sha256"]
 
 
 def test_autosave_and_crash_recovery_are_private_and_audited(tmp_path):

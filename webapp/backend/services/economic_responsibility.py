@@ -148,7 +148,12 @@ class FilenameFolderContextParser:
     AMOUNT = re.compile(r"(?<!\w)(?:usd\s*)?\$?\s*(\d{1,7}(?:[,.]\d{2}))(?!\w)", re.I)
     DATE = re.compile(r"(?<!\d)(20\d{2})[-_ .](0?[1-9]|1[0-2])(?:[-_ .](0?[1-9]|[12]\d|3[01]))?(?!\d)")
     UNIT = re.compile(r"\b(?:unit|apt|suite|project)\s*[-#:]?\s*([a-z0-9-]{1,20})\b", re.I)
-    CATEGORY_TERMS = frozenset({"maintenance", "education", "paint", "supplies", "meals", "subscription", "reimbursement"})
+    CATEGORY_TERMS = frozenset({"maintenance", "education", "paint", "supplies", "meals", "subscription"})
+    CORPORATE_TERMS = frozenset({"corporate", "company", "management", "office", "administration"})
+    REIMBURSEMENT_TERMS = frozenset({"reimburse", "reimbursement", "reimbursable", "repayment"})
+    PERSON_CUES = frozenset({"cardholder", "purchaser", "employee", "manager"})
+    PROPERTY_CUES = frozenset({"property", "properties", "community", "apartments", "unit", "project"})
+    VENDOR_CUES = frozenset({"vendor", "merchant", "supplier", "contractor"})
 
     def parse(self, document_id: str, original_filename: str, parent_folders: Iterable[str]) -> FilenameFolderFacts:
         folders = list(parent_folders)
@@ -172,12 +177,35 @@ class FilenameFolderContextParser:
                 if token in self.CATEGORY_TERMS:
                     candidates.append(MetadataCandidate(candidate_type="expense_category", normalized_value=token,
                         source_kind=source_kind, source_part_index=index, confidence=.4))
+                if token in self.CORPORATE_TERMS:
+                    candidates.append(MetadataCandidate(candidate_type="corporate_indicator", normalized_value=token,
+                        source_kind=source_kind, source_part_index=index, confidence=.35))
+                if token in self.REIMBURSEMENT_TERMS:
+                    candidates.append(MetadataCandidate(candidate_type="reimbursement_indicator", normalized_value=token,
+                        source_kind=source_kind, source_part_index=index, confidence=.4))
+            candidates.extend(self._cue_candidates(value, source_kind, index))
         warnings = ["filename_and_folder_context_is_non_authoritative"]
         if len({candidate.normalized_value for candidate in candidates if candidate.candidate_type == "amount"}) > 1:
             warnings.append("multiple_amount_candidates")
         return FilenameFolderFacts(document_id=document_id, original_filename=original_filename,
             parent_folder_parts=folders, normalized_filename=normalized_filename,
             normalized_folder_parts=normalized_folders, candidates=candidates, warnings=warnings)
+
+    def _cue_candidates(self, value: str, source_kind: str, index: int) -> list[MetadataCandidate]:
+        tokens = value.split()
+        out: list[MetadataCandidate] = []
+        groups = ((self.PROPERTY_CUES, "property_or_entity"), (self.VENDOR_CUES, "vendor"),
+                  (self.PERSON_CUES, "person_or_cardholder"))
+        for cues, candidate_type in groups:
+            for position, token in enumerate(tokens):
+                if token not in cues:
+                    continue
+                adjacent = tokens[position + 1:position + 4]
+                if adjacent:
+                    out.append(MetadataCandidate(candidate_type=candidate_type,
+                        normalized_value=" ".join(adjacent), source_kind=source_kind,
+                        source_part_index=index, confidence=.35))
+        return out
 
 
 class EconomicResponsibilityClassifier:

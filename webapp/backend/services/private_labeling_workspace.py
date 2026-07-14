@@ -41,6 +41,7 @@ REQUIRED_LINE_FIELDS = {
 RESPONSIBILITY_FIELDS = {"payment_source", "economic_bearer", "settlement_treatment", "allocation_scope", "evidence"}
 LINE_RESPONSIBILITY_FIELDS = {"economic_bearer", "settlement_treatment", "allocation_scope", "allocation_targets",
                               "responsibility_evidence"}
+SOURCE_METADATA_DISPOSITIONS = {"confirmed", "rejected", "partially_correct", "ambiguous", "irrelevant"}
 
 
 class WorkspaceError(RuntimeError):
@@ -74,6 +75,8 @@ class PrivateLabelingWorkspace:
         self.decisions_path = self.selection_dir / "tier_d_triage_decisions.jsonl"
         self.replacements_path = self.selection_dir / "replacement_history.json"
         self.transforms_path = self.selection_dir / "preview_transformations.json"
+        self.source_metadata_facts_dir = self.labels_dir / "source_metadata_facts"
+        self.source_metadata_reviews_path = self.labels_dir / "source_metadata_candidate_reviews.jsonl"
         self._inventory = {row["benchmark_id"]: row for row in self._read_jsonl(self.inventory_dir / "private_inventory.jsonl")}
         duplicate_payload = self._read_json(self.inventory_dir / "duplicate_groups.json", {"groups": []})
         self._duplicate_by_member: dict[str, set[str]] = {}
@@ -113,20 +116,78 @@ class PrivateLabelingWorkspace:
             "preview_url": f"/api/private-workspace/document/{benchmark_id}/preview",
             "preview_rotation_degrees": self.preview_rotation(benchmark_id),
             "reserve_candidates": self.replacement_candidates(benchmark_id, limit=5),
-            "filename_folder_candidates": self._filename_folder_candidates(benchmark_id),
+            "source_metadata_evidence": self.private_source_metadata(benchmark_id),
         }
         self._assert_blind(payload)
         return payload
 
-    def _filename_folder_candidates(self, benchmark_id: str) -> list[dict[str, Any]]:
+    def private_source_metadata(self, benchmark_id: str) -> dict[str, Any]:
+        """Return source-name evidence only inside the authorized private workspace."""
         item = self._inventory.get(benchmark_id, {})
         relative = Path(item.get("private_relative_path", ""))
         if not relative.name:
-            return []
+            raise WorkspaceError("private source metadata is unavailable")
+        folders = [self._display_component(part) for part in relative.parent.parts if part not in {"", "."}]
         facts = FilenameFolderContextParser().parse(benchmark_id, relative.name, relative.parent.parts)
-        return [{"candidate_type": candidate.candidate_type, "normalized_value": candidate.normalized_value,
-                 "source_kind": candidate.source_kind, "confidence": candidate.confidence,
-                 "authoritative": False} for candidate in facts.candidates]
+        raw = {"original_filename": self._display_component(relative.name),
+               "filename_stem": self._display_component(relative.stem),
+               "relevant_parent_folders": folders}
+        fingerprint = hashlib.sha256(json.dumps(raw, sort_keys=True).encode()).hexdigest()
+        snapshot = {"schema_version": "private-source-metadata/1.0", "benchmark_id": benchmark_id,
+                    **raw, "raw_metadata_sha256": fingerprint}
+        snapshot_path = self.source_metadata_facts_dir / f"{benchmark_id}.json"
+        existing = self._read_json(snapshot_path, None)
+        if existing is None:
+            self._atomic_json(snapshot_path, snapshot)
+        elif existing != snapshot:
+            raise WorkspaceError("raw filename/folder metadata changed after private preservation")
+        reviews = self._latest_source_metadata_reviews(benchmark_id)
+        candidates = []
+        for candidate in facts.candidates:
+            candidate_id = self._candidate_id(benchmark_id, candidate.model_dump())
+            candidates.append({"candidate_id": candidate_id, "candidate_type": candidate.candidate_type,
+                "normalized_value": candidate.normalized_value, "source_kind": candidate.source_kind,
+                "source_part_index": candidate.source_part_index, "confidence": candidate.confidence,
+                "authoritative": False, "disposition": reviews.get(candidate_id, {}).get("new_disposition")})
+        return {**raw, "raw_metadata_sha256": fingerprint, "candidates": candidates,
+                "parser_warnings": facts.warnings, "evidence_notice":
+                "Source metadata evidence — verify against the document.", "authoritative": False}
+
+    def review_source_metadata_candidate(self, benchmark_id: str, candidate_id: str, *, reviewer_id: str,
+                                         disposition: str, note: str | None = None) -> dict[str, Any]:
+        if disposition not in SOURCE_METADATA_DISPOSITIONS:
+            raise WorkspaceError("invalid source metadata candidate disposition")
+        if not reviewer_id.strip():
+            raise WorkspaceError("reviewer_id is required")
+        metadata = self.private_source_metadata(benchmark_id)
+        candidate = next((row for row in metadata["candidates"] if row["candidate_id"] == candidate_id), None)
+        if candidate is None:
+            raise WorkspaceError("unknown source metadata candidate")
+        previous = self._latest_source_metadata_reviews(benchmark_id).get(candidate_id, {}).get("new_disposition")
+        event = {"schema_version": "source-metadata-review-event/1.0", "benchmark_id": benchmark_id,
+                 "candidate_id": candidate_id, "reviewer_id": reviewer_id.strip(), "timestamp": utc_now(),
+                 "previous_disposition": previous, "new_disposition": disposition,
+                 "raw_metadata_sha256": metadata["raw_metadata_sha256"], "note": note or None}
+        self._append_jsonl(self.source_metadata_reviews_path, event)
+        return event
+
+    def _latest_source_metadata_reviews(self, benchmark_id: str) -> dict[str, dict[str, Any]]:
+        latest = {}
+        for event in self._read_jsonl(self.source_metadata_reviews_path):
+            if event.get("benchmark_id") == benchmark_id:
+                latest[event["candidate_id"]] = event
+        return latest
+
+    @staticmethod
+    def _candidate_id(benchmark_id: str, candidate: Mapping[str, Any]) -> str:
+        encoded = json.dumps({"benchmark_id": benchmark_id, **candidate}, sort_keys=True).encode()
+        return hashlib.sha256(encoded).hexdigest()[:20]
+
+    @staticmethod
+    def _display_component(value: str) -> str:
+        if not value or any(marker in value for marker in ("/", "\\", ":")):
+            raise WorkspaceError("unsafe source metadata display component")
+        return Path(value).name
 
     def private_document_path(self, benchmark_id: str) -> Path:
         item = self._inventory.get(benchmark_id)
