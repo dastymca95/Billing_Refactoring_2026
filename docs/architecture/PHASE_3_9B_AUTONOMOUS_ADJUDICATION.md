@@ -43,8 +43,14 @@ facts do.
 
 Validation covers document totals, line sums, quantity × unit price, due versus
 paid amounts, credit sign, service periods, page continuity, duplicate pages,
-repeated-line flags, and allocation percentage totals. A failed material check
+repeated-line flags, account-number consistency, tax/discount treatment, and
+allocation percentage totals. A failed material check
 cannot be overridden by model confidence.
+
+Read-only visual preprocessing records source type, page count, page-content
+hashes when observable, duplicate-page candidates, persisted preview rotation,
+and whether handwriting routing is required. Empty OCR text is never treated as
+proof that two scanned pages are duplicates.
 
 Property resolution accepts exact and normalized evidence plus injected
 configured aliases. Conflicting candidates fail closed. Filename evidence may
@@ -54,6 +60,11 @@ non-authoritative alone below the configured threshold.
 GL codes enter rows only when selected by AccountingDecisionEngine and when the
 decision confidence reaches the GL threshold. AccountingReadiness remains the
 only readiness/export authority.
+
+Reimbursement is resolved separately from responsibility. Reimbursable treatment
+requires both reimbursing and reimbursed entities; otherwise the document remains
+an exception. When coherent document-level responsibility is resolved, it is
+propagated deterministically to homogeneous line responsibility records.
 
 ## Runtime capability audit
 
@@ -79,8 +90,8 @@ are never invoked.
 - Strong-reasoner executions: 0.
 - Advertised model capabilities: 0.
 
-The dominant blockers were unresolved economic responsibility, missing required
-financial facts/property/GL, and five arithmetic mismatches. These results are
+The dominant blockers were unresolved economic responsibility and reimbursement,
+missing required financial facts/property/GL, and five arithmetic mismatches. These results are
 correct fail-closed behavior for the currently available deterministic evidence;
 they are not evidence that autonomous multimodal extraction meets product goals.
 

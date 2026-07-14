@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import hashlib
 from datetime import datetime, timezone
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -16,7 +17,8 @@ from pydantic import BaseModel, Field
 
 from .accounting_readiness import AccountingReadiness, as_dict as readiness_dict, evaluate_rows
 from .economic_responsibility import (AllocationScope, EconomicBearerType, EconomicResponsibility,
-    EconomicResponsibilityClassifier, EvidenceStrength, PaymentSourceType, ResponsibilityEvidence, SettlementTreatment)
+    EconomicResponsibilityClassifier, EvidenceStrength, LineResponsibility, PaymentSourceType,
+    ResponsibilityEvidence, SettlementTreatment)
 from .model_registry import CapabilityDiscovery, ModelCapability, ModelRegistry, ModelRole, default_registry
 
 
@@ -95,6 +97,26 @@ class PropertyResolution(BaseModel):
     contradiction_status: str
 
 
+class ReimbursementResolution(BaseModel):
+    reimbursement_required: bool | None = None
+    reimbursing_entity: str | None = None
+    reimbursed_entity: str | None = None
+    confidence: float = Field(ge=0, le=1)
+    status: str
+    evidence: list[FieldEvidence] = Field(default_factory=list)
+
+
+class VisualPreprocessingResult(BaseModel):
+    schema_version: str = "visual-preprocessing/1.0"
+    source_type: str
+    page_count: int
+    page_hashes: list[str] = Field(default_factory=list)
+    duplicate_page_indexes: list[int] = Field(default_factory=list)
+    rotation_degrees: int = 0
+    handwriting_route_required: bool = False
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ExtractionPass(BaseModel):
     pass_id: str
     profile_version: str
@@ -115,6 +137,7 @@ class AutonomousAdjudicationResult(BaseModel):
     consensus: list[ConsensusField]
     arithmetic_validation: list[ValidationCheck]
     property_resolution: PropertyResolution
+    reimbursement_resolution: ReimbursementResolution
     economic_responsibility: EconomicResponsibility
     rows: list[dict[str, Any]] = Field(default_factory=list)
     accounting_readiness: dict[str, Any]
@@ -237,6 +260,17 @@ class ArithmeticValidator:
         if repeated is not None:
             checks.append(ValidationCheck(code="repeated_line_items", passed=not bool(repeated),
                 evidence=[{"unresolved": bool(repeated)}]))
+        account_numbers = values.get("document.account_numbers")
+        if isinstance(account_numbers, list):
+            normalized_accounts = {_normalize(value) for value in account_numbers if value}
+            checks.append(ValidationCheck(code="account_number_consistency", passed=len(normalized_accounts) <= 1,
+                evidence=[{"distinct_account_count": len(normalized_accounts)}]))
+        document_tax = _decimal(values.get("document.tax"))
+        line_taxes = [_decimal(line.get("tax")) for line in lines if line.get("tax") is not None]
+        if document_tax is not None and line_taxes and all(value is not None for value in line_taxes):
+            checks.append(self._check("tax_treatment", sum(line_taxes, Decimal("0")), document_tax))
+        if discount is not None:
+            checks.append(ValidationCheck(code="discount_treatment", passed=discount >= 0, actual=discount))
         return checks
 
     def _check(self, code: str, expected: Decimal, actual: Decimal) -> ValidationCheck:
@@ -290,6 +324,63 @@ class ResponsibilityEvidenceBuilder:
         return output
 
 
+class ReimbursementResolver:
+    def __init__(self, policy: AutonomousPolicy) -> None: self.policy = policy
+
+    def resolve(self, consensus: Iterable[ConsensusField], responsibility: EconomicResponsibility) -> ReimbursementResolution:
+        fields = {field.field_path: field for field in consensus}
+        required = fields.get("document.reimbursement_required")
+        reimbursing = fields.get("document.reimbursing_entity"); reimbursed = fields.get("document.reimbursed_entity")
+        inferred_required = responsibility.settlement_treatment in {SettlementTreatment.REIMBURSABLE_TO_MANAGEMENT_COMPANY,
+            SettlementTreatment.INTERCOMPANY_DUE_TO_DUE_FROM}
+        if required and required.selected_value is not None:
+            value = str(required.selected_value).lower() in {"true", "yes", "1", "required"}; confidence = required.confidence
+        elif responsibility.settlement_treatment not in {SettlementTreatment.UNKNOWN, SettlementTreatment.MANUAL_REVIEW}:
+            value = inferred_required; confidence = min(.95, max((e.confidence for e in responsibility.evidence), default=.9))
+        else:
+            return ReimbursementResolution(confidence=0, status="unresolved")
+        if value and (not reimbursing or not reimbursing.selected_value or not reimbursed or not reimbursed.selected_value):
+            return ReimbursementResolution(reimbursement_required=True,
+                reimbursing_entity=str(reimbursing.selected_value) if reimbursing and reimbursing.selected_value else None,
+                reimbursed_entity=str(reimbursed.selected_value) if reimbursed and reimbursed.selected_value else None,
+                confidence=confidence, status="unresolved_entities",
+                evidence=list(required.evidence) if required else [])
+        return ReimbursementResolution(reimbursement_required=value,
+            reimbursing_entity=str(reimbursing.selected_value) if reimbursing and reimbursing.selected_value else None,
+            reimbursed_entity=str(reimbursed.selected_value) if reimbursed and reimbursed.selected_value else None,
+            confidence=confidence, status="resolved" if confidence >= self.policy.threshold("responsibility_confidence") else "insufficient_confidence",
+            evidence=list(required.evidence) if required else [])
+
+
+class VisualPreprocessor:
+    """Read-only structural preprocessing; never rewrites private sources."""
+    def preprocess(self, path: Path, *, rotation_degrees: int = 0, handwriting_hint: bool = False) -> VisualPreprocessingResult:
+        suffix = path.suffix.lower(); hashes: list[str] = []; warnings: list[str] = []
+        if suffix == ".pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(path); page_count = len(reader.pages)
+                for page in reader.pages:
+                    material = (page.extract_text() or "").encode("utf-8", errors="ignore")
+                    hashes.append(hashlib.sha256(material).hexdigest() if material.strip() else "")
+                if any(not digest for digest in hashes): warnings.append("page_content_hash_unavailable_for_image_pages")
+            except Exception as exc:
+                page_count = 1; hashes = [hashlib.sha256(path.read_bytes()).hexdigest()]
+                warnings.append(f"pdf_structure_unavailable:{type(exc).__name__}")
+            source_type = "digital_or_scanned_pdf"
+        else:
+            page_count = 1; hashes = [hashlib.sha256(path.read_bytes()).hexdigest()]
+            source_type = "image" if suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"} else "unknown"
+        seen = {}; duplicates = []
+        for index, digest in enumerate(hashes):
+            if not digest: continue
+            if digest in seen: duplicates.append(index + 1)
+            else: seen[digest] = index + 1
+        return VisualPreprocessingResult(source_type=source_type, page_count=page_count, page_hashes=hashes,
+            duplicate_page_indexes=duplicates, rotation_degrees=rotation_degrees,
+            handwriting_route_required=handwriting_hint, warnings=warnings)
+
+
 class AutonomousAdjudicator:
     """Orchestrates machine analysis without mutating labels, readiness, or frozen data."""
     def __init__(self, *, policy: AutonomousPolicy | None = None, registry: ModelRegistry | None = None,
@@ -302,6 +393,7 @@ class AutonomousAdjudicator:
         self.arithmetic = ArithmeticValidator(Decimal(str(self.policy.values["arithmetic_tolerance"])))
         self.properties = PropertyResolver(self.policy, property_aliases)
         self.responsibility_evidence = ResponsibilityEvidenceBuilder()
+        self.reimbursements = ReimbursementResolver(self.policy)
 
     def adjudicate(self, document_id: str, *, deterministic_primary: ExtractionPass,
                    deterministic_verification: list[VerificationFinding], visual_required: bool,
@@ -315,9 +407,15 @@ class AutonomousAdjudicator:
         checks = self.arithmetic.validate(consensus, primary.lines); property_resolution = self.properties.resolve(consensus)
         responsibility = EconomicResponsibilityClassifier().classify(document_id,
             [*responsibility_evidence, *self.responsibility_evidence.build(consensus)])
+        if not responsibility.review_required and primary.lines:
+            responsibility.line_items = [LineResponsibility(line_item_id=str(line.get("line_id") or index + 1),
+                economic_bearer=responsibility.economic_bearer, settlement_treatment=responsibility.settlement_treatment,
+                allocation_scope=responsibility.allocation_scope, evidence=list(responsibility.evidence), review_required=False)
+                for index, line in enumerate(primary.lines)]
+        reimbursement = self.reimbursements.resolve(consensus, responsibility)
         rows = self._rows(primary.lines, consensus, property_resolution)
         readiness = evaluate_rows(rows)
-        exceptions = self._exceptions(consensus, checks, property_resolution, responsibility, readiness, rows)
+        exceptions = self._exceptions(consensus, checks, property_resolution, responsibility, reimbursement, readiness, rows)
         verified = any(field.status in {ConsensusStatus.EXACT_AGREEMENT, ConsensusStatus.NORMALIZED_AGREEMENT,
                        ConsensusStatus.SUPPORTED_SINGLE_SOURCE} for field in consensus)
         status = AutonomousStatus.EXCEPTION_REQUIRED if exceptions else AutonomousStatus.MACHINE_ADJUDICATED
@@ -326,7 +424,8 @@ class AutonomousAdjudicator:
         return AutonomousAdjudicationResult(document_id=document_id, status=status, primary_extraction=primary,
             verification_profile="isolated-independent-verification/1.0", consensus=consensus,
             arithmetic_validation=checks, property_resolution=property_resolution,
-            economic_responsibility=responsibility, rows=rows, accounting_readiness=readiness_dict(readiness),
+            reimbursement_resolution=reimbursement, economic_responsibility=responsibility,
+            rows=rows, accounting_readiness=readiness_dict(readiness),
             exception_codes=sorted(set(exceptions)), capability_evidence=[capability.__dict__ for capability in capabilities],
             thresholds_version=self.policy.version, generated_at=datetime.now(timezone.utc),
             human_action_required=status is AutonomousStatus.EXCEPTION_REQUIRED)
@@ -352,13 +451,14 @@ class AutonomousAdjudicator:
                     "accounting_decision": line.get("accounting_decision"), "autonomous_line_index": index}})
         return rows
 
-    def _exceptions(self, consensus, checks, property, responsibility, readiness: AccountingReadiness, rows):
+    def _exceptions(self, consensus, checks, property, responsibility, reimbursement, readiness: AccountingReadiness, rows):
         exceptions = []
         material_conflicts = [field for field in consensus if field.material and field.status in {ConsensusStatus.UNRESOLVED_CONFLICT, ConsensusStatus.MISSING}]
         if len(material_conflicts) > int(self.policy.values["unresolved_material_conflicts_allowed"]): exceptions.append("material_field_conflict")
         if self.policy.values["arithmetic_must_pass"] and any(not check.passed for check in checks): exceptions.append("arithmetic_validation_failed")
         if rows and property.selected_property is None: exceptions.append("property_unresolved")
         if responsibility.review_required and not self._non_ap(consensus): exceptions.append("economic_responsibility_unresolved")
+        if reimbursement.status not in {"resolved"} and not self._non_ap(consensus): exceptions.append("reimbursement_unresolved")
         if rows and not readiness.export_allowed: exceptions.extend(issue["code"] for issue in readiness_dict(readiness)["blockers"])
         if not rows and not self._non_ap(consensus): exceptions.append("financial_lines_missing")
         return exceptions

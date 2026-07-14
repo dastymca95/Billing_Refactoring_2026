@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .assisted_labeling import AssistedLabelingService
-from .autonomous_adjudication import AutonomousAdjudicator, deterministic_verification, proposal_to_extraction
+from .autonomous_adjudication import (AutonomousAdjudicator, ExtractedField, FieldEvidence, VisualPreprocessor,
+    deterministic_verification, proposal_to_extraction)
 from .private_labeling_workspace import PrivateLabelingWorkspace, WorkspaceError
 from .reviewer_1_pilot import Reviewer1Pilot
 
@@ -19,6 +20,7 @@ class AutonomousPrivateRunner:
         self.workspace = workspace; self.pilot = pilot; self.assisted = assisted; self.adjudicator = adjudicator
         self.output_dir = workspace.root / "analysis" / "autonomous_3_9b"
         self.report_path = workspace.root / "reports" / "autonomous_adjudication_3_9b.json"
+        self.preprocessing = VisualPreprocessor()
 
     def run_pilot(self) -> dict[str, Any]:
         snapshot = self.workspace.selection_dir / "selected_120_v1.json"
@@ -26,7 +28,19 @@ class AutonomousPrivateRunner:
         for benchmark_id in sorted(self.pilot.pilot_ids()):
             proposal = self.assisted.proposal(benchmark_id); primary = proposal_to_extraction(proposal)
             inventory = self.workspace._inventory.get(benchmark_id, {})
-            visual_required = str(inventory.get("complexity_tier") or "").upper() in {"C", "D"}
+            cohort = next((row.get("cohort", "") for row in self.pilot.prepare_manifest()["documents"]
+                           if row["benchmark_id"] == benchmark_id), "")
+            preprocessing = self.preprocessing.preprocess(self.workspace.private_document_path(benchmark_id),
+                rotation_degrees=self.workspace.preview_rotation(benchmark_id), handwriting_hint="handwrit" in cohort.lower())
+            preprocessing_evidence = [FieldEvidence(source_type="visual_preprocessing",
+                extraction_profile=preprocessing.schema_version, visual_summary=preprocessing.source_type)]
+            for path, value in (("document.page_count", preprocessing.page_count),
+                                ("document.page_hashes", preprocessing.page_hashes),
+                                ("document.duplicate_pages", preprocessing.duplicate_page_indexes)):
+                primary.fields.append(ExtractedField(field_path=path, value=value, confidence=1,
+                    evidence=preprocessing_evidence, source_pass="visual_preprocessing"))
+            visual_required = preprocessing.source_type == "image" or preprocessing.handwriting_route_required or \
+                              str(inventory.get("complexity_tier") or "").upper() in {"C", "D"}
             result = self.adjudicator.adjudicate(benchmark_id, deterministic_primary=primary,
                 deterministic_verification=deterministic_verification(primary), visual_required=visual_required)
             payload = result.model_dump(mode="json"); self.workspace._atomic_json(self.output_dir / f"{benchmark_id}.json", payload)

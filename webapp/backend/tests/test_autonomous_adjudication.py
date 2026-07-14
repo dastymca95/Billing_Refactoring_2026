@@ -5,7 +5,7 @@ import pytest
 from webapp.backend.services.autonomous_adjudication import (
     ArithmeticValidator, AutonomousAdjudicator, AutonomousPolicy, AutonomousStatus,
     ConsensusStatus, ExtractedField, ExtractionPass, FieldConsensusEngine, FieldEvidence,
-    PropertyResolver, VerificationFinding, deterministic_verification,
+    PropertyResolver, ReimbursementResolver, VerificationFinding, VisualPreprocessor, deterministic_verification,
 )
 from webapp.backend.services.economic_responsibility import EvidenceStrength, ResponsibilityEvidence
 from webapp.backend.services.model_registry import ModelRegistry, ModelRole, ModelSpec
@@ -78,13 +78,15 @@ def test_structural_validation_covers_pages_period_credit_and_duplicates():
     primary = [field("document.total", "10.00"), field("document.bill_or_credit", "credit"),
         field("document.service_period_start", "2026-02-01"), field("document.service_period_end", "2026-01-01"),
         field("document.page_count", 2), field("document.page_numbers", [1]),
-        field("document.duplicate_pages", [2]), field("document.repeated_line_items_unresolved", True)]
+        field("document.duplicate_pages", [2]), field("document.repeated_line_items_unresolved", True),
+        field("document.account_numbers", ["A-1", "B-2"]), field("document.discount", "-1.00")]
     verification = [VerificationFinding(field_path=f.field_path, disposition="confirmed", value=f.value,
         confidence=.96, evidence=EVIDENCE) for f in primary]
     consensus = FieldConsensusEngine(policy()).decide(primary, verification)
     failed = {check.code for check in ArithmeticValidator(Decimal("0.01")).validate(consensus, []) if not check.passed}
     assert {"credit_vs_charge_sign", "service_period_validity", "multi_page_continuity",
             "duplicate_pages", "repeated_line_items"} <= failed
+    assert {"account_number_consistency", "discount_treatment"} <= failed
 
 
 def test_property_conflict_remains_unresolved():
@@ -101,6 +103,23 @@ def test_configured_property_aliases_resolve_equivalent_evidence():
     consensus = FieldConsensusEngine(policy()).decide(primary, verification)
     result = PropertyResolver(policy(), {"PN": "Property North"}).resolve(consensus)
     assert result.selected_property == "Property North" and result.contradiction_status == "none"
+
+
+def test_reimbursement_requires_entities_when_treatment_is_reimbursable():
+    evidence = [ResponsibilityEvidence(evidence_type="r", source="document", strength=EvidenceStrength.AUTHORITATIVE,
+        confidence=1, supports=["payment_source:management_company_card", "economic_bearer:property",
+        "allocation_scope:single_property", "settlement_treatment:reimbursable_to_management_company"])]
+    from webapp.backend.services.economic_responsibility import EconomicResponsibilityClassifier
+    responsibility = EconomicResponsibilityClassifier().classify("d", evidence)
+    result = ReimbursementResolver(policy()).resolve([], responsibility)
+    assert result.reimbursement_required is True and result.status == "unresolved_entities"
+
+
+def test_visual_preprocessing_is_read_only_and_detects_rotation(tmp_path):
+    source = tmp_path / "receipt.jpg"; source.write_bytes(b"image bytes")
+    before = source.read_bytes(); result = VisualPreprocessor().preprocess(source, rotation_degrees=90, handwriting_hint=True)
+    assert result.source_type == "image" and result.rotation_degrees == 90
+    assert result.handwriting_route_required is True and source.read_bytes() == before
 
 
 def test_unadvertised_model_is_never_called_and_result_fails_closed(monkeypatch):
