@@ -1,0 +1,19 @@
+{
+  "benchmark_scope": "regression_only_not_a_model_benchmark",
+  "blocked_decisions": 0,
+  "corpus": "complete canonical regression fixtures",
+  "invoices_compared": 5,
+  "legacy_v2_different": 0,
+  "legacy_v2_equal": 9,
+  "lines_compared": 9,
+  "missing_gl": 0,
+  "processing_failures": 0,
+  "schema_version": "phase-2-shadow-metrics/1.0",
+  "semantic_unknown": 5,
+  "skipped_fixtures": [
+    {
+      "fixture": "servall_pest",
+      "reason": "Only a low-resolution conversation screenshot is available. Invoice number, dates, due date, property, total, and exact vendor entity cannot be verified reliably enough for a golden fixture."
+    }
+  ]
+}

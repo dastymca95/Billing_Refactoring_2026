@@ -14,7 +14,24 @@ from .semantic_classifier import classify_line
 
 
 def v2_enabled() -> bool:
-    return os.environ.get("ACCOUNTING_DECISION_ENGINE_V2", "1").strip().lower() not in {"0", "false", "off", "no"}
+    raw = os.environ.get("ACCOUNTING_DECISION_ENGINE_V2")
+    if raw is None or not raw.strip():
+        return True
+    value = raw.strip().lower()
+    if value in {"1", "true", "on", "yes"}:
+        return True
+    if value not in {"0", "false", "off", "no"}:
+        raise RuntimeError(
+            "ACCOUNTING_DECISION_ENGINE_V2 must be an explicit boolean value; "
+            f"received {raw!r}."
+        )
+    rollback = os.environ.get("ACCOUNTING_DECISION_ENGINE_V2_ALLOW_LEGACY_ROLLBACK", "").strip().lower()
+    if rollback not in {"1", "true", "on", "yes"}:
+        raise RuntimeError(
+            "Disabling ACCOUNTING_DECISION_ENGINE_V2 requires the explicit "
+            "ACCOUNTING_DECISION_ENGINE_V2_ALLOW_LEGACY_ROLLBACK=1 authorization."
+        )
+    return False
 
 
 def capture_source_fields(row: dict[str, Any], *, document_id: str, line_item_id: str) -> None:

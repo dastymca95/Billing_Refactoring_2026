@@ -214,3 +214,25 @@ def test_complete_canonical_fixtures_pass_through_central_decision_engine():
             assert decision.get("review_blocking") is False
             assert shadow.get("same") is True
     assert decisions
+
+
+def test_v2_feature_flag_defaults_enabled_and_rejects_ambiguous_configuration(monkeypatch):
+    from webapp.backend.services.accounting_pipeline_v2 import v2_enabled
+
+    monkeypatch.delenv("ACCOUNTING_DECISION_ENGINE_V2", raising=False)
+    monkeypatch.delenv("ACCOUNTING_DECISION_ENGINE_V2_ALLOW_LEGACY_ROLLBACK", raising=False)
+    assert v2_enabled() is True
+    monkeypatch.setenv("ACCOUNTING_DECISION_ENGINE_V2", "perhaps")
+    with pytest.raises(RuntimeError, match="explicit boolean"):
+        v2_enabled()
+
+
+def test_v2_legacy_rollback_requires_two_explicit_switches(monkeypatch):
+    from webapp.backend.services.accounting_pipeline_v2 import v2_enabled
+
+    monkeypatch.setenv("ACCOUNTING_DECISION_ENGINE_V2", "false")
+    monkeypatch.delenv("ACCOUNTING_DECISION_ENGINE_V2_ALLOW_LEGACY_ROLLBACK", raising=False)
+    with pytest.raises(RuntimeError, match="ALLOW_LEGACY_ROLLBACK"):
+        v2_enabled()
+    monkeypatch.setenv("ACCOUNTING_DECISION_ENGINE_V2_ALLOW_LEGACY_ROLLBACK", "true")
+    assert v2_enabled() is False

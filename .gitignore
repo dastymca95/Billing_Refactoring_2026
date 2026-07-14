@@ -47,6 +47,14 @@ Thumbs.db
 webapp/_phase1d_*
 *.tsbuildinfo
 
+# Test/runtime output (reproducible, never source evidence)
+.pytest_cache/
+.coverage
+htmlcov/
+webapp/frontend/test-results/
+webapp/frontend/playwright-report/
+/tmp_*.png
+
 # Phase PERF-1 — runtime artefacts.
 # webapp_data/cache/ is already covered by webapp_data/ above; this
 # block exists to call out the new locations for future contributors.
