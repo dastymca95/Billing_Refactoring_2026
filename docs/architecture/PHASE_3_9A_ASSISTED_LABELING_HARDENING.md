@@ -42,7 +42,9 @@ resulting status is `human_verified_assisted`, never `adjudicated_gold`.
 The workspace provides previous/next navigation, exception-only filtering,
 field acceptance, safe acceptance of inspected non-conflicting proposals,
 validation navigation, guarded keyboard shortcuts, pause/resume, zoom, persistent
-non-destructive rotation, and guarded line-operation affordances. There is no
+non-destructive rotation, and explicit duplicate/split/merge/copy/apply operations
+over selected human-draft lines. Split and merge fail visibly to unknown when an
+amount cannot be safely derived, requiring reviewer resolution. There is no
 bulk approval method and the queue remains restricted to `pilot_20_v1`.
 
 ## Privacy

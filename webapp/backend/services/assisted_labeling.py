@@ -72,6 +72,8 @@ class AssistedLabelingService:
                      human_value: Any = None, reason: str | None = None,
                      evidence_inspected: bool = False, reviewer_confidence: float | None = None) -> dict[str, Any]:
         if action not in FIELD_ACTIONS: raise WorkspaceError("invalid assisted field action")
+        if action in {"accept", "correct"} and not evidence_inspected:
+            raise WorkspaceError("document inspection is required before verification")
         proposal = self.proposal(benchmark_id)
         proposed = next((item for item in proposal["fields"] if item["field_path"] == field_path), None)
         if proposed is None: raise WorkspaceError("unknown proposed field")

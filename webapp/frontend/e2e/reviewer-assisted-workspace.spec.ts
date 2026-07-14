@@ -28,6 +28,7 @@ test.describe("Phase 3.9A private assisted workspace", () => {
     await page.goto("/");
     await page.getByPlaceholder("reviewer id").fill("e2e-reviewer");
     await page.getByTestId("queue-item").first().click();
+    await page.getByLabel("I inspected this document").check();
     await page.keyboard.press("Control+Shift+Enter");
     await expect(page.getByText(/blocking validation errors|proposed fields require/)).toBeVisible();
   });

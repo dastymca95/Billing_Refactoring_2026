@@ -38,6 +38,8 @@ def test_proposal_is_unverified_separate_and_does_not_overwrite_human_draft(tmp_
 def test_accept_and_correct_are_explicit_and_preserve_original_proposal(tmp_path):
     _, controller, service = assisted(tmp_path); benchmark_id = "bench-000"
     proposal = service.proposal(benchmark_id); field = proposal["fields"][0]
+    with pytest.raises(WorkspaceError, match="inspection"):
+        service.decide_field(benchmark_id, field["field_path"], reviewer_id="r", action="accept")
     accepted = service.decide_field(benchmark_id, field["field_path"], reviewer_id="r", action="accept",
                                     evidence_inspected=True)
     corrected = service.decide_field(benchmark_id, field["field_path"], reviewer_id="r", action="correct",
