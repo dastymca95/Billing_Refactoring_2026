@@ -1,0 +1,28 @@
+{
+  "schema_version": "representative-label/1.0",
+  "case_id": "synthetic-digital-service-001",
+  "status": "gold",
+  "document_class": "clean_digital_pdf",
+  "known_vendor": false,
+  "complexity": "simple",
+  "value_cohort": "normal",
+  "first_review": {
+    "reviewer_id": "fixture-author-a", "labeled_at": "2026-07-14T00:00:00Z", "label_confidence": 1.0,
+    "document_family": "invoice", "invoice_number_redacted": "SYN-001", "total_amount": "100.00",
+    "line_items": [{"line_item_id": "line-1", "raw_description_redacted": "Electrical labor service", "amount": "100.00", "line_family": "labor_service", "trade_family": "electrical", "work_mode": "labor_service", "expected_gl": "6540", "acceptable_gl_alternatives": []}],
+    "should_review": true, "should_block": true
+  },
+  "second_review": {
+    "reviewer_id": "fixture-reviewer-b", "labeled_at": "2026-07-14T00:05:00Z", "label_confidence": 1.0,
+    "document_family": "invoice", "invoice_number_redacted": "SYN-001", "total_amount": "100.00",
+    "line_items": [{"line_item_id": "line-1", "raw_description_redacted": "Electrical labor service", "amount": "100.00", "line_family": "labor_service", "trade_family": "electrical", "work_mode": "labor_service", "expected_gl": "6540", "acceptable_gl_alternatives": []}],
+    "should_review": true, "should_block": true
+  },
+  "adjudication_status": "adjudicated_gold",
+  "adjudicated_gold": {
+    "reviewer_id": "fixture-adjudicator", "labeled_at": "2026-07-14T00:10:00Z", "label_confidence": 1.0,
+    "document_family": "invoice", "invoice_number_redacted": "SYN-001", "total_amount": "100.00",
+    "line_items": [{"line_item_id": "line-1", "raw_description_redacted": "Electrical labor service", "amount": "100.00", "line_family": "labor_service", "trade_family": "electrical", "work_mode": "labor_service", "expected_gl": "6540", "acceptable_gl_alternatives": []}],
+    "should_review": true, "should_block": true
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": "representative-manifest/1.0",
+  "entries": [
+    {
+      "case_id": "synthetic-digital-service-001",
+      "document_class": "clean_digital_pdf",
+      "source": "synthetic_public_safe",
+      "document_ref": "documents/synthetic-digital-service-001.txt",
+      "label_ref": "labels/gold/synthetic-digital-service-001.json",
+      "private": false
+    },
+    {
+      "case_id": "synthetic-materials-001",
+      "document_class": "material_invoice",
+      "source": "synthetic_public_safe",
+      "document_ref": "documents/synthetic-materials-001.txt",
+      "label_ref": "labels/gold/synthetic-materials-001.json",
+      "private": false
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": "representative-collection-plan/1.0",
+  "minimum_gold_documents": 100,
+  "cohort_targets": {
+    "clean_digital_pdf": 10,
+    "recurring_utility_bill": 10,
+    "contractor_invoice": 10,
+    "material_invoice": 10,
+    "fee_renewal_subscription": 10,
+    "scan": 10,
+    "photo": 10,
+    "handwriting": 10,
+    "legal_insurance_finance": 10,
+    "unknown_document": 10
+  },
+  "note": "Targets are collection requirements, not completed or labeled cases."
+}
