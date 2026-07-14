@@ -810,7 +810,9 @@ def validate_ai_extraction(
     skipped_zero_items: list[dict[str, Any]] = []
     for idx, item in enumerate(line_items, start=1):
         item = item if isinstance(item, dict) else {}
-        description = _clean(item.get("description")) or f"Line item {idx}"
+        raw_description = _clean(item.get("description"))
+        activity = _clean(item.get("activity"))
+        description = " - ".join(part for part in (activity, raw_description) if part) or f"Line item {idx}"
         amount = _money(item.get("amount"))
         if abs(amount) <= 0.0 and not settings.AI_INCLUDE_ZERO_AMOUNT_LINES:
             zero_amount_excluded += 1
@@ -834,6 +836,8 @@ def validate_ai_extraction(
         if not gl_account:
             gl_issue_seen = True
         normalized_items.append({
+            "activity": activity,
+            "raw_description": raw_description,
             "description": description,
             "quantity": _nullable_float(item.get("quantity")),
             "unit_price": _nullable_money(item.get("unit_price")),
@@ -2355,6 +2359,7 @@ def ai_result_to_invoice(
                 "ai_gl_suggestion_source": item.get("gl_suggestion_source"),
                 "ai_generated_description": True,
                 "ai_source_line_description": item.get("description"),
+                "ai_line_activity": item.get("activity"),
                 "ai_tax_handling": normalized.get("tax_handling"),
                 "ai_tax_amount_inferred": normalized.get("tax_amount_inferred", False),
                 "ai_invoice_date_source": normalized.get("invoice_date_source"),
@@ -3333,7 +3338,7 @@ def _is_known_gl(candidate: str, gl_accounts: list[dict[str, Any]]) -> bool:
 
 
 def _load_vendor_reference() -> list[dict[str, Any]]:
-    path = settings.PROJECT_ROOT / "Vendors" / "Vendor List.csv"
+    path = settings.RUNTIME_ASSET_ROOT / "Vendors" / "Vendor List.csv"
     rows: list[dict[str, Any]] = []
     if not path.is_file():
         return rows
@@ -3360,8 +3365,8 @@ def _load_vendor_reference() -> list[dict[str, Any]]:
 
 def _load_property_reference() -> list[dict[str, Any]]:
     candidates = [
-        settings.PROJECT_ROOT / "Properties" / "Properties.csv",
-        settings.PROJECT_ROOT / "Properties" / "Unit Info Clean.csv",
+        settings.RUNTIME_ASSET_ROOT / "Properties" / "Properties.csv",
+        settings.RUNTIME_ASSET_ROOT / "Properties" / "Unit Info Clean.csv",
     ]
     rows: list[dict[str, Any]] = []
     for path in candidates:

@@ -7,6 +7,8 @@ import type {
   BatchListEntry,
   BatchProgress,
   BatchStatus,
+  BillingV2AuditResponse,
+  BillingV2PrepareLinksResponse,
   DocumentMode,
   ExportResponse,
   FilePreview,
@@ -393,6 +395,15 @@ export const api = {
   async manualReview(batchId: string) {
     const res = await fetch(`/api/batches/${batchId}/manual-review`);
     return jsonOrThrow<ManualReviewResponse>(res);
+  },
+
+  async accountingReadiness(batchId: string, rows?: Record<string, unknown>[]) {
+    const res = await fetch(`/api/batches/${batchId}/readiness`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rows }),
+    });
+    return jsonOrThrow<import("./types").AccountingReadiness>(res);
   },
 
   async exportBatch(batchId: string, editedRows?: Record<string, unknown>[]) {
@@ -863,5 +874,17 @@ export const api = {
   async getQueueStatus() {
     const res = await fetch("/api/processing/queue");
     return jsonOrThrow<QueueStatus>(res);
+  },
+
+  async billingV2Audit() {
+    const res = await fetch("/api/billing-v2/audit");
+    return jsonOrThrow<BillingV2AuditResponse>(res);
+  },
+
+  async prepareBillingV2Links(batchId: string) {
+    const res = await fetch(`/api/billing-v2/batches/${batchId}/prepare-links`, {
+      method: "POST",
+    });
+    return jsonOrThrow<BillingV2PrepareLinksResponse>(res);
   },
 };

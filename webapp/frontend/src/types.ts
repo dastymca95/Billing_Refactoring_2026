@@ -138,6 +138,11 @@ export type PreviewRowMeta = {
   ai_tax_handling?: string | null;
   ai_invoice_date_source?: string | null;
   ai_zero_amount_lines_excluded?: number;
+  readiness_snapshot_id?: string;
+  readiness_status?: "ready" | "needs_review" | "blocked";
+  accounting_decision?: Record<string, unknown> | null;
+  semantic_classification?: Record<string, unknown> | null;
+  document_facts?: Record<string, unknown> | null;
 };
 
 export type AiVendorCandidate = {
@@ -285,6 +290,36 @@ export type PreviewRow = {
   [key: string]: unknown;
 };
 
+export type ReadinessIssue = {
+  code: string;
+  severity: "blocking" | "non_blocking" | "info";
+  scope: string;
+  invoice_id?: string | null;
+  line_item_id?: string | null;
+  field?: string | null;
+  message: string;
+  source: string;
+  evidence: Record<string, unknown>[];
+  resolution_required: boolean;
+  resolved: boolean;
+  resolved_by?: string | null;
+  resolved_at?: string | null;
+  resolution_evidence?: Record<string, unknown> | null;
+};
+
+export type AccountingReadiness = {
+  contract_version: string;
+  snapshot_id: string;
+  status: "ready" | "needs_review" | "blocked";
+  export_allowed: boolean;
+  blockers: ReadinessIssue[];
+  non_blocking_issues: ReadinessIssue[];
+  validated_fields: Record<string, boolean>;
+  reconciliation_status: string;
+  duplicate_status: string;
+  evaluated_at: string;
+};
+
 export type PreviewResponse = {
   batch_id: string;
   summary: ProcessResult["summary"];
@@ -300,6 +335,8 @@ export type PreviewResponse = {
   invoice_count: number;
   row_count: number;
   unsupported_files: any[];
+  accounting_readiness?: AccountingReadiness;
+  invoice_readiness?: Record<string, AccountingReadiness>;
 };
 
 export type BatchStatus = {
@@ -731,4 +768,35 @@ export type ExportResponse = {
   export_used_edited_rows?: boolean;
   edited_rows_count?: number;
   rows_written?: number;
+  accounting_readiness?: AccountingReadiness;
+};
+
+export type BillingV2ProcessorAuditEntry = {
+  vendor_key: string;
+  entrypoint: string;
+  module: string;
+  deterministic: boolean;
+  available: boolean;
+  error?: string;
+};
+
+export type BillingV2AuditResponse = {
+  generated_at: string;
+  count: number;
+  available_count: number;
+  processors: BillingV2ProcessorAuditEntry[];
+  ai_fallback_module: { module: string; available: boolean; error?: string };
+};
+
+export type BillingV2PrepareLinksResponse = {
+  batch_id: string;
+  prepared: boolean;
+  changed?: boolean;
+  reason?: string;
+  cache_path?: string;
+  rows_total: number;
+  rows_with_links: number;
+  rows_missing_links: number;
+  links: { local_webapp: number; dropbox: number; external: number; missing: number };
+  audit_dir?: string;
 };

@@ -1,0 +1,31 @@
+Number,Name,Type,Description
+1100,Cash Asset,Asset,Non payable asset
+6139,Internet Utility,Expense,Fiber internet connection
+6118,Memberships,Expense,Subscriptions and memberships
+6188,Fees,Expense,One time fees
+6205,Legal Services,Expense,Legal service
+6500,General Repairs,Expense,General contract repair
+6505,Appliance Repairs,Expense,Appliance service
+6530,Contract Maintenance,Expense,General maintenance service
+6540,Electrical Contract,Expense,Electrical labor service
+6555,HVAC Contract,Expense,HVAC labor service
+6565,Plumbing Contract,Expense,Plumbing labor service
+6615,General Supplies,Expense,General materials
+6627,Electrical Supplies,Expense,Electrical parts materials
+6651,Cabinet Hardware,Expense,Bar pulls and cabinet hardware
+6669,Maintenance Supplies,Expense,Maintenance materials
+6675,Plumbing Supplies,Expense,Plumbing parts materials
+6730,Cleaning Supplies,Expense,Cleaning chemicals materials
+6740,Carpet Cleaning,Expense,Carpet cleaning service
+6750,Cleaning Contract,Expense,Cleaning labor service
+6760,Painting Contract,Expense,Painting labor service
+6770,Paint Supplies,Expense,Paint materials supplies
+6775,Turn Services,Expense,Unit turn service
+6790,Turn Supplies,Expense,Unit turn materials
+6905,Cable and Internet,Expense,Cable internet connection
+6940,Trash Removal,Expense,Trash collection service
+6955,Water Utility,Expense,Water usage utility
+6956,Utility Fees,Expense,Utility connection fee
+7120,Insurance,Expense,Insurance policy
+7595,Capital Improvements,Expense,Capital renovation
+8050,Legal Professional Fees,Expense,Legal attorney service

@@ -12,12 +12,13 @@ from pathlib import Path
 def _find_project_root() -> Path:
     here = Path(__file__).resolve()
     for candidate in [here, *here.parents]:
-        if (candidate / "config" / "vendors").is_dir() and (candidate / "Output" / "Template.xlsx").is_file():
+        if (candidate / "webapp" / "backend").is_dir() and (candidate / "config" / "canonical_rules.yaml").is_file():
             return candidate
     raise RuntimeError("Could not locate project root from " + str(here))
 
 
 PROJECT_ROOT = _find_project_root()
+RUNTIME_ASSET_ROOT = Path(os.environ.get("INNER_VIEW_TEST_ASSET_ROOT") or PROJECT_ROOT).resolve()
 
 
 def _load_project_env() -> None:
@@ -61,9 +62,9 @@ class InvalidBatchIdError(ValueError):
     """Raised when a caller supplies a batch id outside the generated format."""
 
 # Existing project assets (read-only)
-RESMAN_TEMPLATE = PROJECT_ROOT / "Output" / "Template.xlsx"
+RESMAN_TEMPLATE = RUNTIME_ASSET_ROOT / "Output" / "Template.xlsx"
 VENDORS_INDEX_YAML = PROJECT_ROOT / "config" / "vendor_rules_index.yaml"
-VENDORS_DIR = PROJECT_ROOT / "config" / "vendors"
+VENDORS_DIR = RUNTIME_ASSET_ROOT / "config" / "vendors"
 GENERAL_LEDGER_REFERENCE = PROJECT_ROOT / "config" / "general_ledger_reference.yaml"
 
 

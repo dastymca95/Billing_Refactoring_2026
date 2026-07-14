@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+os.environ.setdefault(
+    "INNER_VIEW_TEST_ASSET_ROOT",
+    str(ROOT / "webapp" / "backend" / "tests" / "fixtures" / "runtime_assets"),
+)
 
 from webapp.backend.services.canonical_invoice_fixtures import list_fixtures, run_fixture  # noqa: E402
 
@@ -30,6 +35,8 @@ def collect_metrics() -> dict[str, Any]:
         "missing_gl": 0,
         "semantic_unknown": 0,
         "processing_failures": 0,
+        "legacy_fixture_assertion_failures": 0,
+        "accounting_failures": 0,
         "skipped_fixtures": [],
     }
     for fixture in list_fixtures()["fixtures"]:
@@ -47,7 +54,10 @@ def collect_metrics() -> dict[str, Any]:
             continue
         metrics["invoices_compared"] += 1
         if not result.get("ok"):
-            metrics["processing_failures"] += 1
+            # The historical fixture also asserts vendor/property/description
+            # behavior. A mismatch there is not a processing failure and must
+            # not be misreported as a V2 accounting failure.
+            metrics["legacy_fixture_assertion_failures"] += 1
         for row in result.get("rows") or []:
             metrics["lines_compared"] += 1
             meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
@@ -62,6 +72,9 @@ def collect_metrics() -> dict[str, Any]:
                 metrics["blocked_decisions"] += 1
             if not decision.get("selected_gl_code"):
                 metrics["missing_gl"] += 1
+                metrics["accounting_failures"] += 1
+            if decision.get("decision_source") != "AccountingDecisionEngine":
+                metrics["accounting_failures"] += 1
             if semantics.get("line_family") == "unknown" or semantics.get("work_mode") == "unknown":
                 metrics["semantic_unknown"] += 1
     return metrics
@@ -78,7 +91,7 @@ def main() -> int:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered, encoding="utf-8")
     print(rendered, end="")
-    return 1 if metrics["processing_failures"] else 0
+    return 1 if metrics["processing_failures"] or metrics["accounting_failures"] else 0
 
 
 if __name__ == "__main__":

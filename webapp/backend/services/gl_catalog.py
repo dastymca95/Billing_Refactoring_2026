@@ -15,7 +15,7 @@ from .gl_payability import is_payable_gl_account
 
 
 CONFIG_PATH = settings.PROJECT_ROOT / "config" / "accounting_decision_v2.yaml"
-CHART_PATH = settings.PROJECT_ROOT / "Gl Codes" / "Chart Of Accounts.csv"
+CHART_PATH = settings.RUNTIME_ASSET_ROOT / "Gl Codes" / "Chart Of Accounts.csv"
 
 
 @lru_cache(maxsize=1)

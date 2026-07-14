@@ -774,7 +774,7 @@ def _load_vendor_yaml_profile(vendor_name: str) -> dict[str, Any]:
     slug = re.sub(r"[^a-z0-9]+", "_", ai_mapping_review.normalize_key(vendor_name)).strip("_")
     if not slug:
         return {}
-    path = settings.PROJECT_ROOT / "config" / "vendors" / f"{slug}.yaml"
+    path = settings.RUNTIME_ASSET_ROOT / "config" / "vendors" / f"{slug}.yaml"
     if not path.is_file():
         return {}
     try:

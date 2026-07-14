@@ -1,8 +1,10 @@
 {
+  "accounting_failures": 0,
   "benchmark_scope": "regression_only_not_a_model_benchmark",
   "blocked_decisions": 0,
   "corpus": "complete canonical regression fixtures",
   "invoices_compared": 5,
+  "legacy_fixture_assertion_failures": 3,
   "legacy_v2_different": 0,
   "legacy_v2_equal": 9,
   "lines_compared": 9,

@@ -19,6 +19,7 @@ import yaml
 
 from .. import settings
 from . import ai_mapping_review
+from .service_invoice_gl_reasoning import build_gl_accounting_reasoning
 from utils.text_normalization import (
     normalize_service_address_for_description,
     proper_case_preserve_acronyms,
@@ -509,6 +510,14 @@ def _apply_gl_rules(out: dict[str, Any], category: str, rules: dict[str, Any]) -
     for item in out.get("line_items") or []:
         if not isinstance(item, dict):
             continue
+        reasoning = build_gl_accounting_reasoning(out, item, category)
+        if reasoning:
+            item["gl_accounting_reasoning"] = reasoning
+            selected = str(reasoning.get("selected_gl_code") or "").strip()
+            if selected:
+                item["source_gl_candidate"] = item.get("gl_account_candidate")
+                item["gl_account_candidate"] = selected
+                item["gl_suggestion_source"] = "accounting_decision_engine"
         raw = str(item.get("gl_account_candidate") or "").strip()
         valid = ai_mapping_review.validate_gl_account(raw)
         if valid:

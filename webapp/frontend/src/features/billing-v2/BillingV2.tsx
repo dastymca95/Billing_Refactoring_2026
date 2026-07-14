@@ -988,16 +988,8 @@ function renderViewer({
       filename={filename}
       targetPage={documentTarget}
       onActivePageChange={onActivePageChange}
-      files={files}
-      uploadItems={uploadItems}
-      onAddDocuments={onAddDocuments}
-      onProcessBatch={onProcessBatch}
-      isProcessing={processing}
       aiProgress={progress}
       onPopout={isDetached ? undefined : onDetach}
-      onReattach={isDetached ? onReattach : undefined}
-      isDetachedWindow={isDetached}
-      batchSelector={<span className="billing-v2-viewer-batch">Billing V2</span>}
     />
   );
 }

@@ -67,7 +67,7 @@ def test_kros_invoice_uses_line_level_accounting_reasoning():
     line1 = items[0]
     r1 = line1["gl_accounting_reasoning"]
     assert "Painting" in line1["description"]
-    assert line1.get("location") == "21"
+    assert r1["classification"]["location_detected"] == "21"
     assert line1["gl_account_candidate"] != "6770"
     assert r1["classification"]["work_mode"] == "labor_service"
     assert r1["classification"]["trade_family"] == "painting"
@@ -90,7 +90,7 @@ def test_kros_invoice_uses_line_level_accounting_reasoning():
     line4 = items[3]
     r4 = line4["gl_accounting_reasoning"]
     assert "bathtub Unit 60" in line4["description"]
-    assert line4.get("location") == "60"
+    assert r4["classification"]["location_detected"] == "60"
     assert line4["gl_account_candidate"] != "6770"
     assert r4["classification"]["trade_family"] == "tub_refinishing"
     assert line4["gl_account_candidate"] in {"6570", "6760", "7595", "6500"}
