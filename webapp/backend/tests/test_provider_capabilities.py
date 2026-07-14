@@ -233,3 +233,32 @@ def test_provider_http_error_body_is_not_written_to_logs(monkeypatch, caplog):
         )
     assert marker not in caplog.text
     assert "local-test-secret" not in caplog.text
+
+
+def test_openai_probe_uses_gpt56_compatible_completion_parameters(monkeypatch):
+    from pydantic import SecretStr
+    from webapp.backend.services.provider_capabilities import OpenAICompatibleProbeTransport
+
+    captured = {}
+
+    def send(**kwargs):
+        captured.update(kwargs)
+        return '{"probe":"IV39C_JSON","ok":true}'
+
+    monkeypatch.setattr(ai_provider, "_send_chat_completion", send)
+    profile = ModelProfile(
+        provider="openai", profile_id="runtime-text", model_id="configured-model",
+        role=ModelProfileRole.TEXT_EXTRACTION,
+        declared_capabilities=[ModelCapability.STRUCTURED_OUTPUT], credentials_present=True,
+        base_url_configured=True, api_key=SecretStr("local-test-secret"),
+        base_url="https://api.openai.com/v1",
+    )
+    result = OpenAICompatibleProbeTransport()(profile, ModelCapability.STRUCTURED_OUTPUT, {
+        "system": "Return JSON", "prompt": "Return JSON", "trace_id": "trace:test",
+        "cache_key": "cache:test",
+    })
+    payload = captured["payload"]
+    assert result["ok"] is True
+    assert payload["max_completion_tokens"] == 512
+    assert payload["reasoning_effort"] == "low"
+    assert "temperature" not in payload and "max_tokens" not in payload

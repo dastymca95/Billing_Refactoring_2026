@@ -349,9 +349,12 @@ class OpenAICompatibleProbeTransport:
             if not image: raise RuntimeError("private_vision_probe_image_missing")
             content = [{"type": "text", "text": request["prompt"]},
                        {"type": "image_url", "image_url": {"url": image}}]
-        payload = {"model": profile.model_id, "temperature": 0, "response_format": {"type": "json_object"},
-            "messages": [{"role": "system", "content": request["system"]}, {"role": "user", "content": content}],
-            "max_tokens": 300}
+        payload = {"model": profile.model_id, "response_format": {"type": "json_object"},
+            "messages": [{"role": "system", "content": request["system"]}, {"role": "user", "content": content}]}
+        if profile.provider == "openai":
+            payload.update({"max_completion_tokens": 512, "reasoning_effort": "low"})
+        else:
+            payload.update({"max_tokens": 300, "temperature": 0})
         raw = ai_provider._send_chat_completion(
             provider=profile.provider,
             payload=payload,
