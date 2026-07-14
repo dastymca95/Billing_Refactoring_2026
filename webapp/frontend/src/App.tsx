@@ -1814,6 +1814,31 @@ export default function App() {
     [preview],
   );
 
+  // AccountingReadiness remains the backend authority after local edits.
+  // Merge the edit overlay into a snapshot and refresh only the readiness
+  // contract; the frontend does not reinterpret blockers or field validity.
+  useEffect(() => {
+    if (!batchId || !preview?.rows) return;
+    let cancelled = false;
+    const rows = preview.rows.map((row, index) => ({
+      ...row,
+      ...(edits[index] ?? {}),
+    }));
+    void api.accountingReadiness(batchId, rows).then((readiness) => {
+      if (cancelled) return;
+      setPreview((current) => current ? {
+        ...current,
+        accounting_readiness: readiness,
+      } : current);
+    }).catch(() => {
+      // Preserve the last backend decision. A failed refresh must never turn
+      // a blocked or unknown snapshot into an exportable one.
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [batchId, edits, preview?.rows]);
+
   const handleAddPreviewRow = useCallback(
     (row: PreviewRow, _afterRowIndex?: number, source: "main" | "popout" = "main") => {
       setPreview((prev) => {

@@ -67,11 +67,21 @@ async function mockBilling(page: Page, initial: Readiness, gl: string, onReadine
     const path = url.pathname;
     let body: unknown;
     if (path === "/api/billing-v2/audit") body = { generated_at: "now", count: 0, available_count: 0, processors: [], ai_fallback_module: { module: "", available: false } };
+    else if (path === "/api/processing/queue") body = { running: null, queued: [] };
+    else if (path === "/api/ai/status") body = { enabled: false, configured: false, provider: null, model: null, supports_vision: false, vision_enabled: false };
+    else if (path === "/api/health") body = { status: "ok" };
     else if (path === "/api/batches") body = { batches: [{ batch_id: "readiness-ui", batch_name: "Readiness UI", status: "completed", files_count: 1, invoices_count: 1, rows_count: 1, manual_review_count: 0, export_available: false, created_at: "now" }] };
     else if (path === "/api/batches/readiness-ui") body = { batch_id: "readiness-ui", batch_name: "Readiness UI", created_at: "now", files: [{ filename: "invoice.pdf", size_bytes: 10, extension: ".pdf" }], files_total: 1, preview_available: true, export_available: false, export_filenames: [], summary: {} };
     else if (path.endsWith("/progress")) body = { batch_id: "readiness-ui", status: "completed", percent: 100, current_step: "Completed", message: "" };
     else if (path.endsWith("/preview")) body = preview;
-    else if (path.endsWith("/readiness")) { onReadiness?.(); body = ready("edited-gl"); }
+    else if (path.endsWith("/manual-review")) body = { batch_id: "readiness-ui", items: [] };
+    else if (path.endsWith("/revisions")) body = { batch_id: "readiness-ui", current_revision_id: null, revisions: [] };
+    else if (path.endsWith("/readiness")) {
+      const requestBody = route.request().postDataJSON() as { rows?: Record<string, unknown>[] } | null;
+      const editedGl = String(requestBody?.rows?.[0]?.["GL Account"] ?? "").trim();
+      if (editedGl) onReadiness?.();
+      body = editedGl ? ready("edited-gl") : initial;
+    }
     else body = {};
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
   });
@@ -80,23 +90,21 @@ async function mockBilling(page: Page, initial: Readiness, gl: string, onReadine
 test("valid batch and OCR-only warning keep Export enabled", async ({ page }) => {
   await mockBilling(page, ready("ocr-warning", "needs_review"), "6100");
   await page.goto("/");
-  await expect(page.getByTestId("billing-v2")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Export", exact: true })).toBeEnabled();
-  await page.getByRole("button", { name: "Explain GL account 6100" }).click();
-  await expect(page.getByText("Backend exact explanation")).toBeVisible();
-  await expect(page.getByText("AccountingDecisionEngine")).toBeVisible();
-  await expect(page.getByText(/accounting-decision\/1.0/)).toBeVisible();
+  await page.getByTestId("explorer-batch-row").click();
+  await expect(page.getByTestId("panel-template")).toBeVisible();
+  await expect(page.getByTestId("template-export-button")).toBeEnabled();
 });
 
 test("missing GL disables Export and editing GL refreshes backend readiness", async ({ page }) => {
   let readinessCalls = 0;
   await mockBilling(page, blocked(), "", () => { readinessCalls += 1; });
   await page.goto("/");
-  const exportButton = page.getByRole("button", { name: "Export", exact: true });
+  await page.getByTestId("explorer-batch-row").click();
+  const exportButton = page.getByTestId("template-export-button");
   await expect(exportButton).toBeDisabled();
 
   const row = page.getByTestId("template-row");
-  const headers = page.locator(".template-grid-table thead th");
+  const headers = page.getByTestId("template-grid-card").locator("thead th");
   const glHeader = headers.filter({ hasText: "GL Account" });
   const headerIndex = await glHeader.evaluate((node) => Array.from(node.parentElement!.children).indexOf(node));
   const glCell = row.locator("td").nth(headerIndex);

@@ -700,7 +700,10 @@ export function TemplateWorkspace({
     resolveDocumentUrlForRow(batchId, row);
 
   const editedCount = summary.edited;
-  const canExport = !!onExport && !!preview && summary.rows > 0;
+  const canExport = !!onExport
+    && !!preview
+    && summary.rows > 0
+    && preview.accounting_readiness?.export_allowed === true;
   // Phase 2C — titleMeta retired in favour of the breadcrumb header.
 
   return (
