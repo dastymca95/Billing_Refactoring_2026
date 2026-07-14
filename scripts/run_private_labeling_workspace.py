@@ -22,6 +22,7 @@ from webapp.backend.services.private_labeling_workspace import (  # noqa: E402
     LabelValidationError, PrivateLabelingWorkspace, WorkspaceError,
 )
 from webapp.backend.services.reviewer_1_pilot import Reviewer1Pilot  # noqa: E402
+from webapp.backend.services.assisted_labeling import AssistedLabelingService  # noqa: E402
 
 
 HTML = r"""<!doctype html>
@@ -54,10 +55,15 @@ async function saveLabel(status){try{let payload={benchmark_id:current,reviewer_
 label.addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(()=>{if(current&&reviewer.value)saveLabel('in_progress')},1500)});refresh();
 </script></body></html>"""
 
+# Phase 3.9A uses a structured form; the embedded legacy JSON editor remains
+# available only as historical fallback source and is not served.
+HTML = (ROOT / "webapp/backend/static/reviewer_1_assisted_workspace.html").read_text(encoding="utf-8")
+
 
 class Handler(BaseHTTPRequestHandler):
     workspace: PrivateLabelingWorkspace
     pilot: Reviewer1Pilot
+    assisted: AssistedLabelingService
     token: str
 
     def do_GET(self):
@@ -70,7 +76,10 @@ class Handler(BaseHTTPRequestHandler):
             if route.path == "/api/tier-d": return self._json(self.workspace.tier_d_queue())
             if route.path == "/api/pilot": return self._json(self.pilot.queue())
             if route.path == "/api/pilot-status": return self._json(self.pilot.metrics())
+            if route.path == "/api/assisted-metrics": return self._json(self.assisted.metrics())
             parts = route.path.strip("/").split("/")
+            if len(parts) == 3 and parts[:2] == ["api", "assisted"]:
+                return self._json(self.assisted.review_state(parts[2]))
             if len(parts) == 5 and parts[:3] == ["api", "private-workspace", "document"] and parts[4] == "preview":
                 path = self.workspace.private_document_path(parts[3])
                 return self._bytes(path.read_bytes(), mimetypes.guess_type(path.name)[0] or "application/octet-stream")
@@ -93,6 +102,20 @@ class Handler(BaseHTTPRequestHandler):
                     action=body["action"], details=body.get("details")))
             if self.path == "/api/pilot-abandon":
                 return self._json(self.pilot.abandon_draft(body["benchmark_id"], reviewer_id=body["reviewer_id"], reason=body["reason"]))
+            if self.path == "/api/assisted-field":
+                return self._json(self.assisted.decide_field(body["benchmark_id"], body["field_path"],
+                    reviewer_id=body["reviewer_id"], action=body["action"], human_value=body.get("human_value"),
+                    reason=body.get("reason"), evidence_inspected=body.get("evidence_inspected", False),
+                    reviewer_confidence=body.get("reviewer_confidence")))
+            if self.path == "/api/assisted-accept-safe":
+                return self._json(self.assisted.accept_non_conflicting(body["benchmark_id"], reviewer_id=body["reviewer_id"],
+                    evidence_inspected=body.get("evidence_inspected", False)))
+            if self.path == "/api/assisted-approve":
+                return self._json(self.assisted.approve_document(body["benchmark_id"], reviewer_id=body["reviewer_id"],
+                    evidence_inspected=body.get("evidence_inspected", False)))
+            if self.path == "/api/preview-rotation":
+                return self._json(self.workspace.set_preview_rotation(body["benchmark_id"], int(body["degrees_clockwise"]),
+                    reviewer_id=body["reviewer_id"]))
             if self.path == "/api/source-metadata-review":
                 return self._json(self.workspace.review_source_metadata_candidate(body["benchmark_id"], body["candidate_id"],
                     reviewer_id=body["reviewer_id"], disposition=body["disposition"], note=body.get("note")))
@@ -128,6 +151,8 @@ def main() -> int:
     Handler.workspace = PrivateLabelingWorkspace(args.root, catalog)
     Handler.pilot = Reviewer1Pilot(Handler.workspace)
     Handler.pilot.prepare_manifest()
+    Handler.assisted = AssistedLabelingService(Handler.workspace, Handler.pilot)
+    Handler.assisted.record_dataset_owner_validity()
     if args.safe_status:
         args.safe_status.parent.mkdir(parents=True, exist_ok=True)
         args.safe_status.write_text(Handler.workspace.safe_status_markdown(), encoding="utf-8")

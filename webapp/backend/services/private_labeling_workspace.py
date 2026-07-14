@@ -291,6 +291,19 @@ class PrivateLabelingWorkspace:
         return next((int(row["degrees_clockwise"]) for row in payload.get("rotations", [])
                      if row.get("benchmark_id") == benchmark_id), 0)
 
+    def set_preview_rotation(self, benchmark_id: str, degrees_clockwise: int, *, reviewer_id: str) -> dict[str, Any]:
+        if degrees_clockwise not in {0, 90, 180, 270}: raise WorkspaceError("invalid preview rotation")
+        path = self.private_document_path(benchmark_id); source_hash = _sha256_file(path)
+        payload = self._read_json(self.transforms_path, {"schema_version": "preview-transformations/1.0", "rotations": []})
+        rotations = [row for row in payload.get("rotations", []) if row.get("benchmark_id") != benchmark_id]
+        event = {"benchmark_id": benchmark_id, "degrees_clockwise": degrees_clockwise,
+                 "source_sha256": source_hash, "source_modified": False, "derived_from": "reviewer_preview_control",
+                 "reviewer_id": reviewer_id, "created_at": utc_now()}
+        rotations.append(event); payload.update({"rotations": rotations, "updated_at": utc_now()})
+        self._atomic_json(self.transforms_path, payload)
+        if _sha256_file(path) != source_hash: raise WorkspaceError("source changed while saving preview rotation")
+        return event
+
     def _replace(self, benchmark_id: str, replacement_id: str | None) -> str:
         selected, reserve = self.selected(), self.reserve()
         current = next(row for row in selected if row["benchmark_id"] == benchmark_id)
