@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from . import ai_provider
 from .model_registry import ModelRegistry, ModelRole, ModelSpec
@@ -25,10 +27,18 @@ class ModelCapability(str, Enum):
     INDEPENDENT_VERIFICATION = "independent_verification"
 
 
+class ModelProfileRole(str, Enum):
+    TEXT_EXTRACTION = "text_extraction"
+    MULTIMODAL_EXTRACTION = "multimodal_extraction"
+    INDEPENDENT_VERIFICATION = "independent_verification"
+    ACCOUNTING_REASONING = "accounting_reasoning"
+
+
 class ModelProfile(BaseModel):
     provider: str
     profile_id: str
     model_id: str
+    role: ModelProfileRole = ModelProfileRole.TEXT_EXTRACTION
     declared_capabilities: list[ModelCapability]
     base_url_configured: bool = False
     credentials_present: bool = False
@@ -36,6 +46,21 @@ class ModelProfile(BaseModel):
     vision: bool = False
     timeout_seconds: int = Field(default=45, ge=1, le=300)
     max_retries: int = Field(default=2, ge=0, le=5)
+    api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+    base_url: str | None = Field(default=None, exclude=True, repr=False)
+    trace_namespace: str = "profile"
+    cache_namespace: str = "profile"
+    model_family: str | None = None
+    verification_independence: str | None = None
+
+
+class CapabilityProbeEvidence(BaseModel):
+    capability: ModelCapability
+    trace_id: str
+    cache_key: str
+    request_role: ModelProfileRole
+    passed: bool
+    failure_reason: str | None = None
 
 
 class ModelProfileCapabilityReport(BaseModel):
@@ -47,6 +72,9 @@ class ModelProfileCapabilityReport(BaseModel):
     unavailable_capabilities: list[ModelCapability] = Field(default_factory=list)
     health_status: str
     failure_reason: str | None = None
+    role: ModelProfileRole
+    verification_independence: str | None = None
+    probe_evidence: list[CapabilityProbeEvidence] = Field(default_factory=list)
     verified_at: datetime
 
 
@@ -64,6 +92,7 @@ class ProviderActivationReport(BaseModel):
     """Conservative gate between probes and autonomous runtime wiring."""
 
     schema_version: str = "provider-activation/1.0"
+    text_profile_ids: list[str] = Field(default_factory=list)
     multimodal_profile_ids: list[str] = Field(default_factory=list)
     reasoning_profile_ids: list[str] = Field(default_factory=list)
     independent_verifier_profile_ids: list[str] = Field(default_factory=list)
@@ -92,29 +121,76 @@ class ProfileLoader:
         provider = os.environ.get("AI_PROVIDER", "").strip().lower()
         key = os.environ.get("AI_API_KEY", "").strip()
         base = os.environ.get("AI_BASE_URL", "").strip()
-        timeout = _int_env("AI_TIMEOUT_SECONDS", 45); profiles = []
+        timeout = _int_env("AI_TIMEOUT_SECONDS", 45)
+        profiles: list[ModelProfile] = []
         text = os.environ.get("AI_MODEL", "").strip()
         if provider and text:
-            profiles.append(ModelProfile(provider=provider, profile_id="runtime-text", model_id=text,
-                declared_capabilities=[ModelCapability.TEXT_EXTRACTION, ModelCapability.STRUCTURED_OUTPUT,
-                    ModelCapability.LONG_DOCUMENT_PROCESSING], credentials_present=bool(key),
-                base_url_configured=bool(base or provider == "openai"), timeout_seconds=timeout))
+            profiles.append(_environment_profile(
+                provider=provider,
+                profile_id="runtime-text",
+                model_id=text,
+                role=ModelProfileRole.TEXT_EXTRACTION,
+                capabilities=[ModelCapability.TEXT_EXTRACTION, ModelCapability.STRUCTURED_OUTPUT,
+                              ModelCapability.LONG_DOCUMENT_PROCESSING],
+                api_key=key,
+                base_url=base,
+                timeout=timeout,
+                model_family=os.environ.get("AI_MODEL_FAMILY", "").strip() or None,
+            ))
         vision_model = os.environ.get("AI_VISION_MODEL", "").strip()
         vision_provider = os.environ.get("AI_VISION_PROVIDER", "").strip().lower() or provider
         vision_key = os.environ.get("AI_VISION_API_KEY", "").strip() or key
         vision_base = os.environ.get("AI_VISION_BASE_URL", "").strip() or base
         if vision_provider and vision_model:
-            profiles.append(ModelProfile(provider=vision_provider, profile_id="runtime-vision", model_id=vision_model,
-                declared_capabilities=[ModelCapability.TEXT_EXTRACTION, ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
-                    ModelCapability.STRUCTURED_OUTPUT], credentials_present=bool(vision_key),
-                base_url_configured=bool(vision_base or vision_provider == "openai"), vision=True, timeout_seconds=timeout))
+            profiles.append(_environment_profile(
+                provider=vision_provider,
+                profile_id="runtime-vision",
+                model_id=vision_model,
+                role=ModelProfileRole.MULTIMODAL_EXTRACTION,
+                capabilities=[ModelCapability.TEXT_EXTRACTION, ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
+                              ModelCapability.HANDWRITING_INTERPRETATION, ModelCapability.STRUCTURED_OUTPUT],
+                api_key=vision_key,
+                base_url=vision_base,
+                timeout=timeout,
+                vision=True,
+                model_family=os.environ.get("AI_VISION_MODEL_FAMILY", "").strip() or None,
+            ))
+        verification_model = os.environ.get("AI_VERIFICATION_MODEL", "").strip()
+        verification_provider = os.environ.get("AI_VERIFICATION_PROVIDER", "").strip().lower() or provider
+        verification_key = os.environ.get("AI_VERIFICATION_API_KEY", "").strip() or key
+        verification_base = os.environ.get("AI_VERIFICATION_BASE_URL", "").strip() or base
+        if verification_provider and verification_model:
+            profiles.append(_environment_profile(
+                provider=verification_provider,
+                profile_id="runtime-verification",
+                model_id=verification_model,
+                role=ModelProfileRole.INDEPENDENT_VERIFICATION,
+                capabilities=[ModelCapability.INDEPENDENT_VERIFICATION,
+                              ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
+                              ModelCapability.STRUCTURED_OUTPUT],
+                api_key=verification_key,
+                base_url=verification_base,
+                timeout=timeout,
+                vision=True,
+                model_family=os.environ.get("AI_VERIFICATION_MODEL_FAMILY", "").strip() or None,
+            ))
         reasoner = os.environ.get("AI_ACCOUNTING_REASONING_MODEL", "").strip()
         reason_provider = os.environ.get("AI_ACCOUNTING_REASONING_PROVIDER", "").strip().lower() or provider
+        reason_key = os.environ.get("AI_ACCOUNTING_REASONING_API_KEY", "").strip() or key
+        reason_base = os.environ.get("AI_ACCOUNTING_REASONING_BASE_URL", "").strip() or base
         if reason_provider and reasoner:
-            profiles.append(ModelProfile(provider=reason_provider, profile_id="runtime-accounting", model_id=reasoner,
-                declared_capabilities=[ModelCapability.ACCOUNTING_REASONING, ModelCapability.INDEPENDENT_VERIFICATION,
-                    ModelCapability.STRUCTURED_OUTPUT], credentials_present=bool(key),
-                base_url_configured=bool(base or reason_provider == "openai"), timeout_seconds=timeout))
+            profiles.append(_environment_profile(
+                provider=reason_provider,
+                profile_id="runtime-accounting",
+                model_id=reasoner,
+                role=ModelProfileRole.ACCOUNTING_REASONING,
+                capabilities=[ModelCapability.ACCOUNTING_REASONING, ModelCapability.STRUCTURED_OUTPUT],
+                api_key=reason_key,
+                base_url=reason_base,
+                timeout=timeout,
+                model_family=os.environ.get("AI_ACCOUNTING_REASONING_MODEL_FAMILY", "").strip() or None,
+            ))
+        _record_verification_independence(profiles)
         return profiles
 
 
@@ -123,7 +199,10 @@ class ProviderCapabilityValidator:
         self.transport = transport or OpenAICompatibleProbeTransport()
 
     def validate(self, profile: ModelProfile) -> ModelProfileCapabilityReport:
-        unavailable = []; verified = []; reasons = []
+        unavailable = []
+        verified = []
+        reasons = []
+        evidence: list[CapabilityProbeEvidence] = []
         if not profile.enabled: reasons.append("profile_disabled")
         if not profile.credentials_present: reasons.append("credentials_missing")
         if profile.provider != "openai" and not profile.base_url_configured: reasons.append("endpoint_missing")
@@ -131,19 +210,38 @@ class ProviderCapabilityValidator:
             return ModelProfileCapabilityReport(provider=profile.provider, profile_id=profile.profile_id,
                 model_id=profile.model_id, declared_capabilities=profile.declared_capabilities,
                 unavailable_capabilities=profile.declared_capabilities, health_status="disabled",
-                failure_reason=",".join(reasons), verified_at=datetime.now(timezone.utc))
+                failure_reason=",".join(reasons), verified_at=datetime.now(timezone.utc),
+                role=profile.role, verification_independence=profile.verification_independence)
         for capability in profile.declared_capabilities:
+            request = _probe_request(profile, capability)
             try:
-                payload = self.transport(profile, capability, _probe_request(capability))
-                if _probe_passed(capability, payload): verified.append(capability)
-                else: unavailable.append(capability); reasons.append(f"{capability.value}:probe_assertion_failed")
+                payload = self.transport(profile, capability, request)
+                passed = _probe_passed(capability, payload)
+                if passed:
+                    verified.append(capability)
+                else:
+                    unavailable.append(capability)
+                    reasons.append(f"{capability.value}:probe_assertion_failed")
+                evidence.append(CapabilityProbeEvidence(
+                    capability=capability, trace_id=request["trace_id"], cache_key=request["cache_key"],
+                    request_role=profile.role, passed=passed,
+                    failure_reason=None if passed else "probe_assertion_failed",
+                ))
             except Exception as exc:
-                unavailable.append(capability); reasons.append(f"{capability.value}:{type(exc).__name__}")
+                failure = type(exc).__name__
+                unavailable.append(capability)
+                reasons.append(f"{capability.value}:{failure}")
+                evidence.append(CapabilityProbeEvidence(
+                    capability=capability, trace_id=request["trace_id"], cache_key=request["cache_key"],
+                    request_role=profile.role, passed=False, failure_reason=failure,
+                ))
         health = "healthy" if verified and not unavailable else ("degraded" if verified else "unavailable")
         return ModelProfileCapabilityReport(provider=profile.provider, profile_id=profile.profile_id,
             model_id=profile.model_id, declared_capabilities=profile.declared_capabilities,
             verified_capabilities=verified, unavailable_capabilities=unavailable, health_status=health,
-            failure_reason=";".join(reasons) or None, verified_at=datetime.now(timezone.utc))
+            failure_reason=";".join(reasons) or None, verified_at=datetime.now(timezone.utc),
+            role=profile.role, verification_independence=profile.verification_independence,
+            probe_evidence=evidence)
 
     def audit(self, profiles: list[ModelProfile]) -> ProviderAuditReport:
         reports = [self.validate(profile) for profile in profiles]
@@ -165,7 +263,7 @@ class VerifiedCapabilityRegistry:
         return [report for report in self.reports if capability in report.verified_capabilities]
 
     def activated_model_registry(self) -> ModelRegistry:
-        specs = []
+        specs_by_model: dict[str, ModelSpec] = {}
         for report in self.reports:
             if not report.verified_capabilities: continue
             roles = set()
@@ -173,32 +271,56 @@ class VerifiedCapabilityRegistry:
             if ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING in report.verified_capabilities: roles.add(ModelRole.EXTRACTION_VISION)
             if ModelCapability.ACCOUNTING_REASONING in report.verified_capabilities: roles.add(ModelRole.ACCOUNTING_REASONING)
             if not roles: continue
-            specs.append(ModelSpec(model_id=report.model_id, provider=report.provider, roles=frozenset(roles),
-                supports_json_schema=ModelCapability.STRUCTURED_OUTPUT in report.verified_capabilities,
-                supports_vision=ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING in report.verified_capabilities,
-                strong_reasoner=ModelCapability.ACCOUNTING_REASONING in report.verified_capabilities))
-        return ModelRegistry(specs)
+            previous = specs_by_model.get(report.model_id)
+            combined_roles = roles | (set(previous.roles) if previous else set())
+            specs_by_model[report.model_id] = ModelSpec(model_id=report.model_id, provider=report.provider,
+                roles=frozenset(combined_roles),
+                supports_json_schema=(ModelCapability.STRUCTURED_OUTPUT in report.verified_capabilities
+                                      or bool(previous and previous.supports_json_schema)),
+                supports_vision=(ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING in report.verified_capabilities
+                                 or bool(previous and previous.supports_vision)),
+                strong_reasoner=(ModelCapability.ACCOUNTING_REASONING in report.verified_capabilities
+                                 or bool(previous and previous.strong_reasoner)))
+        return ModelRegistry(specs_by_model.values())
 
     def activation_report(self) -> ProviderActivationReport:
+        text = [
+            report.profile_id for report in self.reports
+            if report.role is ModelProfileRole.TEXT_EXTRACTION
+            and {
+                ModelCapability.TEXT_EXTRACTION,
+                ModelCapability.STRUCTURED_OUTPUT,
+            }.issubset(set(report.verified_capabilities))
+        ]
         multimodal = [
             report.profile_id for report in self.reports
-            if {
+            if report.role is ModelProfileRole.MULTIMODAL_EXTRACTION
+            and {
                 ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
+                ModelCapability.HANDWRITING_INTERPRETATION,
                 ModelCapability.STRUCTURED_OUTPUT,
             }.issubset(set(report.verified_capabilities))
         ]
         reasoning = [
             report.profile_id for report in self.reports
-            if {
+            if report.role is ModelProfileRole.ACCOUNTING_REASONING
+            and {
                 ModelCapability.ACCOUNTING_REASONING,
                 ModelCapability.STRUCTURED_OUTPUT,
             }.issubset(set(report.verified_capabilities))
         ]
         verifiers = [
             report.profile_id for report in self.reports
-            if ModelCapability.INDEPENDENT_VERIFICATION in report.verified_capabilities
+            if report.role is ModelProfileRole.INDEPENDENT_VERIFICATION
+            and {
+                ModelCapability.INDEPENDENT_VERIFICATION,
+                ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
+                ModelCapability.STRUCTURED_OUTPUT,
+            }.issubset(set(report.verified_capabilities))
         ]
         reasons = []
+        if not text:
+            reasons.append("verified_text_profile_missing")
         if not multimodal:
             reasons.append("verified_multimodal_profile_missing")
         if not reasoning:
@@ -206,6 +328,7 @@ class VerifiedCapabilityRegistry:
         if not verifiers:
             reasons.append("verified_independent_verifier_missing")
         return ProviderActivationReport(
+            text_profile_ids=text,
             multimodal_profile_ids=multimodal,
             reasoning_profile_ids=reasoning,
             independent_verifier_profile_ids=verifiers,
@@ -229,12 +352,29 @@ class OpenAICompatibleProbeTransport:
         payload = {"model": profile.model_id, "temperature": 0, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": request["system"]}, {"role": "user", "content": content}],
             "max_tokens": 300}
-        raw = ai_provider._send_chat_completion(provider=profile.provider, payload=payload, vision=vision)
+        raw = ai_provider._send_chat_completion(
+            provider=profile.provider,
+            payload=payload,
+            vision=vision,
+            api_key_override=profile.api_key.get_secret_value() if profile.api_key else None,
+            base_url_override=profile.base_url,
+            timeout_seconds_override=profile.timeout_seconds,
+            max_attempts_override=profile.max_retries + 1,
+        )
         return json.loads(raw)
 
 
-def _probe_request(capability: ModelCapability) -> dict[str, Any]:
-    system = "Return strict JSON only. This is a capability health probe; do not include reasoning narrative."
+def _probe_request(profile: ModelProfile, capability: ModelCapability) -> dict[str, Any]:
+    role_instructions = {
+        ModelProfileRole.TEXT_EXTRACTION: "Extract observable source content only; do not make accounting decisions.",
+        ModelProfileRole.MULTIMODAL_EXTRACTION: "Read visual source evidence only; preserve uncertainty.",
+        ModelProfileRole.INDEPENDENT_VERIFICATION: "Verify supplied evidence independently; do not reuse a prior conclusion.",
+        ModelProfileRole.ACCOUNTING_REASONING: "Reason over supplied facts without changing readiness or export authorization.",
+    }
+    system = (
+        "Return strict JSON only. This is a capability health probe; do not include reasoning narrative. "
+        + role_instructions[profile.role]
+    )
     prompts = {
         ModelCapability.TEXT_EXTRACTION: 'Return {"probe":"IV39C_TEXT","value":"invoice 42"}.',
         ModelCapability.STRUCTURED_OUTPUT: 'Return exactly a JSON object with probe="IV39C_JSON" and ok=true.',
@@ -244,7 +384,19 @@ def _probe_request(capability: ModelCapability) -> dict[str, Any]:
         ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING: 'Read the private probe image marker and return {"probe":"<marker>"}.',
         ModelCapability.HANDWRITING_INTERPRETATION: 'Read the handwritten marker and return {"probe":"<marker>"}.',
     }
-    return {"system": system, "prompt": prompts[capability]}
+    prompt = prompts[capability]
+    trace_id = f"{profile.trace_namespace}:{uuid.uuid4().hex}"
+    cache_material = json.dumps({
+        "namespace": profile.cache_namespace,
+        "profile_id": profile.profile_id,
+        "role": profile.role.value,
+        "model_id": profile.model_id,
+        "capability": capability.value,
+        "prompt": prompt,
+    }, sort_keys=True).encode("utf-8")
+    cache_key = f"{profile.cache_namespace}:{hashlib.sha256(cache_material).hexdigest()}"
+    return {"system": system, "prompt": prompt, "trace_id": trace_id,
+            "cache_key": cache_key, "role": profile.role.value}
 
 
 def _probe_passed(capability: ModelCapability, payload: Mapping[str, Any]) -> bool:
@@ -266,6 +418,52 @@ def _int_env(name: str, default: int) -> int:
     except ValueError: return default
 
 
-__all__ = ["ModelCapability", "ModelProfile", "ModelProfileCapabilityReport", "OpenAICompatibleProbeTransport",
+def _environment_profile(*, provider: str, profile_id: str, model_id: str,
+                         role: ModelProfileRole, capabilities: list[ModelCapability],
+                         api_key: str, base_url: str, timeout: int,
+                         vision: bool = False, model_family: str | None = None) -> ModelProfile:
+    return ModelProfile(
+        provider=provider,
+        profile_id=profile_id,
+        model_id=model_id,
+        role=role,
+        declared_capabilities=capabilities,
+        credentials_present=bool(api_key),
+        base_url_configured=bool(base_url or provider == "openai"),
+        vision=vision,
+        timeout_seconds=timeout,
+        api_key=SecretStr(api_key) if api_key else None,
+        base_url=base_url or None,
+        trace_namespace=f"provider-trace:{profile_id}",
+        cache_namespace=f"provider-cache:{profile_id}",
+        model_family=model_family,
+    )
+
+
+def _record_verification_independence(profiles: list[ModelProfile]) -> None:
+    verifier = next((item for item in profiles
+                     if item.role is ModelProfileRole.INDEPENDENT_VERIFICATION), None)
+    if verifier is None:
+        return
+    extraction = [item for item in profiles if item.role in {
+        ModelProfileRole.TEXT_EXTRACTION,
+        ModelProfileRole.MULTIMODAL_EXTRACTION,
+    }]
+    same_family = any(
+        verifier.provider == item.provider
+        and (
+            verifier.model_id == item.model_id
+            or bool(verifier.model_family and item.model_family
+                    and verifier.model_family == item.model_family)
+        )
+        for item in extraction
+    )
+    verifier.verification_independence = (
+        "isolated_same_family" if same_family else "isolated_unconfirmed_family"
+    )
+
+
+__all__ = ["CapabilityProbeEvidence", "ModelCapability", "ModelProfile", "ModelProfileCapabilityReport",
+           "ModelProfileRole", "OpenAICompatibleProbeTransport",
            "ProfileLoader", "ProviderActivationReport", "ProviderAuditReport", "ProviderCapabilityValidator",
            "VerifiedCapabilityRegistry"]

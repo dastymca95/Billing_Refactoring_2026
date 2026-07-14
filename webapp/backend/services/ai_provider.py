@@ -234,19 +234,27 @@ def _send_chat_completion(
     provider: str,
     payload: dict[str, Any],
     vision: bool = False,
+    api_key_override: str | None = None,
+    base_url_override: str | None = None,
+    timeout_seconds_override: int | None = None,
+    max_attempts_override: int | None = None,
 ) -> str:
     raw = json.dumps(payload).encode("utf-8")
     request_provider = (
-        (getattr(settings, "AI_VISION_PROVIDER", "") or provider).strip().lower()
-        if vision
-        else provider
+        provider
+        if api_key_override is not None or base_url_override is not None
+        else (
+            (getattr(settings, "AI_VISION_PROVIDER", "") or provider).strip().lower()
+            if vision
+            else provider
+        )
     )
-    request_base_url = (
+    request_base_url = base_url_override or (
         (getattr(settings, "AI_VISION_BASE_URL", "") or settings.AI_BASE_URL).strip()
         if vision
         else settings.AI_BASE_URL
     )
-    request_key = (
+    request_key = api_key_override or (
         (getattr(settings, "AI_VISION_API_KEY", "") or settings.AI_API_KEY).strip()
         if vision
         else settings.AI_API_KEY
@@ -257,7 +265,7 @@ def _send_chat_completion(
     url = _chat_completions_url(request_provider, request_base_url)
     label = "AI vision provider" if vision else "AI provider"
     retryable_statuses = {429, 500, 502, 503, 504}
-    max_attempts = 3 if vision else 2
+    max_attempts = max_attempts_override or (3 if vision else 2)
     last_http_error: tuple[int, str] | None = None
     for attempt in range(max_attempts):
         req = urllib.request.Request(
@@ -270,7 +278,10 @@ def _send_chat_completion(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=settings.AI_TIMEOUT_SECONDS) as resp:
+            with urllib.request.urlopen(
+                req,
+                timeout=timeout_seconds_override or settings.AI_TIMEOUT_SECONDS,
+            ) as resp:
                 body = resp.read(settings.AI_MAX_OUTPUT_CHARS * 2).decode("utf-8", "replace")
             break
         except urllib.error.HTTPError as exc:

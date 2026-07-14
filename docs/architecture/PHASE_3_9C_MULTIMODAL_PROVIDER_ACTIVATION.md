@@ -92,6 +92,30 @@ successful live run, archive the private report under the authorized benchmark
 root and rerun the Phase 3.9B pilot in shadow mode. Do not lower adjudication
 thresholds to obtain coverage.
 
+## Phase 3.9C-1 runtime topology
+
+Runtime configuration now materializes four logical profiles with independent
+profile IDs and namespaces:
+
+| Profile | Role | Required model variable |
+|---|---|---|
+| `runtime-text` | text extraction | `AI_MODEL` |
+| `runtime-vision` | multimodal and handwriting extraction | `AI_VISION_MODEL` |
+| `runtime-verification` | isolated verification | `AI_VERIFICATION_MODEL` |
+| `runtime-accounting` | accounting reasoning | `AI_ACCOUNTING_REASONING_MODEL` |
+
+Each specialized profile accepts its own provider, API key, and base URL, then
+falls back to the corresponding base `AI_*` value when omitted. Secrets are
+excluded from Pydantic serialization and capability reports. Trace and cache
+namespaces include the logical profile ID; probe prompts also contain
+role-specific boundaries.
+
+Verification never claims independent-family voting. An explicit matching
+model family, or the same provider and exact model ID, is recorded as
+`isolated_same_family`. All other configurations remain
+`isolated_unconfirmed_family` until deployment supplies reliable family
+metadata.
+
 ## Acceptance status
 
 - Typed capability contract: complete.

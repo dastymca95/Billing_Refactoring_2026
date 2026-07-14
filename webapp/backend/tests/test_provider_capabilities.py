@@ -1,6 +1,7 @@
 from webapp.backend.services.model_registry import ModelRole
 from webapp.backend.services.provider_capabilities import (
-    ModelCapability, ModelProfile, ProfileLoader, ProviderCapabilityValidator, VerifiedCapabilityRegistry,
+    ModelCapability, ModelProfile, ModelProfileRole, ProfileLoader,
+    ProviderCapabilityValidator, VerifiedCapabilityRegistry,
 )
 
 
@@ -65,9 +66,11 @@ def test_audit_never_exposes_secrets():
 
 
 def test_activation_requires_probe_verified_multimodal_reasoning_and_verification():
-    def report(profile_id, model_id, capabilities):
+    def report(profile_id, model_id, role, capabilities):
         responses = {
+            ModelCapability.TEXT_EXTRACTION: {"probe": "IV39C_TEXT"},
             ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING: {"probe": "IMAGE42"},
+            ModelCapability.HANDWRITING_INTERPRETATION: {"probe": "IMAGE42"},
             ModelCapability.STRUCTURED_OUTPUT: {"probe": "IV39C_JSON", "ok": True},
             ModelCapability.ACCOUNTING_REASONING: {"probe": "IV39C_ACCOUNTING", "balanced": True},
             ModelCapability.INDEPENDENT_VERIFICATION: {
@@ -77,27 +80,37 @@ def test_activation_requires_probe_verified_multimodal_reasoning_and_verificatio
         return ProviderCapabilityValidator(
             lambda _profile, capability, _request: responses[capability]
         ).validate(ModelProfile(provider="openai", profile_id=profile_id, model_id=model_id,
-                                declared_capabilities=capabilities, credentials_present=True))
+                                role=role, declared_capabilities=capabilities,
+                                credentials_present=True))
 
     import os
     old_marker = os.environ.get("AI_CAPABILITY_VISION_PROBE_EXPECTED")
     os.environ["AI_CAPABILITY_VISION_PROBE_EXPECTED"] = "IMAGE42"
     try:
-        vision = report("vision", "vision-model", [
+        text = report("text", "text-model", ModelProfileRole.TEXT_EXTRACTION, [
+            ModelCapability.TEXT_EXTRACTION,
+            ModelCapability.STRUCTURED_OUTPUT,
+        ])
+        vision = report("vision", "vision-model", ModelProfileRole.MULTIMODAL_EXTRACTION, [
+            ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
+            ModelCapability.HANDWRITING_INTERPRETATION,
+            ModelCapability.STRUCTURED_OUTPUT,
+        ])
+        verifier = report("verifier", "verify-model", ModelProfileRole.INDEPENDENT_VERIFICATION, [
+            ModelCapability.INDEPENDENT_VERIFICATION,
             ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
             ModelCapability.STRUCTURED_OUTPUT,
         ])
-        reasoner = report("reasoner", "reason-model", [
+        reasoner = report("reasoner", "reason-model", ModelProfileRole.ACCOUNTING_REASONING, [
             ModelCapability.ACCOUNTING_REASONING,
             ModelCapability.STRUCTURED_OUTPUT,
-            ModelCapability.INDEPENDENT_VERIFICATION,
         ])
     finally:
         if old_marker is None:
             os.environ.pop("AI_CAPABILITY_VISION_PROBE_EXPECTED", None)
         else:
             os.environ["AI_CAPABILITY_VISION_PROBE_EXPECTED"] = old_marker
-    activation = VerifiedCapabilityRegistry([vision, reasoner]).activation_report()
+    activation = VerifiedCapabilityRegistry([text, vision, verifier, reasoner]).activation_report()
     assert activation.autonomous_gateway_enabled is True
     assert activation.strong_reasoning_mode == "shadow"
 
@@ -110,3 +123,80 @@ def test_partial_verification_does_not_enable_autonomous_gateway():
     activation = VerifiedCapabilityRegistry([report]).activation_report()
     assert activation.autonomous_gateway_enabled is False
     assert "verified_multimodal_profile_missing" in activation.blocking_reasons
+
+
+def test_environment_topology_has_four_isolated_profiles_with_safe_fallback(monkeypatch):
+    values = {
+        "AI_PROVIDER": "openai_compatible",
+        "AI_MODEL": "text-model",
+        "AI_API_KEY": "base-secret",
+        "AI_BASE_URL": "https://provider.invalid/v1",
+        "AI_VISION_MODEL": "vision-model",
+        "AI_VERIFICATION_MODEL": "vision-model",
+        "AI_ACCOUNTING_REASONING_MODEL": "reason-model",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    profiles = ProfileLoader._environment_profiles()
+    assert [profile.profile_id for profile in profiles] == [
+        "runtime-text", "runtime-vision", "runtime-verification", "runtime-accounting",
+    ]
+    assert len({profile.trace_namespace for profile in profiles}) == 4
+    assert len({profile.cache_namespace for profile in profiles}) == 4
+    assert all(profile.credentials_present and profile.base_url_configured for profile in profiles)
+    verifier = profiles[2]
+    assert verifier.verification_independence == "isolated_same_family"
+    assert verifier.api_key and verifier.api_key.get_secret_value() == "base-secret"
+
+
+def test_profile_specific_credentials_and_endpoints_override_base(monkeypatch):
+    for key, value in {
+        "AI_PROVIDER": "openai_compatible", "AI_MODEL": "text", "AI_API_KEY": "base",
+        "AI_BASE_URL": "https://base.invalid/v1", "AI_VERIFICATION_MODEL": "verify",
+        "AI_VERIFICATION_PROVIDER": "openai_compatible", "AI_VERIFICATION_API_KEY": "verify-secret",
+        "AI_VERIFICATION_BASE_URL": "https://verify.invalid/v1",
+    }.items():
+        monkeypatch.setenv(key, value)
+    verifier = next(profile for profile in ProfileLoader._environment_profiles()
+                    if profile.profile_id == "runtime-verification")
+    assert verifier.api_key and verifier.api_key.get_secret_value() == "verify-secret"
+    assert verifier.base_url == "https://verify.invalid/v1"
+
+
+def test_probe_requests_have_role_specific_prompts_traces_and_cache_keys(monkeypatch):
+    captured = []
+    validator = ProviderCapabilityValidator(
+        lambda profile, capability, request: captured.append((profile, capability, request))
+        or {"probe": "IV39C_JSON", "ok": True}
+    )
+    for profile_id, role in (("text", ModelProfileRole.TEXT_EXTRACTION),
+                             ("reason", ModelProfileRole.ACCOUNTING_REASONING)):
+        validator.validate(ModelProfile(
+            provider="openai", profile_id=profile_id, model_id="shared-model", role=role,
+            declared_capabilities=[ModelCapability.STRUCTURED_OUTPUT], credentials_present=True,
+            trace_namespace=f"trace:{profile_id}", cache_namespace=f"cache:{profile_id}",
+        ))
+    text_request, reason_request = captured[0][2], captured[1][2]
+    assert text_request["system"] != reason_request["system"]
+    assert text_request["trace_id"] != reason_request["trace_id"]
+    assert text_request["cache_key"] != reason_request["cache_key"]
+
+
+def test_same_underlying_model_can_serve_distinct_verified_logical_profiles():
+    text = ProviderCapabilityValidator(lambda *_: {"probe": "IV39C_TEXT"}).validate(ModelProfile(
+        provider="openai", profile_id="text", model_id="shared-model",
+        role=ModelProfileRole.TEXT_EXTRACTION,
+        declared_capabilities=[ModelCapability.TEXT_EXTRACTION], credentials_present=True,
+    ))
+    reason = ProviderCapabilityValidator(
+        lambda *_: {"probe": "IV39C_ACCOUNTING", "balanced": True}
+    ).validate(ModelProfile(
+        provider="openai", profile_id="reason", model_id="shared-model",
+        role=ModelProfileRole.ACCOUNTING_REASONING,
+        declared_capabilities=[ModelCapability.ACCOUNTING_REASONING], credentials_present=True,
+    ))
+    registry = VerifiedCapabilityRegistry([text, reason]).activated_model_registry()
+    assert registry.get("shared-model") is not None
+    assert registry.get("shared-model").roles == {
+        ModelRole.EXTRACTION_TEXT, ModelRole.ACCOUNTING_REASONING,
+    }

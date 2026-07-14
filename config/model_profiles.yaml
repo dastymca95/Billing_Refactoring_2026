@@ -1,5 +1,34 @@
 schema_version: model-profiles/1.0
 # Deployment-owned profiles belong in local/private configuration. Never commit
-# credentials. Environment-configured AI_MODEL/AI_VISION_MODEL/reasoning models
-# are synthesized as profiles at runtime and still require active probes.
+# credentials. The runtime topology below maps logical profiles to environment
+# variables. It declares configuration shape only; capability probes remain the
+# sole authority for verification.
 profiles: []
+runtime_topology:
+  - profile_id: runtime-text
+    role: text_extraction
+    provider_env: AI_PROVIDER
+    model_env: AI_MODEL
+    api_key_env: AI_API_KEY
+    base_url_env: AI_BASE_URL
+  - profile_id: runtime-vision
+    role: multimodal_extraction
+    provider_env: AI_VISION_PROVIDER
+    model_env: AI_VISION_MODEL
+    api_key_env: AI_VISION_API_KEY
+    base_url_env: AI_VISION_BASE_URL
+    fallback_profile: runtime-text
+  - profile_id: runtime-verification
+    role: independent_verification
+    provider_env: AI_VERIFICATION_PROVIDER
+    model_env: AI_VERIFICATION_MODEL
+    api_key_env: AI_VERIFICATION_API_KEY
+    base_url_env: AI_VERIFICATION_BASE_URL
+    fallback_profile: runtime-text
+  - profile_id: runtime-accounting
+    role: accounting_reasoning
+    provider_env: AI_ACCOUNTING_REASONING_PROVIDER
+    model_env: AI_ACCOUNTING_REASONING_MODEL
+    api_key_env: AI_ACCOUNTING_REASONING_API_KEY
+    base_url_env: AI_ACCOUNTING_REASONING_BASE_URL
+    fallback_profile: runtime-text
