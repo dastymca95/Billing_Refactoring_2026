@@ -19,6 +19,7 @@ from .api import (
     ai_status,
     ai_invoice,
     ai_mappings,
+    billing_v2,
     batches,
     canonical_rules,
     cells,
@@ -84,6 +85,7 @@ def create_app() -> FastAPI:
     # Phase 2K — Cell explain / correct / learn.
     app.include_router(cells.router)
     app.include_router(cells.learned_router)
+    app.include_router(billing_v2.router)
 
     @app.get("/api/health")
     def health() -> dict:

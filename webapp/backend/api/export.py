@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from ..services import batch_store, batch_processor
+from ..services import accounting_readiness, batch_store, batch_processor
 
 
 router = APIRouter(prefix="/api/batches", tags=["export"])
@@ -88,6 +88,20 @@ class ExportRequest(BaseModel):
     writes a fresh workbook from `Output/Template.xlsx`.
     """
     edited_rows: Optional[list[dict[str, Any]]] = None
+
+
+class ReadinessRequest(BaseModel):
+    rows: Optional[list[dict[str, Any]]] = None
+
+
+@router.post("/{batch_id}/readiness")
+def readiness_endpoint(batch_id: str, body: ReadinessRequest | None = None) -> dict[str, Any]:
+    try:
+        batch_store.get_batch_dir(batch_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
+    rows = body.rows if body and body.rows is not None else batch_processor.cached_preview_rows_for_readiness(batch_id)
+    return accounting_readiness.as_dict(accounting_readiness.evaluate_and_record(batch_id, rows))
 
 
 @router.post("/{batch_id}/export")
