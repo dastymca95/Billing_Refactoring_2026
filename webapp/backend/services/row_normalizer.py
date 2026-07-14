@@ -200,6 +200,11 @@ def normalize_rows(
             touched += 1
     if output_contract_validator is not None:
         output_contract_validator.annotate_rows(rows)
+    from .accounting_integration_bridges import RowAccountingV2Adapter
+    RowAccountingV2Adapter().enrich_rows(rows, {
+        "document_id": source_file or batch_id or "normalized-row",
+        "extraction_route": vendor_key or "row_normalizer",
+    })
     return touched
 
 

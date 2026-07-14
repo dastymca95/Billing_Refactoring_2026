@@ -2382,7 +2382,7 @@ def ai_result_to_invoice(
         }
         rows.append(row)
 
-    return {
+    invoice = {
         "vendor_key": AI_VENDOR_KEY,
         "source_file": source_file,
         "file_name": source_file,
@@ -2403,6 +2403,10 @@ def ai_result_to_invoice(
             "original_vendor_key": vendor_key,
         },
     }
+    from .accounting_integration_bridges import AIResultAccountingV2Adapter
+    return AIResultAccountingV2Adapter().convert(invoice, {
+        "document_id": f"{batch_id}:{source_file}:1",
+    })
 
 
 def _distribute_invoice_difference(

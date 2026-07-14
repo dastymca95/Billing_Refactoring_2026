@@ -10,7 +10,8 @@ import yaml
 
 from .. import settings
 from .accounting_contracts import GLAccountMetadata
-from .ai_mapping_review import is_payable_gl_account, normalize_key
+from .ai_mapping_review import normalize_key
+from .gl_payability import is_payable_gl_account
 
 
 CONFIG_PATH = settings.PROJECT_ROOT / "config" / "accounting_decision_v2.yaml"
@@ -46,7 +47,7 @@ def load_gl_catalog() -> tuple[str, dict[str, GLAccountMetadata]]:
                 incompatible_work_modes=list(merged.get("incompatible_work_modes") or []),
                 capital_context=str(merged.get("capital_context") or "operating"),
                 specificity=str(merged.get("specificity") or "broad"),
-                payable=is_payable_gl_account(account),
+                payable=is_payable_gl_account(code, {code: account}),
                 description_tokens=_tokens(f"{name} {row.get('Description') or ''}"),
                 metadata_source="chart+approved_config" if override else "chart_inference",
                 metadata_confidence=0.98 if override else 0.65,
