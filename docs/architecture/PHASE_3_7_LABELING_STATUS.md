@@ -5,15 +5,18 @@ filenames, private paths, labels, vendor names, addresses, screenshots, or notes
 
 - Selected documents: 120
 - Tier D total: 35
-- Tier D reviewed: 0
-- Kept: 0
+- Tier D reviewed: 35
+- Kept: 35
 - Replaced: 0
 - Excluded: 0
-- Labeling not started: 120
-- Labeling in progress: 0
+- Labeling not started: 119
+- Labeling in progress: 1
 - Labeling complete: 0
-- Labels with validation errors: 0
-- Dataset frozen: no
+- Labels with validation errors: 1
+- Dataset frozen: yes
+- Preview rotations applied: 1
+- Dataset version: v1
+- Dataset SHA-256: 8b5c065d8898a7aa32e56a150bc1cdf2f2a10599005f901000385313090ffcbf
 - AI calls: 0
 - Strong reasoner used: no
 

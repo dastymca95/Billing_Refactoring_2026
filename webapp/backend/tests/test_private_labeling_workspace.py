@@ -119,6 +119,21 @@ def test_snapshot_hash_changes_after_replacement(tmp_path):
     assert one != two
 
 
+def test_manual_rotation_is_preview_metadata_and_does_not_modify_source(tmp_path):
+    workspace = build_workspace(tmp_path)
+    source = workspace.private_document_path("bench-000")
+    before = source.read_bytes()
+    workspace.record_triage("bench-000", reviewer="r", decision="needs_manual_rotation",
+                            reason="Rotate preview 90 degrees clockwise")
+    with pytest.raises(WorkspaceError, match="rotation metadata"):
+        workspace.freeze_dataset("v1")
+    result = workspace.apply_preview_rotation_metadata()
+    assert result == {"rotations_applied": 1, "unresolved": 0}
+    assert workspace.preview_rotation("bench-000") == 90
+    assert source.read_bytes() == before
+    assert workspace.freeze_dataset("v1")["dataset_version"] == "v1"
+
+
 def test_blind_payload_excludes_app_and_reviewer_2_outputs(tmp_path):
     workspace = build_workspace(tmp_path)
     payload = json.dumps(workspace.blind_document_payload("bench-000")).lower()

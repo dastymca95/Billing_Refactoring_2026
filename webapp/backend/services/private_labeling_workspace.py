@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from collections import Counter
 from datetime import datetime, timezone
@@ -68,6 +69,7 @@ class PrivateLabelingWorkspace:
         self.reserve_path = self.selection_dir / "reserve_20.json"
         self.decisions_path = self.selection_dir / "tier_d_triage_decisions.jsonl"
         self.replacements_path = self.selection_dir / "replacement_history.json"
+        self.transforms_path = self.selection_dir / "preview_transformations.json"
         self._inventory = {row["benchmark_id"]: row for row in self._read_jsonl(self.inventory_dir / "private_inventory.jsonl")}
         duplicate_payload = self._read_json(self.inventory_dir / "duplicate_groups.json", {"groups": []})
         self._duplicate_by_member: dict[str, set[str]] = {}
@@ -105,6 +107,7 @@ class PrivateLabelingWorkspace:
             "inventory_warnings": inventory.get("inventory_warnings", []),
             "duplicate_information": {"group_member_count": len(self._duplicate_by_member.get(benchmark_id, {benchmark_id}))},
             "preview_url": f"/api/private-workspace/document/{benchmark_id}/preview",
+            "preview_rotation_degrees": self.preview_rotation(benchmark_id),
             "reserve_candidates": self.replacement_candidates(benchmark_id, limit=5),
         }
         self._assert_blind(payload)
@@ -181,6 +184,37 @@ class PrivateLabelingWorkspace:
         self._append_jsonl(self.decisions_path, event)
         return event
 
+    def apply_preview_rotation_metadata(self) -> dict[str, Any]:
+        """Persist rotation metadata without rewriting private source documents."""
+        decisions = self.latest_triage_decisions()
+        rotations = []
+        unresolved = []
+        for benchmark_id, event in decisions.items():
+            if event.get("decision") != "needs_manual_rotation":
+                continue
+            match = re.search(r"(?<!\d)(90|180|270)(?!\d)", str(event.get("reason") or ""))
+            if not match:
+                unresolved.append(benchmark_id)
+                continue
+            path = self.private_document_path(benchmark_id)
+            before = _sha256_file(path)
+            rotation = {"benchmark_id": benchmark_id, "degrees_clockwise": int(match.group(1)),
+                        "source_sha256": before, "source_modified": False,
+                        "derived_from": "human_triage_reason", "created_at": utc_now()}
+            after = _sha256_file(path)
+            if before != after:
+                raise WorkspaceError("source changed while applying preview metadata")
+            rotations.append(rotation)
+        payload = {"schema_version": "preview-transformations/1.0", "rotations": rotations,
+                   "unresolved_benchmark_ids": unresolved, "updated_at": utc_now()}
+        self._atomic_json(self.transforms_path, payload)
+        return {"rotations_applied": len(rotations), "unresolved": len(unresolved)}
+
+    def preview_rotation(self, benchmark_id: str) -> int:
+        payload = self._read_json(self.transforms_path, {"rotations": []})
+        return next((int(row["degrees_clockwise"]) for row in payload.get("rotations", [])
+                     if row.get("benchmark_id") == benchmark_id), 0)
+
     def _replace(self, benchmark_id: str, replacement_id: str | None) -> str:
         selected, reserve = self.selected(), self.reserve()
         current = next(row for row in selected if row["benchmark_id"] == benchmark_id)
@@ -218,6 +252,12 @@ class PrivateLabelingWorkspace:
                    if row.get("quality_tier") == "D" and decisions.get(row["benchmark_id"], {}).get("new_status") != "kept"]
         if pending:
             raise WorkspaceError(f"Tier D triage incomplete: {len(pending)} pending")
+        rotation_required = {benchmark_id for benchmark_id, event in decisions.items()
+                             if event.get("decision") == "needs_manual_rotation"}
+        transformations = self._read_json(self.transforms_path, {"rotations": [], "unresolved_benchmark_ids": []})
+        rotation_recorded = {row.get("benchmark_id") for row in transformations.get("rotations", [])}
+        if transformations.get("unresolved_benchmark_ids") or rotation_required - rotation_recorded:
+            raise WorkspaceError("preview rotation metadata is incomplete")
         selected = self.selected()
         if len(selected) != 120:
             raise WorkspaceError("frozen dataset must contain exactly 120 documents")
@@ -273,6 +313,10 @@ class PrivateLabelingWorkspace:
         counts = Counter(event.get("new_status") for event in decisions.values())
         label_counts = Counter(label.get("completion_status", "not_started") for label in labels)
         confidence = Counter(_confidence_bucket(label) for label in labels if label)
+        transformations = self._read_json(self.transforms_path, {"rotations": []})
+        frozen_hashes = sorted(self.selection_dir.glob("selected_120_v*.sha256"))
+        frozen_hash = frozen_hashes[-1].read_text(encoding="ascii").strip() if frozen_hashes else None
+        frozen_version = frozen_hashes[-1].stem.replace("selected_120_", "") if frozen_hashes else None
         return {"schema_version": "phase-3.7-status/1.0", "selected_count": len(selected),
                 "tier_d_total": len(d_rows), "tier_d_reviewed": sum(row["benchmark_id"] in decisions for row in d_rows),
                 "kept": counts["kept"], "replaced": counts["replaced"],
@@ -282,7 +326,9 @@ class PrivateLabelingWorkspace:
                              "validation_errors": sum(bool(label.get("validation_errors")) for label in labels)},
                 "cohort_progress": dict(Counter(row.get("selection_cohort") for row in selected)),
                 "reviewer_confidence_distribution": dict(confidence),
-                "dataset_frozen": any(self.selection_dir.glob("selected_120_v*.sha256")),
+                "preview_rotations_applied": len(transformations.get("rotations", [])),
+                "dataset_frozen": bool(frozen_hashes), "dataset_version": frozen_version,
+                "dataset_sha256": frozen_hash,
                 "ai_calls": 0, "strong_reasoner_used": False}
 
     def safe_status_markdown(self) -> str:
@@ -304,6 +350,9 @@ filenames, private paths, labels, vendor names, addresses, screenshots, or notes
 - Labeling complete: {labeling['complete']}
 - Labels with validation errors: {labeling['validation_errors']}
 - Dataset frozen: {'yes' if status['dataset_frozen'] else 'no'}
+- Preview rotations applied: {status['preview_rotations_applied']}
+- Dataset version: {status['dataset_version'] or 'not frozen'}
+- Dataset SHA-256: {status['dataset_sha256'] or 'not frozen'}
 - AI calls: 0
 - Strong reasoner used: no
 
@@ -434,3 +483,11 @@ def _confidence_bucket(label: Mapping[str, Any]) -> str:
     try: number = float(value)
     except (TypeError, ValueError): return "unknown"
     return "high" if number >= .85 else "medium" if number >= .6 else "low"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
