@@ -110,13 +110,38 @@ pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m uvicorn webapp.backend.main:app --reload --port 8000
 ```
 
+The Python requirements include `pytest` and `httpx`; both are required for
+backend unit tests and FastAPI `TestClient` contract tests. Run them with:
+
+```bash
+python -m pytest
+```
+
 ### Frontend (React + Vite)
 
 ```bash
 cd webapp/frontend
 npm install
+npx playwright install chromium
 npm run dev          # http://localhost:5173 (proxies /api/* to backend)
 ```
+
+Chromium is a separate Playwright runtime dependency and is not installed by
+`npm install`. After installing it, run the browser suite with
+`npm run test:e2e`. In CI/Linux, use `npx playwright install --with-deps chromium`
+so the required system libraries are installed as well.
+
+### Accounting-readiness export safety
+
+Every web export is authorized by the versioned backend
+`AccountingReadiness` decision. The historical behavior that copied an
+already-generated vendor workbook directly into the batch export directory
+has been **retired**. It bypassed row validation and invoice reconciliation.
+
+Do not restore legacy workbook copying. A legacy batch must either be rebuilt
+from its cached rows through the current readiness gate or return
+`legacy_export_disabled` and be reprocessed. This applies even when the old
+workbook appears structurally valid.
 
 ### Docker
 

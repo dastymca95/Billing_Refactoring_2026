@@ -23,3 +23,7 @@ python-dotenv==1.2.2
 
 # --- HTTP client used by Dropbox SDK + a few helpers ---
 requests==2.33.1
+
+# --- Development / API contract tests ---
+pytest==8.4.2
+httpx==0.28.1
