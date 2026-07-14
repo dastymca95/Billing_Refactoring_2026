@@ -1,0 +1,172 @@
+{
+  "records": [
+    {
+      "ai_calls": 0,
+      "blocked_actual": true,
+      "case_id": "synthetic-digital-service-001",
+      "complexity": "simple",
+      "cost_usd": 0.0,
+      "decision_confidence": 0.8,
+      "document_class": "clean_digital_pdf",
+      "error": null,
+      "expected_gls": [
+        "6540"
+      ],
+      "fields_correct": {
+        "amount": true,
+        "invoice_number": true
+      },
+      "known_vendor": false,
+      "latency_ms": 134,
+      "ranked_gls": [
+        "6540",
+        "6530",
+        "6627"
+      ],
+      "ready_actual": false,
+      "review_actual": true,
+      "route_actual": "deterministic",
+      "route_expected": "deterministic",
+      "semantics_correct": {
+        "line_family": true,
+        "trade_family": true,
+        "work_mode": true
+      },
+      "should_block": true,
+      "should_review": true,
+      "value_cohort": "normal"
+    },
+    {
+      "ai_calls": 0,
+      "blocked_actual": true,
+      "case_id": "synthetic-materials-001",
+      "complexity": "simple",
+      "cost_usd": 0.0,
+      "decision_confidence": 0.8,
+      "document_class": "material_invoice",
+      "error": null,
+      "expected_gls": [
+        "6627"
+      ],
+      "fields_correct": {
+        "amount": true,
+        "invoice_number": true
+      },
+      "known_vendor": false,
+      "latency_ms": 4,
+      "ranked_gls": [
+        "6627",
+        "6540"
+      ],
+      "ready_actual": false,
+      "review_actual": true,
+      "route_actual": "deterministic",
+      "route_expected": "deterministic",
+      "semantics_correct": {
+        "line_family": true,
+        "trade_family": true,
+        "work_mode": true
+      },
+      "should_block": true,
+      "should_review": true,
+      "value_cohort": "normal"
+    }
+  ],
+  "schema_version": "representative-run/1.0",
+  "summary": {
+    "ai_calls": 0,
+    "cohorts": {
+      "complexity": {
+        "simple": {
+          "documents": 2,
+          "false_ready_rate": 0.0,
+          "gl_top_1": 1.0,
+          "latency_ms_p50": 4.0
+        }
+      },
+      "document_class": {
+        "clean_digital_pdf": {
+          "documents": 1,
+          "false_ready_rate": 0.0,
+          "gl_top_1": 1.0,
+          "latency_ms_p50": 134.0
+        },
+        "material_invoice": {
+          "documents": 1,
+          "false_ready_rate": 0.0,
+          "gl_top_1": 1.0,
+          "latency_ms_p50": 4.0
+        }
+      },
+      "route": {
+        "deterministic": {
+          "documents": 2,
+          "false_ready_rate": 0.0,
+          "gl_top_1": 1.0,
+          "latency_ms_p50": 4.0
+        }
+      },
+      "value": {
+        "normal": {
+          "documents": 2,
+          "false_ready_rate": 0.0,
+          "gl_top_1": 1.0,
+          "latency_ms_p50": 4.0
+        }
+      },
+      "vendor": {
+        "unknown": {
+          "documents": 2,
+          "false_ready_rate": 0.0,
+          "gl_top_1": 1.0,
+          "latency_ms_p50": 4.0
+        }
+      },
+      "work": {
+        "materials": {
+          "documents": 1,
+          "false_ready_rate": 0.0,
+          "gl_top_1": 1.0,
+          "latency_ms_p50": 4.0
+        },
+        "service": {
+          "documents": 1,
+          "false_ready_rate": 0.0,
+          "gl_top_1": 1.0,
+          "latency_ms_p50": 134.0
+        }
+      }
+    },
+    "cost_per_document_usd": 0.0,
+    "cost_per_successful_gl_usd": 0.0,
+    "documents": 2,
+    "false_block_rate": 0.0,
+    "false_ready_rate": 0.0,
+    "field_accuracy": {
+      "amount": 1.0,
+      "invoice_number": 1.0
+    },
+    "gl_top_1": 1.0,
+    "gl_top_3": 1.0,
+    "high_confidence_errors": [],
+    "label_counts": {
+      "gold": 2,
+      "partial": 0,
+      "unlabeled": 0
+    },
+    "latency_ms_p50": 4.0,
+    "latency_ms_p95": 134.0,
+    "processing_failures": 0,
+    "profile": "current",
+    "representative_minimum_met": false,
+    "review_precision": 1.0,
+    "review_recall": 1.0,
+    "route_accuracy": 1.0,
+    "schema_version": "representative-results/1.0",
+    "semantic_accuracy": {
+      "line_family": 1.0,
+      "trade_family": 1.0,
+      "work_mode": 1.0
+    }
+  }
+}
