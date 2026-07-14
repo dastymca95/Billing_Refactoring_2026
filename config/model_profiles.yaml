@@ -1,0 +1,5 @@
+schema_version: model-profiles/1.0
+# Deployment-owned profiles belong in local/private configuration. Never commit
+# credentials. Environment-configured AI_MODEL/AI_VISION_MODEL/reasoning models
+# are synthesized as profiles at runtime and still require active probes.
+profiles: []

@@ -54,6 +54,7 @@ htmlcov/
 webapp/frontend/test-results/
 webapp/frontend/playwright-report/
 /tmp_*.png
+/.private/
 
 # Phase PERF-1 — runtime artefacts.
 # webapp_data/cache/ is already covered by webapp_data/ above; this
