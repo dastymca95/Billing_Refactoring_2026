@@ -1,0 +1,79 @@
+schema_version: accounting-decision-config/1.0
+catalog_version: gl-catalog/1.0
+semantic_version: semantic-classification/1.0
+decision_version: accounting-decision/1.0
+
+ranking_weights:
+  semantic_compatibility: 0.35
+  trade_match: 0.20
+  work_mode_match: 0.15
+  specificity: 0.10
+  deterministic_rule_support: 0.10
+  historical_support: 0.05
+  vendor_support: 0.03
+  property_policy: 0.02
+  contradiction_penalty: -0.25
+
+thresholds:
+  minimum_selectable_score: 0.45
+  minimum_top_1_margin: 0.08
+  high_confidence: 0.80
+  medium_confidence: 0.60
+  blocking_ambiguity: 0.04
+
+semantic_indicators:
+  material: [material, materials, supply, supplies, part, parts, gallon, gallons, primer, brush, brushes, roller, rollers, filter, filters, bulb, bulbs, breaker, breakers, fitting, fittings, valve, valves, hardware, chemical, chemicals]
+  service: [labor, service, repair, maintenance, install, installation, replace, painting, cleaning, refinish, resurface, inspection, leak, leaks, diagnostic, diagnosis]
+  recurring: [monthly, recurring, subscription, membership, renewal, annual service]
+  fee: [fee, late charge, service charge, connection fee, reconnect fee, trip charge]
+  capital: [capital, renovation, renovate, remodel, full replacement, complete replacement]
+  trades:
+    plumbing: [plumbing, plumber, pipe, leak, leaks, toilet, drain, faucet, water heater]
+    electrical: [electrical, electrician, outlet, breaker, wiring, panel, gfci, lighting]
+    hvac: [hvac, air conditioner, furnace, thermostat, refrigerant, condenser]
+    painting: [paint, painting, painter, repaint]
+    cleaning: [cleaning, janitorial, carpet cleaning, move out clean]
+    landscaping: [landscape, landscaping, lawn, mowing, mulch, grounds]
+    pest: [pest, extermination, termite, roach, bed bug]
+    appliance: [appliance, refrigerator, dishwasher, stove, washer, dryer]
+    flooring: [flooring, carpet, vinyl, tile, plank, subfloor]
+    cabinets: [cabinet, cabinets]
+    countertop: [countertop, counter top]
+    tub_refinishing: [tub refinishing, tub resurfacing, reglazing, bathtub refinish]
+    legal: [legal, attorney, court, eviction]
+    insurance: [insurance, premium, policy coverage]
+    utility: [electric usage, electric service, water usage, water service, sewer usage, sewer service, gas usage, gas service, utility consumption, trash service, waste service, trash collection, fuel recovery adjustment]
+    general_maintenance: [maintenance, handyman, work order, minor repair]
+
+gl_overrides:
+  "6118": {gl_family: subscription_membership, trade_families: [admin], compatible_work_modes: [renewal, recurring_service], specificity: specific}
+  "6188": {gl_family: fee, trade_families: [admin], compatible_work_modes: [one_time_fee], specificity: specific}
+  "6200": {gl_family: legal, trade_families: [legal], compatible_work_modes: [labor_service], specificity: broad}
+  "6205": {gl_family: legal, trade_families: [legal], compatible_work_modes: [labor_service], specificity: specific}
+  "6500": {gl_family: contract_services, trade_families: [general_maintenance], compatible_work_modes: [labor_service, recurring_service], specificity: broad}
+  "6505": {gl_family: appliance, trade_families: [appliance], compatible_work_modes: [labor_service], specificity: specific}
+  "6530": {gl_family: general_maintenance, trade_families: [general_maintenance], compatible_work_modes: [labor_service, one_time_fee], specificity: broad}
+  "6540": {gl_family: electrical, trade_families: [electrical], compatible_work_modes: [labor_service], specificity: specific}
+  "6555": {gl_family: hvac, trade_families: [hvac], compatible_work_modes: [labor_service], specificity: specific}
+  "6565": {gl_family: plumbing, trade_families: [plumbing], compatible_work_modes: [labor_service], specificity: specific}
+  "6595": {gl_family: contract_services, trade_families: [general_maintenance], compatible_work_modes: [labor_service], specificity: broad}
+  "6606": {gl_family: appliance, trade_families: [appliance], compatible_work_modes: [material_purchase], specificity: specific}
+  "6615": {gl_family: general_maintenance, trade_families: [general_maintenance], compatible_work_modes: [labor_service], specificity: broad}
+  "6627": {gl_family: electrical, trade_families: [electrical], compatible_work_modes: [material_purchase], specificity: specific}
+  "6654": {gl_family: hvac, trade_families: [hvac], compatible_work_modes: [material_purchase], specificity: specific}
+  "6669": {gl_family: general_maintenance, trade_families: [general_maintenance], compatible_work_modes: [material_purchase], specificity: broad}
+  "6675": {gl_family: plumbing, trade_families: [plumbing], compatible_work_modes: [material_purchase], specificity: specific}
+  "6730": {gl_family: cleaning, trade_families: [cleaning], compatible_work_modes: [material_purchase], specificity: specific}
+  "6750": {gl_family: cleaning, trade_families: [cleaning], compatible_work_modes: [labor_service, recurring_service], specificity: specific}
+  "6760": {gl_family: painting, trade_families: [painting], compatible_work_modes: [labor_service], specificity: specific}
+  "6770": {gl_family: painting, trade_families: [painting], compatible_work_modes: [material_purchase], specificity: specific}
+  "6810": {gl_family: landscaping, trade_families: [landscaping], compatible_work_modes: [labor_service, recurring_service], specificity: specific}
+  "6915": {gl_family: utility, trade_families: [utility], compatible_work_modes: [recurring_service], specificity: specific}
+  "6920": {gl_family: utility, trade_families: [utility], compatible_work_modes: [recurring_service], specificity: specific}
+  "6940": {gl_family: utility, trade_families: [utility], compatible_work_modes: [recurring_service], specificity: specific}
+  "6955": {gl_family: utility, trade_families: [utility], compatible_work_modes: [recurring_service], specificity: specific}
+  "6956": {gl_family: fee, trade_families: [utility, admin], compatible_work_modes: [one_time_fee], specificity: specific}
+  "6995": {gl_family: utility, trade_families: [utility], compatible_work_modes: [recurring_service], specificity: specific}
+  "7120": {gl_family: insurance, trade_families: [insurance], compatible_work_modes: [recurring_service, renewal], specificity: specific}
+  "7595": {gl_family: capital, trade_families: [general_maintenance, painting, flooring, cabinets, countertop], compatible_work_modes: [labor_service], specificity: broad, capital_context: capital}
+  "8050": {gl_family: legal, trade_families: [legal], compatible_work_modes: [labor_service], specificity: specific}
