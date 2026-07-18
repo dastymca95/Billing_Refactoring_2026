@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "seed:qa-fixture": "python ../../scripts/seed_webapp_qa_fixture.py",
     "test:e2e": "playwright test",
+    "test:e2e:active": "playwright test",
+    "test:e2e:legacy": "playwright test --config playwright.legacy.config.ts",
     "test:e2e:headed": "playwright test --headed"
   },
   "dependencies": {
