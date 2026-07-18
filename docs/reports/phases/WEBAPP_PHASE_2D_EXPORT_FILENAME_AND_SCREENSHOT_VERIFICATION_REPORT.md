@@ -105,7 +105,7 @@ Directory: [`docs/reports/phases/screenshots/phase_2d_export_filename/`](docs/re
 
 The local Chrome extension that drives automated capture was offline during this run (frontend dev server was up at `http://localhost:5174` and reachable). Two artefacts were produced anyway:
 
-- **`download_filename_evidence.md`** (committed) — programmatically captures the full `Content-Disposition` header for the five canonical cases (default, operator-named, traversal attempt, illegal chars, extension swap). This is the machine-readable equivalent of a "downloaded filename" screenshot and is more reliable than a single browser snap.
+- The generated `download_filename_evidence.md` transcript originally captured the `Content-Disposition` behavior for the canonical cases. It was intentionally removed from source control during repository cleanup because generated evidence belongs outside the tracked documentation tree; the filename behavior remains covered by the corresponding automated tests and can be regenerated when needed.
 - **Screenshot list pending manual capture** when the Chrome extension is back online:
   1. `01_template_normal.png` — Phase 2C.1 polished header in the live app.
   2. `02_export_name_edit.png` — title in editing mode (input visible, helper hint below).
@@ -147,7 +147,7 @@ Vendor processors not touched. No Dropbox calls. No AI calls. No source PDFs/CSV
 - **Helper visibility is a one-shot nudge.** Once the operator names the export, the helper line is gone forever for that batch. There's no "show help again" affordance — by design, but worth noting.
 - **Zebra toggle state is per-browser, not per-batch.** Stored in `localStorage`. If the operator wants different zebra preferences per batch, that's a future enhancement.
 - **Popover animation is a single fade-slide.** No exit animation; the popover unmounts immediately on close. Adding an exit transition would require either an unmount delay or a CSS animation chain — overkill for a 220 px panel.
-- **Screenshots are still pending manual capture** because the Chrome extension was offline during the run. The `download_filename_evidence.md` document covers the most important "did the filename actually change?" question with a programmatic transcript.
+- **Screenshots were pending manual capture** because the Chrome extension was offline during the run. The generated filename transcript was later removed from source control under the repository artifact-retention policy; automated filename assertions remain the reproducible evidence source.
 - **Some legacy `<a download>` clients** that ignore Content-Disposition (rare; mostly enterprise IE-style stacks) would still see the on-disk timestamped filename. All evergreen browsers honour the Content-Disposition header path implemented here.
 
 ## 9. Recommended next phase

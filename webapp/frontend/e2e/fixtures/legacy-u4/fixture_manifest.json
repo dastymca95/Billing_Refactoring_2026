@@ -1,0 +1,15 @@
+{
+  "schema_version": "legacy-u4-discovery/1.0",
+  "cases": [
+    { "key": "knoxville", "label": "Knoxville Utility Board" },
+    { "key": "kentucky_utilities", "label": "Kentucky Utilities" },
+    { "key": "clarksville_gas_water", "label": "Clarksville Gas and Water" },
+    { "key": "alabama_power", "label": "Alabama Power" },
+    { "key": "epb_fiber", "label": "EPB Fiber Optics" },
+    { "key": "henderson", "label": "The City of Henderson" },
+    { "key": "tennessee_american_water", "label": "Tennessee American Water" },
+    { "key": "hwea", "label": "HWEA" },
+    { "key": "richmond", "label": "Richmond Utilities" },
+    { "key": "weakley_image", "label": "Weakley image bill" }
+  ]
+}
