@@ -3,7 +3,12 @@ import sys
 import types
 from pathlib import Path
 
-os.environ.setdefault("INNER_VIEW_TEST_ASSET_ROOT", str(Path(__file__).parent / "fixtures" / "runtime_assets"))
+TEST_RUNTIME_ASSET_ROOT = Path(__file__).parent / "fixtures" / "runtime_assets"
+os.environ.setdefault("INNER_VIEW_TEST_ASSET_ROOT", str(TEST_RUNTIME_ASSET_ROOT))
+if os.environ.get("INNER_VIEW_CI") == "1":
+    ci_policy = TEST_RUNTIME_ASSET_ROOT / "config" / "tenant_document_policies.yaml"
+    if not ci_policy.is_file():
+        raise RuntimeError("CI tenant document policy fixture is missing")
 
 
 def _install_ci_only_processor_import_stubs() -> None:

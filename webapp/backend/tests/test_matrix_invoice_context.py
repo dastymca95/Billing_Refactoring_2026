@@ -112,6 +112,14 @@ def test_explicit_service_date_is_traceable_invoice_date_fallback_and_service_pe
     assert normalized["due_date_text"] == "Upon Receipt"
     assert normalized["service_period_start"] == "02/21/2025"
     assert normalized["service_period_end"] == "02/21/2025"
+    assert normalized["tenant_document_policy"]["date_policy"] == {
+        "policy_id": normalized["date_provenance"][1]["policy_id"],
+        "invoice_date_from_service_date": True,
+        "due_date_from_upon_receipt": True,
+    }
+    assert normalized["tenant_document_policy"]["date_policy"]["policy_id"].endswith(
+        "-date-policy/1.0"
+    )
     provenance = {item["field"]: item for item in normalized["date_provenance"]}
     assert provenance["service_date"]["provenance"] == "document_observed"
     assert provenance["invoice_date"]["provenance"] == "tenant_policy_inference"

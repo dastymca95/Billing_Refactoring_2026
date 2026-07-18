@@ -33,9 +33,20 @@ def test_gold_requires_independent_reviews_and_adjudication():
     assert gold.status is LabelStatus.GOLD
 
 
-def test_private_document_references_cannot_escape_private_root():
-    with pytest.raises(ValidationError):
-        DatasetEntry(case_id="x", document_class="scan", source="private", document_ref="../secret.pdf",
+@pytest.mark.parametrize(
+    "document_ref",
+    [
+        "../secret.pdf",
+        r"C:\private\secret.pdf",
+        "C:/private/secret.pdf",
+        r"\\server\share\secret.pdf",
+        "/private/secret.pdf",
+        "file:///private/secret.pdf",
+    ],
+)
+def test_private_document_references_cannot_escape_private_root(document_ref):
+    with pytest.raises(ValidationError, match="safe relative"):
+        DatasetEntry(case_id="x", document_class="scan", source="private", document_ref=document_ref,
                      label_ref="labels/x.json", private=True)
 
 

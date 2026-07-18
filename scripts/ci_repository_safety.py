@@ -182,7 +182,11 @@ def _scan_added_production_lines(base: str) -> list[Finding]:
             new_line = int(header.group(1))
             continue
         if raw_line.startswith("+") and not raw_line.startswith("+++"):
-            if current_path and WINDOWS_ABSOLUTE_PATH.search(raw_line[1:]):
+            if (
+                current_path
+                and not _is_test_path(current_path)
+                and WINDOWS_ABSOLUTE_PATH.search(raw_line[1:])
+            ):
                 findings.append(Finding(current_path, new_line, "new-absolute-windows-path"))
             new_line += 1
         elif not raw_line.startswith("-"):

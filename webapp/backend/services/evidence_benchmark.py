@@ -16,6 +16,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from .accounting_contracts import CropCoordinates
+from .path_safety import is_safe_relative_artifact_reference
 
 
 GOLDEN_CONTRACT_VERSION = "evidence-backed-accounting-golden/1.0"
@@ -41,8 +42,7 @@ class EvidenceAsset(BaseModel):
 
     @model_validator(mode="after")
     def safe_relative_reference(self):
-        ref = Path(self.crop_ref)
-        if ref.is_absolute() or ".." in ref.parts:
+        if not is_safe_relative_artifact_reference(self.crop_ref):
             raise ValueError("crop_ref must be a safe relative reference")
         if self.crop_coordinates.page != self.source_page:
             raise ValueError("crop page must equal source_page")

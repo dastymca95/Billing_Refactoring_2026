@@ -27,7 +27,9 @@ class TenantDocumentPolicy(BaseModel):
 @lru_cache(maxsize=32)
 def get_policy(tenant_id: str | None = None) -> TenantDocumentPolicy:
     resolved_tenant = validate_tenant_id(tenant_id or default_tenant_id())
-    path = settings.PROJECT_ROOT / "config" / "tenant_document_policies.yaml"
+    # Test/deployment asset roots must be self-contained. In production the
+    # runtime root defaults to PROJECT_ROOT, preserving the existing policy.
+    path = settings.RUNTIME_ASSET_ROOT / "config" / "tenant_document_policies.yaml"
     payload: dict[str, Any] = {}
     if path.is_file():
         loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}

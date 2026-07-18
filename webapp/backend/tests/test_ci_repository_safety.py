@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -58,6 +59,25 @@ def test_environment_lookup_is_not_mistaken_for_literal_secret() -> None:
 def test_merge_markers_are_typed_findings() -> None:
     findings = safety._scan_text("webapp/backend/example.py", "<<<<<<< HEAD\nvalue = 1\n")
     assert [item.category for item in findings] == ["merge-conflict-marker"]
+
+
+def test_new_windows_paths_are_reported_only_in_production_source(monkeypatch) -> None:
+    diff = """\
++++ b/webapp/backend/tests/test_paths.py
+@@ -0,0 +1 @@
++sample = r\"C:\\private\\fixture.pdf\"
++++ b/webapp/backend/services/unsafe.py
+@@ -0,0 +1 @@
++runtime_path = r\"C:\\private\\runtime.pdf\"
+"""
+    monkeypatch.setattr(safety, "_valid_commit", lambda _base: True)
+    monkeypatch.setattr(safety, "_git", lambda *_args: SimpleNamespace(stdout=diff))
+
+    findings = safety._scan_added_production_lines("base")
+
+    assert [(item.path, item.category) for item in findings] == [
+        ("webapp/backend/services/unsafe.py", "new-absolute-windows-path")
+    ]
 
 
 def test_sanitized_u4_fixture_has_exact_discovery_contract() -> None:
