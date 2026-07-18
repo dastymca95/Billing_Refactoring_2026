@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from webapp.backend.services import ai_invoice_processor, canonical_rules
+from webapp.backend.services import ai_invoice_processor, canonical_rules, service_invoice_gl_reasoning
 from webapp.backend.services.service_invoice_gl_reasoning import (
     build_gl_accounting_reasoning,
     classify_line_item_semantics,
@@ -38,7 +38,34 @@ def _alt_text(reasoning: dict) -> str:
     return " ".join(pieces).lower()
 
 
-def test_kros_invoice_uses_line_level_accounting_reasoning():
+def test_kros_invoice_uses_line_level_accounting_reasoning(monkeypatch):
+    # This test must not inherit a local ignored vendor YAML. Supply only the
+    # sanitized accounting context required by the reasoning contract.
+    monkeypatch.setattr(
+        ai_invoice_processor,
+        "_load_detailed_vendor_rule",
+        lambda _rule_file: {
+            "vendor_name": "Kros Home Services LLC",
+            "normalized_vendor_key": "kros_home_services_llc",
+            "category": "Construction - Remodeling",
+            "default_gl_code": "7595",
+            "default_gl_description": "Remodel Of Units",
+        },
+    )
+    monkeypatch.setattr(
+        service_invoice_gl_reasoning.ai_mapping_review,
+        "validate_property_location",
+        lambda *, property_abbreviation, location="": (
+            {
+                "property_abbreviation": "VOA",
+                "property_name": "Synthetic VOA Test Property",
+                "location": location,
+                "address": "",
+            }
+            if property_abbreviation == "VOA" and location in {"21", "60"}
+            else None
+        ),
+    )
     payload = {
         "vendor_name": "Kros Home Services LLC",
         "invoice_number": "1323",

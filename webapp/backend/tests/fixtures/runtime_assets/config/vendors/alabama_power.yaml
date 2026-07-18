@@ -1,0 +1,11 @@
+vendor_identity:
+  vendor_name: Alabama Power
+  normalized_vendor_key: alabama_power
+  aliases:
+    - Alabama Power
+  detection_keywords:
+    - Alabama Power
+  active: true
+document_detection:
+  vendor_name_patterns:
+    - ALABAMA POWER
