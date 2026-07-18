@@ -13,6 +13,8 @@ from typing import Any, Iterable, Mapping
 
 from pydantic import BaseModel, Field, model_validator
 
+from .path_safety import is_safe_relative_artifact_reference
+
 
 class LabelStatus(str, Enum):
     UNLABELED = "unlabeled"
@@ -90,8 +92,7 @@ class DatasetEntry(BaseModel):
 
     @model_validator(mode="after")
     def validate_reference(self):
-        ref = Path(self.document_ref)
-        if ref.is_absolute() or ".." in ref.parts:
+        if not is_safe_relative_artifact_reference(self.document_ref):
             raise ValueError("document_ref must be a safe relative reference")
         if self.private and not self.document_ref.startswith("private/"):
             raise ValueError("private documents must use private/ references")

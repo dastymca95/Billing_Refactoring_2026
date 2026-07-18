@@ -34,6 +34,7 @@ def test_reduced_visual_payload_is_retried_before_text_fallback(monkeypatch):
 
 def test_invalid_economy_vision_result_escalates_to_configured_runtime_model(monkeypatch):
     calls = []
+    monkeypatch.setattr(ai_provider.settings, "AI_VISION_ENABLED", True)
 
     def fake_extract(**kwargs):
         calls.append(kwargs)

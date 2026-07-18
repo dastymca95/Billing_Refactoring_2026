@@ -1,0 +1,11 @@
+vendor_identity:
+  vendor_name: Hopkinsville Water Environment Authority
+  normalized_vendor_key: hopkinsville_water_environment_authority
+  aliases:
+    - Hopkinsville Water Environment Authority
+  detection_keywords:
+    - Hopkinsville Water Environment Authority
+  active: true
+document_detection:
+  vendor_name_patterns:
+    - HOPKINSVILLE WATER ENVIRONMENT AUTHORITY

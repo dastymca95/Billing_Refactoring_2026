@@ -1,0 +1,9 @@
+vendor_identity:
+  vendor_name: Kros Home Services LLC
+  normalized_vendor_key: kros_home_services_llc
+  category: Construction - Remodeling
+  aliases:
+    - Kros Home Services LLC
+  detection_keywords:
+    - Kros Home Services
+  active: true

@@ -52,7 +52,18 @@ def test_human_adjudication_must_match_accepted_value():
         )
 
 
-def test_crop_reference_cannot_expose_an_absolute_private_path():
+@pytest.mark.parametrize(
+    "crop_ref",
+    [
+        r"C:\private\crop.png",
+        "C:/private/crop.png",
+        r"\\server\share\crop.png",
+        "/private/crop.png",
+        "file:///private/crop.png",
+        "../private/crop.png",
+    ],
+)
+def test_crop_reference_cannot_expose_an_absolute_private_path(crop_ref):
     with pytest.raises(ValidationError, match="safe relative"):
         EvidenceAsset(
             source_document_sha256="a" * 64,
@@ -61,5 +72,13 @@ def test_crop_reference_cannot_expose_an_absolute_private_path():
                 page=1, x=10, y=20, width=30, height=40, render_dpi=600,
             ),
             crop_sha256="b" * 64,
-            crop_ref="C:/private/source.png",
+            crop_ref=crop_ref,
         )
+
+
+@pytest.mark.parametrize("crop_ref", ["crop.png", "crops/invoice/row.png"])
+def test_crop_reference_accepts_portable_relative_artifacts(crop_ref):
+    payload = _asset().model_dump()
+    payload["crop_ref"] = crop_ref
+
+    assert EvidenceAsset.model_validate(payload).crop_ref == crop_ref

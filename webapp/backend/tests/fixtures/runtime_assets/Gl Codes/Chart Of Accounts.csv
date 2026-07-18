@@ -10,6 +10,7 @@ Number,Name,Type,Description
 6540,Electrical Contract,Expense,Electrical labor service
 6555,HVAC Contract,Expense,HVAC labor service
 6565,Plumbing Contract,Expense,Plumbing labor service
+6570,Plumbing Tub and Sink Refinish,Expense,Tub and sink refinishing labor service
 6615,General Supplies,Expense,General materials
 6627,Electrical Supplies,Expense,Electrical parts materials
 6651,Cabinet Hardware,Expense,Bar pulls and cabinet hardware

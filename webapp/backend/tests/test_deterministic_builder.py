@@ -15,18 +15,30 @@ def private_builder_root(tmp_path, monkeypatch):
     return root
 
 
-def test_private_sample_preserves_safe_filename_and_never_serializes_absolute_path(private_builder_root):
+@pytest.mark.parametrize(
+    ("original_filename", "expected_filename"),
+    [
+        (r"C:\private\manager\invoice.csv", "invoice.csv"),
+        ("C:/private/manager/invoice.csv", "invoice.csv"),
+        ("/private/manager/invoice.csv", "invoice.csv"),
+        ("relative/folder/invoice.csv", "invoice.csv"),
+        ("invoice.csv", "invoice.csv"),
+    ],
+)
+def test_private_sample_preserves_safe_filename_and_never_serializes_absolute_path(
+    private_builder_root, original_filename, expected_filename,
+):
     session = builder.create_session("alabama_power")
     session = builder.add_sample(
         session.session_id,
-        original_filename=r"C:\private\manager\invoice.csv",
+        original_filename=original_filename,
         content=b"invoice,total\nABC,10.00\n",
     )
-    assert session.samples[0].original_filename == "invoice.csv"
+    assert session.samples[0].original_filename == expected_filename
     evidence_path = private_builder_root / session.session_id / "samples" / session.samples[0].sample_id / "evidence.json"
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     assert evidence["source_path"] == ""
-    assert "C:\\private" not in evidence_path.read_text(encoding="utf-8")
+    assert original_filename not in evidence_path.read_text(encoding="utf-8")
 
 
 def test_ai_chat_only_updates_validated_draft_and_never_activates(monkeypatch, private_builder_root):

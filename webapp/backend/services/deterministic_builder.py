@@ -25,6 +25,7 @@ from .. import settings
 from . import ai_provider, batch_processor, batch_store, deterministic_coverage, document_ingestion
 from . import rules_impact, vendor_rules
 from .accounting_assistant import _estimate_cost
+from .path_safety import portable_filename
 from .semantic_reasoning_gateway import _select_accounting_profile
 
 
@@ -138,7 +139,7 @@ def add_sample(
     session = get_session(session_id)
     if len(session.samples) >= MAX_SAMPLES:
         raise ValueError(f"A session supports at most {MAX_SAMPLES} samples.")
-    safe_name = Path(original_filename or "sample").name
+    safe_name = portable_filename(original_filename, fallback="sample")
     suffix = Path(safe_name).suffix.casefold()
     if suffix not in ALLOWED_EXTENSIONS:
         raise ValueError(f"Unsupported sample extension: {suffix or '(none)'}.")

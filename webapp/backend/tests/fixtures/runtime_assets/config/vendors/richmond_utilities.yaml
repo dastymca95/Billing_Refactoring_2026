@@ -1,0 +1,11 @@
+vendor_identity:
+  vendor_name: Richmond Utilities
+  normalized_vendor_key: richmond_utilities
+  aliases:
+    - Richmond Utilities
+  detection_keywords:
+    - Richmond Utilities
+  active: true
+document_detection:
+  vendor_name_patterns:
+    - RICHMOND UTILITIES
