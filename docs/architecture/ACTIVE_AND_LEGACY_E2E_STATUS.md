@@ -33,7 +33,6 @@ The principal migration candidates are:
 - `e2e/utility-u4.spec.ts`
 - `e2e/ingestion-ai9.spec.ts`
 - `e2e/reviewer-assisted-workspace.spec.ts`
-- legacy-only paths that remain in `e2e/accounting-assistant.spec.ts`
 
 Failures caused solely by those retired-shell selectors are not Billing V2
 product regressions. They are also not grounds for deleting tests or lowering
@@ -52,3 +51,11 @@ assertions. Historical tests retain value as migration references.
 
 The preservation snapshot records both the green active gates and the known
 legacy-suite debt. Cleanup of legacy E2E remains a separate, reviewable change.
+
+## Explicit runners
+
+- `npm run test:e2e` and `npm run test:e2e:active` execute the active Billing
+  V2 release gate.
+- `npm run test:e2e:legacy` executes the preserved historical specs through
+  `playwright.legacy.config.ts`. It is a migration/audit suite, not a release
+  gate, and its failures must remain visible and documented.

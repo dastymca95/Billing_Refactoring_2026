@@ -4,7 +4,7 @@ const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:5174";
 
 export default defineConfig({
   testDir: "./e2e",
-  testIgnore: [
+  testMatch: [
     "**/operator-visual.spec.ts",
     "**/utility-u4.spec.ts",
     "**/ingestion-ai9.spec.ts",
@@ -23,7 +23,7 @@ export default defineConfig({
   },
   projects: [
     {
-      name: "chromium",
+      name: "chromium-legacy",
       use: {
         ...devices["Desktop Chrome"],
       },
