@@ -9,7 +9,6 @@ import { useEffect, useRef, useState } from "react";
 type PanelKey = "batches" | "document" | "template";
 
 const ITEMS: { key: PanelKey; label: string }[] = [
-  { key: "batches", label: "Batches" },
   { key: "document", label: "Document Viewer" },
   { key: "template", label: "Template" },
 ];

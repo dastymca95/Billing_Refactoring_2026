@@ -43,6 +43,10 @@ try:
     from utils.text_normalization import proper_case_preserve_acronyms as _shared_proper_case
 except Exception:  # pragma: no cover
     _shared_proper_case = None  # type: ignore
+try:
+    from .description_builder import polish_accounting_description_pair
+except Exception:  # pragma: no cover
+    polish_accounting_description_pair = None  # type: ignore
 
 
 _LOG = logging.getLogger(__name__)
@@ -50,6 +54,10 @@ try:
     from . import output_contract_validator
 except Exception:  # pragma: no cover
     output_contract_validator = None  # type: ignore
+try:
+    from . import accounting_pipeline_v2
+except Exception:  # pragma: no cover
+    accounting_pipeline_v2 = None  # type: ignore
 
 
 _DATE_COLUMNS = ("Invoice Date", "Accounting Date", "Due Date")
@@ -92,6 +100,8 @@ _DATE_INPUT_FORMATS = (
     "%m-%d-%Y",
     "%m-%d-%y",
     "%Y/%m/%d",
+    "%d-%b-%Y",
+    "%d-%b-%y",
 )
 
 
@@ -157,13 +167,34 @@ def normalize_rows(
         return 0
     canonical_name: Optional[str] = None
     if vendor_key and vendor_key != "ai_assisted":
-        canonical_name = _vendor_canonical(vendor_key, "")
+        emitted_vendor = str((rows[0] or {}).get("Vendor") or "") if rows else ""
+        canonical_name = _vendor_canonical(vendor_key, emitted_vendor)
     base_url: Optional[str] = _webapp_base_url() if batch_id else None
 
+    document_semantic_context = " | ".join(dict.fromkeys(
+        str(value).strip()
+        for row in rows if isinstance(row, dict)
+        for value in (
+            ((row.get("_meta") or {}).get("source_text") or {}).get("raw_invoice_description")
+            if isinstance(row.get("_meta"), dict) else None,
+            row.get("Invoice Description"),
+            ((row.get("_meta") or {}).get("source_line_description")
+             if isinstance(row.get("_meta"), dict) else None),
+            row.get("Line Item Description"),
+        )
+        if value and str(value).strip()
+    ))
     touched = 0
-    for row in rows:
+    for row_index, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
+        meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+        line_item_id = str(meta.get("line_item_id") or meta.get("invoice_row_index") or row.get("Line Item Number") or row_index)
+        document_id = str(meta.get("source_file") or source_file or batch_id or "unknown-document")
+        if accounting_pipeline_v2 is not None:
+            accounting_pipeline_v2.capture_source_fields(
+                row, document_id=document_id, line_item_id=line_item_id,
+            )
         changed = False
 
         # 1) Vendor name
@@ -181,6 +212,20 @@ def normalize_rows(
                     row[col] = new_val
                     changed = True
 
+        if polish_accounting_description_pair is not None:
+            invoice_desc, line_desc = polish_accounting_description_pair(
+                row.get("Invoice Description"),
+                row.get("Line Item Description"),
+                gl_account=row.get("GL Account"),
+                vendor_name=row.get("Vendor"),
+            )
+            if "Invoice Description" in row and invoice_desc != (row.get("Invoice Description") or ""):
+                row["Invoice Description"] = invoice_desc
+                changed = True
+            if "Line Item Description" in row and line_desc != (row.get("Line Item Description") or ""):
+                row["Line Item Description"] = line_desc
+                changed = True
+
         # 3) Dates → ISO strings (the workbook writer flips these into
         #    real datetime.date cells with a MM/DD/YYYY format).
         for col in _DATE_COLUMNS:
@@ -190,21 +235,44 @@ def normalize_rows(
                     row[col] = iso
                     changed = True
 
-        # 4) Document Url is owned by the vendor processor (Dropbox
-        #    upload). When the upload fails or Dropbox isn't configured
-        #    the cell is left blank and the row is already flagged
-        #    `dropbox_upload_failed` / `dropbox_credentials_missing`
-        #    in manual_review_reasons. No fallback here.
+        # 4) Document Url should still be usable from the web console even
+        #    when a deterministic processor did not upload the support doc to
+        #    Dropbox. Use the original batch file content endpoint as a local
+        #    fallback so export validation does not fail on an otherwise valid
+        #    preview. Real Dropbox links from processors are left untouched.
+        if (
+            base_url
+            and source_file
+            and "Document Url" in row
+            and not str(row.get("Document Url") or "").strip()
+        ):
+            safe_name = quote(source_file, safe="")
+            row["Document Url"] = (
+                base_url
+                + _FILE_CONTENT_PATH_FMT.format(batch_id=quote(batch_id, safe=""), filename=safe_name)
+            )
+            meta = row.setdefault("_meta", {})
+            if isinstance(meta, dict):
+                meta.setdefault("support_document_status", "local_webapp_link")
+            changed = True
 
+        meta = row.setdefault("_meta", {})
+        if isinstance(meta, dict):
+            source_text = meta.get("source_text") if isinstance(meta.get("source_text"), dict) else {}
+            if not meta.get("normalized_source_description"):
+                meta["normalized_source_description"] = to_sentence_case(source_text.get("raw_description")) if source_text.get("raw_description") else None
+            meta["generated_line_description"] = row.get("Line Item Description")
+            meta["generated_invoice_description"] = row.get("Invoice Description")
         if changed:
             touched += 1
-    if output_contract_validator is not None:
-        output_contract_validator.annotate_rows(rows)
     from .accounting_integration_bridges import RowAccountingV2Adapter
     RowAccountingV2Adapter().enrich_rows(rows, {
         "document_id": source_file or batch_id or "normalized-row",
         "extraction_route": vendor_key or "row_normalizer",
+        "document_context": document_semantic_context,
     })
+    if output_contract_validator is not None:
+        output_contract_validator.annotate_rows(rows)
     return touched
 
 
@@ -218,6 +286,7 @@ def normalize_result(result: dict[str, Any]) -> dict[str, int]:
     copies), so both must be updated to keep the preview and the
     export workbook in sync."""
     counts: dict[str, int] = {}
+    from .review_taxonomy import migrate_invoice_review_codes
     batch_id = str(result.get("batch_id") or "")
     by_vendor = result.get("by_vendor") or {}
 
@@ -236,6 +305,7 @@ def normalize_result(result: dict[str, Any]) -> dict[str, int]:
                 batch_id=batch_id,
                 source_file=src,
             )
+            migrate_invoice_review_codes(inv)
         counts[vendor_key] = n
 
     # Top-level all_invoices: same per-invoice walk so the source_file
@@ -255,6 +325,7 @@ def normalize_result(result: dict[str, Any]) -> dict[str, int]:
             batch_id=batch_id,
             source_file=src,
         )
+        migrate_invoice_review_codes(inv)
     if only_key:
         counts[only_key] = counts.get(only_key, 0) + extra
     return counts

@@ -87,7 +87,8 @@ class TrustedUnitIndex:
                     prop = (row.get("property_abbreviation")
                             or row.get("Property Abbreviation") or "").strip()
                     unit = (row.get("unit_number")
-                            or row.get("Unit Number") or "").strip()
+                            or row.get("Unit Number")
+                            or row.get("Unit") or "").strip()
                     if prop:
                         idx.properties.add(_normalize_token(prop))
                     if prop and unit:

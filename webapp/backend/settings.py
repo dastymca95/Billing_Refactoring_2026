@@ -31,11 +31,28 @@ def _load_project_env() -> None:
     if not env_path.is_file():
         return
     try:
+        private_label_aliases = {
+            "deepseek api": "DEEPSEEK_API_KEY",
+            "gemini api": "GEMINI_API_KEY",
+            "claude api": "ANTHROPIC_API_KEY",
+        }
         for raw in env_path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
+            if not line or line.startswith("#"):
                 continue
-            key, value = line.split("=", 1)
+            if "=" in line:
+                key, value = line.split("=", 1)
+            elif ":" in line:
+                # Temporary private-workspace adapter for the original labels
+                # entered by the owner.  The value remains in-process only and
+                # is never logged or serialized. Standard NAME=value remains
+                # the documented format.
+                label, value = line.split(":", 1)
+                key = private_label_aliases.get(label.strip().casefold(), "")
+                if not key:
+                    continue
+            else:
+                continue
             key = key.strip()
             value = value.strip().strip('"').strip("'")
             if key:
@@ -110,6 +127,34 @@ AI_VISION_BASE_URL = os.environ.get("AI_VISION_BASE_URL", "").strip()
 AI_VISION_MAX_PAGES = _env_int("AI_VISION_MAX_PAGES", 2)
 AI_VISION_MAX_IMAGE_WIDTH = _env_int("AI_VISION_MAX_IMAGE_WIDTH", 1600)
 AI_VISION_MODE = os.environ.get("AI_VISION_MODE", "fallback_only").strip().lower()
+AI_VISION_TIMEOUT_SECONDS = _env_int("AI_VISION_TIMEOUT_SECONDS", 120)
+AI_VISION_MAX_RESPONSE_TOKENS = _env_int("AI_VISION_MAX_RESPONSE_TOKENS", 8192)
+AI_VISION_NATIVE_PDF_ENABLED = _env_bool("AI_VISION_NATIVE_PDF_ENABLED", False)
+AI_VISION_NATIVE_PDF_DETAIL = os.environ.get(
+    "AI_VISION_NATIVE_PDF_DETAIL", "high"
+).strip().lower()
+AI_VISION_NATIVE_PDF_REASONING_EFFORT = os.environ.get(
+    "AI_VISION_NATIVE_PDF_REASONING_EFFORT", "medium"
+).strip().lower()
+AI_VISION_NATIVE_PDF_MAX_BYTES = _env_int(
+    "AI_VISION_NATIVE_PDF_MAX_BYTES", 50 * 1024 * 1024
+)
+AI_VISION_NATIVE_PDF_MAX_RESPONSE_TOKENS = _env_int(
+    "AI_VISION_NATIVE_PDF_MAX_RESPONSE_TOKENS", 32768
+)
+AI_VISION_NATIVE_PDF_TIMEOUT_SECONDS = _env_int(
+    "AI_VISION_NATIVE_PDF_TIMEOUT_SECONDS", 240
+)
+AI_INVOICE_GROUP_WORKERS = _env_int("AI_INVOICE_GROUP_WORKERS", 4)
+AI_PAGE_FACTS_ALLOW_PERSISTED_MIGRATION = _env_bool(
+    "AI_PAGE_FACTS_ALLOW_PERSISTED_MIGRATION", False
+)
+# Fast-first remains shadow/benchmark-only until the exact golden comparison
+# has been explicitly approved. A missing or ambiguous value is always off.
+AI_FAST_FIRST_FACTS_ONLY_ENABLED = _env_bool("AI_FAST_FIRST_FACTS_ONLY_ENABLED", False)
+AI_FAST_FIRST_GOLDEN_PARITY_APPROVED = _env_bool(
+    "AI_FAST_FIRST_GOLDEN_PARITY_APPROVED", False
+)
 
 # Allowed file extensions for upload
 ALLOWED_UPLOAD_EXTENSIONS = {

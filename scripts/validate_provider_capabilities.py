@@ -17,8 +17,42 @@ from webapp.backend.services.provider_capabilities import (
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(); parser.add_argument("--private-output", type=Path)
-    args = parser.parse_args(); profiles = ProfileLoader().load(); report = ProviderCapabilityValidator().audit(profiles)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--private-output", type=Path)
+    parser.add_argument(
+        "--profile-id", action="append", default=[],
+        help="Probe only this logical profile ID; repeat for multiple profiles.",
+    )
+    parser.add_argument(
+        "--list-only", action="store_true",
+        help="Show secret-safe configuration status without making provider calls.",
+    )
+    args = parser.parse_args()
+    profiles = ProfileLoader().load()
+    if args.profile_id:
+        requested = set(args.profile_id)
+        profiles = [profile for profile in profiles if profile.profile_id in requested]
+        missing = sorted(requested - {profile.profile_id for profile in profiles})
+        if missing:
+            print(json.dumps({"error": "profile_not_configured", "profile_ids": missing}))
+            return 3
+    if args.list_only:
+        print(json.dumps({
+            "profiles": [{
+                "profile_id": profile.profile_id,
+                "provider": profile.provider,
+                "model_id": profile.model_id,
+                "role": profile.role.value,
+                "enabled": profile.enabled,
+                "credentials_present": profile.credentials_present,
+                "endpoint_configured": profile.base_url_configured,
+                "declared_capabilities": [item.value for item in profile.declared_capabilities],
+            } for profile in profiles],
+            "provider_calls_made": 0,
+            "secrets_exposed": False,
+        }, indent=2, sort_keys=True))
+        return 0
+    report = ProviderCapabilityValidator().audit(profiles)
     activation = VerifiedCapabilityRegistry(report.profiles).activation_report()
     payload = report.model_dump(mode="json")
     payload["activation"] = activation.model_dump(mode="json")

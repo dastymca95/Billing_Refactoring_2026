@@ -12,7 +12,7 @@ service_period_expected:
 property_abbreviation_expected: OG-PPA
 location_expected: ""
 location_policy_expected: valid_unit_if_present
-invoice_description_expected: 05/09/26 - Lowes Pro Supply - 3-3/4-In (96mm) Bar Pull
+invoice_description_expected: 3-3/4-In (96mm) Bar Pull
 line_items_expected:
   - line_item_number: 1
     gl_account: "6651"

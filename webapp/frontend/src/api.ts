@@ -6,17 +6,21 @@ import type {
   AiVisionAssistResponse,
   BatchListEntry,
   BatchProgress,
-  BatchStatus,
   BillingV2AuditResponse,
   BillingV2PrepareLinksResponse,
+  BatchStatus,
   DocumentMode,
   ExportResponse,
   FilePreview,
   FilesResponse,
+  HumanAdjudicationContext,
+  HumanAdjudicationOptions,
   IngestionPreviewResponse,
   ManualReviewResponse,
   PreviewResponse,
   ProcessResult,
+  ProcessingRouteSnapshot,
+  ProcessingRouteUpdate,
   QueueStatus,
   RegionHint,
   RegionHintsResponse,
@@ -107,6 +111,15 @@ type UploadProgressEvent = {
   percent: number;
 };
 
+export type UploadFileResponse = {
+  batch_id?: string;
+  filename: string;
+  size_bytes: number;
+  extension?: string;
+  page_count?: number | null;
+  converted_from?: string;
+};
+
 function uploadWithProgress<T>(
   url: string,
   body: FormData,
@@ -181,13 +194,20 @@ export function getFriendlyErrorMessage(error: unknown, context?: string): strin
       return "Invalid batch. Please refresh and try again.";
     }
     if (error.status === 404) {
+      if (/batch not found/i.test(detailText)) {
+        return "Batch not found. It may have been deleted.";
+      }
+      if (/no preview|manual-review data|run process/i.test(detailText)) {
+        return "The processed preview is still being prepared. Please wait a moment.";
+      }
+      if (detailText) return detailText;
       return "Batch not found. It may have been deleted.";
     }
     if (error.status === 405) {
       return "This action is not available on the running backend. Restart the backend and refresh the app.";
     }
     if (error.status === 422) {
-      return "Some information is invalid. Please review and try again.";
+      return detailMessage(error.detail) || "Some information is invalid. Please review and try again.";
     }
     return detailMessage(error.detail) || error.message || "Request failed. Please try again.";
   }
@@ -279,8 +299,8 @@ export const api = {
 
   // Returns 404 if the batch folder is gone (stale localStorage). The
   // frontend uses that to clear localStorage on app load.
-  async getBatch(batchId: string) {
-    const res = await fetch(`/api/batches/${batchId}`);
+  async getBatch(batchId: string, opts: { signal?: AbortSignal } = {}) {
+    const res = await fetch(`/api/batches/${batchId}`, { signal: opts.signal });
     return jsonOrThrow<BatchStatus>(res);
   },
 
@@ -295,22 +315,63 @@ export const api = {
     batchId: string,
     file: File,
     onProgress?: (progress: UploadProgressEvent) => void,
+    opts: { asPdf?: boolean } = {},
   ) {
     const fd = new FormData();
     fd.append("file", file);
+    const params = new URLSearchParams();
+    if (opts.asPdf) params.set("as_pdf", "1");
+    const url = `/api/batches/${batchId}/upload${params.toString() ? `?${params}` : ""}`;
     if (onProgress) {
-      return uploadWithProgress<{ filename: string; size_bytes: number }>(
-        `/api/batches/${batchId}/upload`,
+      return uploadWithProgress<UploadFileResponse>(
+        url,
         fd,
         onProgress,
         file.size,
       );
     }
-    const res = await fetch(`/api/batches/${batchId}/upload`, {
+    const res = await fetch(url, {
       method: "POST",
       body: fd,
     });
-    return jsonOrThrow<{ filename: string; size_bytes: number }>(res);
+    return jsonOrThrow<UploadFileResponse>(res);
+  },
+
+  async appendFileToDocument(
+    batchId: string,
+    filename: string,
+    file: File,
+    onProgress?: (progress: UploadProgressEvent) => void,
+  ) {
+    const fd = new FormData();
+    fd.append("file", file);
+    const url = `/api/batches/${batchId}/files/${encodeURIComponent(filename)}/append`;
+    if (onProgress) {
+      return uploadWithProgress<{
+        batch_id: string;
+        filename: string;
+        original_filename?: string;
+        appended_filename: string;
+        appended_pages: number;
+        page_count: number;
+        size_bytes: number;
+        extension: string;
+      }>(url, fd, onProgress, file.size);
+    }
+    const res = await fetch(url, {
+      method: "POST",
+      body: fd,
+    });
+    return jsonOrThrow<{
+      batch_id: string;
+      filename: string;
+      original_filename?: string;
+      appended_filename: string;
+      appended_pages: number;
+      page_count: number;
+      size_bytes: number;
+      extension: string;
+    }>(res);
   },
 
   async listFiles(batchId: string) {
@@ -327,9 +388,14 @@ export const api = {
     return jsonOrThrow<{ batch_id: string; filename: string; deleted: boolean }>(res);
   },
 
-  async filePreview(batchId: string, filename: string) {
+  async filePreview(
+    batchId: string,
+    filename: string,
+    opts: { signal?: AbortSignal } = {},
+  ) {
     const res = await fetch(
       `/api/batches/${batchId}/files/${encodeURIComponent(filename)}/preview`,
+      { signal: opts.signal },
     );
     return jsonOrThrow<FilePreview>(res);
   },
@@ -352,6 +418,12 @@ export const api = {
     return `/api/batches/${batchId}/files/${encodeURIComponent(filename)}/content`;
   },
 
+  combinedPdfContentUrl(batchId: string, filenames: string[]) {
+    const params = new URLSearchParams();
+    for (const filename of filenames) params.append("files", filename);
+    return `/api/batches/${batchId}/combined/content?${params.toString()}`;
+  },
+
   // Phase 1G: process() now returns immediately ({status: "accepted",
   // polling_url}) and the actual work happens in a backend thread. The
   // frontend polls /progress until status=completed|failed, then re-fetches
@@ -359,7 +431,12 @@ export const api = {
   // behaviour (used by tests).
   async process(
     batchId: string,
-    opts: { sync?: boolean; file?: string; fileMode?: "replace" | "merge" } = {},
+    opts: {
+      sync?: boolean;
+      file?: string;
+      fileMode?: "replace" | "merge";
+      page?: number;
+    } = {},
   ) {
     // Phase 2M — pass ``file`` to process a single file inside the
     // batch. Single-file runs are always sync on the server.
@@ -367,6 +444,7 @@ export const api = {
     if (opts.sync || opts.file) params.set("sync", "1");
     if (opts.file) params.set("file", opts.file);
     if (opts.fileMode) params.set("file_mode", opts.fileMode);
+    if (opts.page != null) params.set("page", String(opts.page));
     const qs = params.toString();
     const url = qs
       ? `/api/batches/${batchId}/process?${qs}`
@@ -387,13 +465,17 @@ export const api = {
     );
   },
 
-  async preview(batchId: string) {
-    const res = await fetch(`/api/batches/${batchId}/preview`);
+  async preview(batchId: string, opts: { signal?: AbortSignal } = {}) {
+    const res = await fetch(`/api/batches/${batchId}/preview`, {
+      signal: opts.signal,
+    });
     return jsonOrThrow<PreviewResponse>(res);
   },
 
-  async manualReview(batchId: string) {
-    const res = await fetch(`/api/batches/${batchId}/manual-review`);
+  async manualReview(batchId: string, opts: { signal?: AbortSignal } = {}) {
+    const res = await fetch(`/api/batches/${batchId}/manual-review`, {
+      signal: opts.signal,
+    });
     return jsonOrThrow<ManualReviewResponse>(res);
   },
 
@@ -404,6 +486,349 @@ export const api = {
       body: JSON.stringify({ rows }),
     });
     return jsonOrThrow<import("./types").AccountingReadiness>(res);
+  },
+
+  async processingRoutes(batchId: string, opts: { signal?: AbortSignal } = {}) {
+    const res = await fetch(`/api/batches/${batchId}/processing-routes`, {
+      signal: opts.signal,
+    });
+    return jsonOrThrow<ProcessingRouteSnapshot>(res);
+  },
+
+  async updateProcessingRoute(batchId: string, update: ProcessingRouteUpdate) {
+    const res = await fetch(`/api/batches/${batchId}/processing-routes`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update),
+    });
+    return jsonOrThrow<ProcessingRouteSnapshot>(res);
+  },
+
+  async accountingAssistantChat(body: {
+    batch_id: string;
+    invoice_group_id: string;
+    message: string;
+    tenant_id?: string;
+  }) {
+    const res = await fetch("/api/accounting-assistant/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return jsonOrThrow<import("./types").AccountingAssistantChatResult>(res);
+  },
+
+  async listAccountingAssistantInteractions(batchId: string, invoiceGroupId: string) {
+    const query = new URLSearchParams({
+      batch_id: batchId,
+      invoice_group_id: invoiceGroupId,
+    });
+    const res = await fetch(`/api/accounting-assistant/interactions?${query.toString()}`);
+    return jsonOrThrow<{
+      contract_version: string;
+      items: import("./types").AccountingAssistantInteraction[];
+    }>(res);
+  },
+
+  async listApprovedAccountingCorrections(batchId?: string) {
+    const query = batchId ? `?${new URLSearchParams({ batch_id: batchId }).toString()}` : "";
+    const res = await fetch(`/api/accounting-assistant/corrections${query}`);
+    return jsonOrThrow<{
+      contract_version: string;
+      items: import("./types").ApprovedInvoiceCorrection[];
+      active_count: number;
+    }>(res);
+  },
+
+  async decideAccountingAssistantCorrections(interactionId: string, approve: boolean) {
+    const res = await fetch(
+      `/api/accounting-assistant/interactions/${encodeURIComponent(interactionId)}/corrections/decision`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approve, actor: "local_operator" }),
+      },
+    );
+    return jsonOrThrow<{
+      result: import("./types").AccountingAssistantChatResult;
+      applied: number;
+      replayed: boolean;
+    }>(res);
+  },
+
+  async listAccountingRules() {
+    const res = await fetch("/api/accounting-assistant/rules");
+    return jsonOrThrow<{
+      contract_version: string;
+      items: import("./types").OperatorAccountingRule[];
+      active_count: number;
+    }>(res);
+  },
+
+  async decideAccountingRule(ruleId: string, approve: boolean) {
+    const res = await fetch(
+      `/api/accounting-assistant/rules/${encodeURIComponent(ruleId)}/decision`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approve, actor: "local_operator" }),
+      },
+    );
+    return jsonOrThrow<import("./types").OperatorAccountingRule>(res);
+  },
+
+  async updateAccountingRule(
+    ruleId: string,
+    draft: Pick<import("./types").OperatorAccountingRule, "title" | "description" | "scope" | "constraint">,
+  ) {
+    const res = await fetch(
+      `/api/accounting-assistant/rules/${encodeURIComponent(ruleId)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ draft, actor: "local_operator" }),
+      },
+    );
+    return jsonOrThrow<import("./types").OperatorAccountingRule>(res);
+  },
+
+  async setAccountingRuleEnabled(ruleId: string, enabled: boolean) {
+    const res = await fetch(
+      `/api/accounting-assistant/rules/${encodeURIComponent(ruleId)}/status`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled, actor: "local_operator" }),
+      },
+    );
+    return jsonOrThrow<import("./types").OperatorAccountingRule>(res);
+  },
+
+  async tenantAccountingContext() {
+    const res = await fetch("/api/tenant-accounting/context");
+    return jsonOrThrow<{ tenant_id: string; context_source: string; production_auth_required: boolean }>(res);
+  },
+
+  async listTenantVendors(tenantId?: string) {
+    const query = tenantId ? `?${new URLSearchParams({ tenant_id: tenantId })}` : "";
+    const res = await fetch(`/api/tenant-accounting/vendors${query}`);
+    return jsonOrThrow<{ tenant_id: string; items: import("./types").TenantVendorEntity[] }>(res);
+  },
+
+  async createTenantVendor(draft: { canonical_name: string; erp_vendor_id?: string | null; aliases: string[] }, tenantId?: string) {
+    const res = await fetch("/api/tenant-accounting/vendors", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenantId, draft, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").TenantVendorEntity>(res);
+  },
+
+  async getResManContextStatus(tenantId?: string) {
+    const query = tenantId ? `?${new URLSearchParams({ tenant_id: tenantId })}` : "";
+    const res = await fetch(`/api/resman-context/status${query}`);
+    return jsonOrThrow<{ tenant_id: string; datasets: import("./types").ResManDatasetStatus[] }>(res);
+  },
+
+  async previewResManImport(dataset: import("./types").ResManDatasetKind, file: File, tenantId?: string) {
+    const query = tenantId ? `?${new URLSearchParams({ tenant_id: tenantId })}` : "";
+    const form = new FormData();
+    form.append("file", file, file.name);
+    const res = await fetch(`/api/resman-context/${dataset}/imports/preview${query}`, {
+      method: "POST",
+      body: form,
+    });
+    return jsonOrThrow<import("./types").ResManImportPreview>(res);
+  },
+
+  async publishResManImport(dataset: import("./types").ResManDatasetKind, importId: string, tenantId?: string) {
+    const res = await fetch(`/api/resman-context/${dataset}/imports/${encodeURIComponent(importId)}/publish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenantId, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").ResManSnapshot>(res);
+  },
+
+  async listResManSnapshots(dataset: import("./types").ResManDatasetKind, tenantId?: string) {
+    const query = tenantId ? `?${new URLSearchParams({ tenant_id: tenantId })}` : "";
+    const res = await fetch(`/api/resman-context/${dataset}/snapshots${query}`);
+    return jsonOrThrow<{ items: import("./types").ResManSnapshot[] }>(res);
+  },
+
+  async activateResManSnapshot(dataset: import("./types").ResManDatasetKind, snapshotId: string, tenantId?: string) {
+    const res = await fetch(`/api/resman-context/${dataset}/snapshots/${encodeURIComponent(snapshotId)}/activate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenantId, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").ResManSnapshot>(res);
+  },
+
+  async listResManRecords(
+    dataset: import("./types").ResManDatasetKind,
+    options: { page?: number; pageSize?: number; search?: string; tenantId?: string } = {},
+  ) {
+    const params = new URLSearchParams({
+      page: String(options.page || 1),
+      page_size: String(options.pageSize || 50),
+    });
+    if (options.search) params.set("search", options.search);
+    if (options.tenantId) params.set("tenant_id", options.tenantId);
+    const res = await fetch(`/api/resman-context/${dataset}/records?${params}`);
+    return jsonOrThrow<import("./types").ResManRecordPage>(res);
+  },
+
+  async createResManRecord(dataset: import("./types").ResManDatasetKind, payload: Record<string, unknown>, tenantId?: string) {
+    const res = await fetch(`/api/resman-context/${dataset}/records`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenantId, payload, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").ResManContextRecord>(res);
+  },
+
+  async updateResManRecord(
+    dataset: import("./types").ResManDatasetKind,
+    naturalKey: string,
+    payload: Record<string, unknown>,
+    tenantId?: string,
+  ) {
+    const res = await fetch(`/api/resman-context/${dataset}/records/${encodeURIComponent(naturalKey)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenantId, payload, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").ResManContextRecord>(res);
+  },
+
+  async deleteResManRecord(dataset: import("./types").ResManDatasetKind, naturalKey: string, tenantId?: string) {
+    const params = new URLSearchParams({ actor: "local_operator" });
+    if (tenantId) params.set("tenant_id", tenantId);
+    const res = await fetch(
+      `/api/resman-context/${dataset}/records/${encodeURIComponent(naturalKey)}?${params}`,
+      { method: "DELETE" },
+    );
+    return jsonOrThrow<{ deleted: boolean; natural_key: string; audit_preserved: boolean }>(res);
+  },
+
+  async getContextIntelligenceStatus(tenantId?: string) {
+    const query = tenantId ? `?${new URLSearchParams({ tenant_id: tenantId })}` : "";
+    const res = await fetch(`/api/context-intelligence/status${query}`);
+    return jsonOrThrow<import("./types").ContextIntelligenceStatus>(res);
+  },
+
+  async scanResManContext(tenantId?: string) {
+    const res = await fetch("/api/context-intelligence/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenantId, actor: "local_operator" }),
+    });
+    return jsonOrThrow<{ state: "ready"; snapshot: import("./types").ContextIntelligenceSnapshotSummary }>(res);
+  },
+
+  async listContextMatrix(options: {
+    dimension: "vendors" | "properties";
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    mode?: string;
+    tenantId?: string;
+  }) {
+    const params = new URLSearchParams({
+      dimension: options.dimension,
+      page: String(options.page || 1),
+      page_size: String(options.pageSize || 50),
+    });
+    if (options.search) params.set("search", options.search);
+    if (options.mode) params.set("mode", options.mode);
+    if (options.tenantId) params.set("tenant_id", options.tenantId);
+    const res = await fetch(`/api/context-intelligence/matrix?${params}`);
+    return jsonOrThrow<import("./types").ContextMatrixPage>(res);
+  },
+
+  async updateVendorContextGovernance(
+    vendorKey: string,
+    body: { governance_status: import("./types").VendorContextProfile["governance_status"]; reviewer_notes?: string | null },
+    tenantId?: string,
+  ) {
+    const res = await fetch(`/api/context-intelligence/vendors/${encodeURIComponent(vendorKey)}/governance`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, tenant_id: tenantId, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").VendorContextProfile>(res);
+  },
+
+  async createDeterministicBuilderSession(vendorKey: string) {
+    const res = await fetch("/api/deterministic-builder/sessions", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vendor_key: vendorKey, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").DeterministicBuilderSession>(res);
+  },
+
+  async uploadDeterministicBuilderSample(sessionId: string, file: File) {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`/api/deterministic-builder/sessions/${encodeURIComponent(sessionId)}/samples`, {
+      method: "POST", body: form,
+    });
+    return jsonOrThrow<import("./types").DeterministicBuilderSession>(res);
+  },
+
+  async chatDeterministicBuilder(sessionId: string, message: string, selectedColumn?: string | null) {
+    const res = await fetch(`/api/deterministic-builder/sessions/${encodeURIComponent(sessionId)}/chat`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, selected_column: selectedColumn || null, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").DeterministicBuilderSession>(res);
+  },
+
+  async previewDeterministicBuilder(sessionId: string) {
+    const res = await fetch(`/api/deterministic-builder/sessions/${encodeURIComponent(sessionId)}/preview`, { method: "POST" });
+    return jsonOrThrow<import("./types").DeterministicBuilderSession>(res);
+  },
+
+  async approveDeterministicBuilder(sessionId: string, expectedRevision: number) {
+    const res = await fetch(`/api/deterministic-builder/sessions/${encodeURIComponent(sessionId)}/approve`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_revision: expectedRevision, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").DeterministicBuilderSession>(res);
+  },
+
+  async listTenantPolicies(tenantId?: string) {
+    const query = tenantId ? `?${new URLSearchParams({ tenant_id: tenantId })}` : "";
+    const res = await fetch(`/api/tenant-accounting/policies${query}`);
+    return jsonOrThrow<{ tenant_id: string; items: import("./types").TenantAccountingPolicy[]; active_count: number }>(res);
+  },
+
+  async simulateTenantPolicy(policyId: string, lines: Record<string, unknown>[], tenantId?: string) {
+    const res = await fetch(`/api/tenant-accounting/policies/${encodeURIComponent(policyId)}/simulate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenantId, lines, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").TenantAccountingPolicy>(res);
+  },
+
+  async decideTenantPolicy(policyId: string, approve: boolean, tenantId?: string) {
+    const res = await fetch(`/api/tenant-accounting/policies/${encodeURIComponent(policyId)}/decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenantId, approve, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").TenantAccountingPolicy>(res);
+  },
+
+  async setTenantPolicyEnabled(policyId: string, enabled: boolean, tenantId?: string) {
+    const res = await fetch(`/api/tenant-accounting/policies/${encodeURIComponent(policyId)}/status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tenant_id: tenantId, enabled, actor: "local_operator" }),
+    });
+    return jsonOrThrow<import("./types").TenantAccountingPolicy>(res);
   },
 
   async exportBatch(batchId: string, editedRows?: Record<string, unknown>[]) {
@@ -486,6 +911,17 @@ export const api = {
   async listRevisions(batchId: string) {
     const res = await fetch(`/api/batches/${batchId}/revisions`);
     return jsonOrThrow<RevisionListResponse>(res);
+  },
+
+  async listBatchActivity(batchId: string, invoiceGroupId?: string) {
+    const query = new URLSearchParams();
+    if (invoiceGroupId) query.set("invoice_group_id", invoiceGroupId);
+    const suffix = query.size ? `?${query.toString()}` : "";
+    const res = await fetch(`/api/batches/${encodeURIComponent(batchId)}/activity${suffix}`);
+    return jsonOrThrow<{
+      contract_version: string;
+      items: import("./types").OperatorActivityEvent[];
+    }>(res);
   },
 
   async activateRevision(batchId: string, revisionId: string) {
@@ -844,18 +1280,41 @@ export const api = {
   async saveEdits(
     batchId: string,
     edits: Record<number, Record<string, unknown>>,
+    adjudication?: HumanAdjudicationOptions,
   ) {
     const res = await fetch(`/api/batches/${batchId}/save-edits`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ edits }),
+      body: JSON.stringify({ edits, adjudication }),
     });
     return jsonOrThrow<{
       batch_id: string;
       applied: number;
       skipped: number;
       current_revision_id: string | null;
+      adjudication?: {
+        recorded: number;
+        applied: number;
+        unresolved: number;
+        revision_ids: string[];
+        benchmark_submissions: number;
+        learning_approvals: number;
+        rule_proposals: number;
+      } | null;
     }>(res);
+  },
+
+  async humanAdjudicationContext() {
+    const res = await fetch("/api/human-adjudication/context");
+    return jsonOrThrow<HumanAdjudicationContext>(res);
+  },
+
+  humanAdjudicationEvidenceCropUrl(
+    batchId: string,
+    rowIndex: number,
+    field: string,
+  ) {
+    return `/api/batches/${encodeURIComponent(batchId)}/adjudications/evidence/${rowIndex}/${encodeURIComponent(field)}/crop`;
   },
 
   async deleteRevision(batchId: string, revisionId: string) {

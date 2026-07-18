@@ -3,6 +3,8 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import PopoutPage, { parsePopoutHash } from "./components/PopoutPage";
 import "./styles.css";
+import "./brand-refresh.css";
+import "./processing-route.css";
 
 function RootRouter() {
   // Phase 2C — hash-based router. We don't need react-router for two

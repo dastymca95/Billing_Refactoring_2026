@@ -39,3 +39,29 @@ def test_ai_bridge_does_not_accept_invalid_ai_gl_and_readiness_blocks_null():
     assert decision["selected_gl_code"] != "1100"
     readiness = evaluate_rows(invoice["rows"])
     assert readiness.export_allowed is False
+
+
+def test_ai_bridge_marks_pre_engine_gl_warning_resolved_after_authoritative_decision():
+    row = _row("6530")
+    row["_meta"].update({
+        "ai_validation_flags": ["gl_mapping_required", "required_property_abbreviation"],
+        "manual_review_reasons": [
+            "GL mapping remained unresolved after AI extraction.",
+            "Property Abbreviation is required by Canonical Rules before export.",
+        ],
+    })
+    invoice = {
+        "manual_review_codes": ["gl_mapping_required", "required_property_abbreviation"],
+        "manual_review_reasons": list(row["_meta"]["manual_review_reasons"]),
+        "validation_summary": {"blocking_required_fields": ["GL Account", "Property Abbreviation"]},
+        "rows": [row],
+    }
+
+    converted = AIResultAccountingV2Adapter().convert(invoice, {"document_id": "ai-doc"})
+    meta = converted["rows"][0]["_meta"]
+
+    assert "gl_mapping_required" not in converted["manual_review_codes"]
+    assert converted["manual_review_codes"] == ["required_property_abbreviation"]
+    assert converted["validation_summary"]["blocking_required_fields"] == ["Property Abbreviation"]
+    assert "gl_mapping_required" not in meta["ai_validation_flags"]
+    assert meta["resolved_pre_engine_issues"][0]["evidence"][0]["decision_source"] == "AccountingDecisionEngine"

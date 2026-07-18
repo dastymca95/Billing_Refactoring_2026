@@ -52,6 +52,9 @@ class ModelProfile(BaseModel):
     cache_namespace: str = "profile"
     model_family: str | None = None
     verification_independence: str | None = None
+    input_cost_usd_per_million: float | None = Field(default=None, ge=0)
+    output_cost_usd_per_million: float | None = Field(default=None, ge=0)
+    routing_priority: int = Field(default=100, ge=0, le=1000)
 
 
 class CapabilityProbeEvidence(BaseModel):
@@ -136,6 +139,8 @@ class ProfileLoader:
                 base_url=base,
                 timeout=timeout,
                 model_family=os.environ.get("AI_MODEL_FAMILY", "").strip() or None,
+                input_cost=_float_env("AI_INPUT_COST_USD_PER_MILLION"),
+                output_cost=_float_env("AI_OUTPUT_COST_USD_PER_MILLION"),
             ))
         vision_model = os.environ.get("AI_VISION_MODEL", "").strip()
         vision_provider = os.environ.get("AI_VISION_PROVIDER", "").strip().lower() or provider
@@ -154,6 +159,8 @@ class ProfileLoader:
                 timeout=timeout,
                 vision=True,
                 model_family=os.environ.get("AI_VISION_MODEL_FAMILY", "").strip() or None,
+                input_cost=_float_env("AI_VISION_INPUT_COST_USD_PER_MILLION"),
+                output_cost=_float_env("AI_VISION_OUTPUT_COST_USD_PER_MILLION"),
             ))
         verification_model = os.environ.get("AI_VERIFICATION_MODEL", "").strip()
         verification_provider = os.environ.get("AI_VERIFICATION_PROVIDER", "").strip().lower() or provider
@@ -173,6 +180,8 @@ class ProfileLoader:
                 timeout=timeout,
                 vision=True,
                 model_family=os.environ.get("AI_VERIFICATION_MODEL_FAMILY", "").strip() or None,
+                input_cost=_float_env("AI_VERIFICATION_INPUT_COST_USD_PER_MILLION"),
+                output_cost=_float_env("AI_VERIFICATION_OUTPUT_COST_USD_PER_MILLION"),
             ))
         reasoner = os.environ.get("AI_ACCOUNTING_REASONING_MODEL", "").strip()
         reason_provider = os.environ.get("AI_ACCOUNTING_REASONING_PROVIDER", "").strip().lower() or provider
@@ -189,7 +198,10 @@ class ProfileLoader:
                 base_url=reason_base,
                 timeout=timeout,
                 model_family=os.environ.get("AI_ACCOUNTING_REASONING_MODEL_FAMILY", "").strip() or None,
+                input_cost=_float_env("AI_ACCOUNTING_REASONING_INPUT_COST_USD_PER_MILLION"),
+                output_cost=_float_env("AI_ACCOUNTING_REASONING_OUTPUT_COST_USD_PER_MILLION"),
             ))
+        profiles.extend(_provider_family_profiles())
         _record_verification_independence(profiles)
         return profiles
 
@@ -363,8 +375,9 @@ class OpenAICompatibleProbeTransport:
             base_url_override=profile.base_url,
             timeout_seconds_override=profile.timeout_seconds,
             max_attempts_override=profile.max_retries + 1,
+            capability_override=capability.value,
         )
-        return json.loads(raw)
+        return ai_provider._extract_json_object(raw)
 
 
 def _probe_request(profile: ModelProfile, capability: ModelCapability) -> dict[str, Any]:
@@ -421,10 +434,85 @@ def _int_env(name: str, default: int) -> int:
     except ValueError: return default
 
 
+def _float_env(name: str) -> float | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _provider_family_profiles() -> list[ModelProfile]:
+    """Load optional provider-specific profiles without guessing model IDs.
+
+    A credential by itself never activates a model.  Each role requires an
+    explicit model environment variable so capability probes can validate the
+    exact deployment before routing production work to it.
+    """
+    definitions = (
+        ("gemini", "GEMINI", "https://generativelanguage.googleapis.com/v1beta/openai"),
+        ("deepseek", "DEEPSEEK", "https://api.deepseek.com"),
+        ("anthropic", "ANTHROPIC", "https://api.anthropic.com/v1"),
+    )
+    profiles: list[ModelProfile] = []
+    for provider, prefix, default_base in definitions:
+        key = os.environ.get(f"{prefix}_API_KEY", "").strip()
+        base = os.environ.get(f"{prefix}_BASE_URL", "").strip() or default_base
+        timeout = _int_env(f"{prefix}_TIMEOUT_SECONDS", 45)
+        family = os.environ.get(f"{prefix}_MODEL_FAMILY", "").strip() or None
+        priority = _int_env(f"{prefix}_ROUTING_PRIORITY", 100)
+        common = {
+            "provider": provider,
+            "api_key": key,
+            "base_url": base,
+            "timeout": timeout,
+            "model_family": family,
+            "routing_priority": priority,
+        }
+        role_specs = (
+            ("text", "TEXT_MODEL", ModelProfileRole.TEXT_EXTRACTION,
+             [ModelCapability.TEXT_EXTRACTION, ModelCapability.STRUCTURED_OUTPUT,
+              ModelCapability.LONG_DOCUMENT_PROCESSING], False),
+            ("vision", "VISION_MODEL", ModelProfileRole.MULTIMODAL_EXTRACTION,
+             [ModelCapability.TEXT_EXTRACTION, ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
+              ModelCapability.HANDWRITING_INTERPRETATION, ModelCapability.STRUCTURED_OUTPUT], True),
+            ("verification", "VERIFICATION_MODEL", ModelProfileRole.INDEPENDENT_VERIFICATION,
+             [ModelCapability.INDEPENDENT_VERIFICATION,
+              ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
+              ModelCapability.STRUCTURED_OUTPUT], True),
+            ("accounting", "ACCOUNTING_REASONING_MODEL", ModelProfileRole.ACCOUNTING_REASONING,
+             [ModelCapability.ACCOUNTING_REASONING, ModelCapability.STRUCTURED_OUTPUT], False),
+        )
+        for suffix, model_env, role, capabilities, vision in role_specs:
+            model = (os.environ.get(f"{prefix}_{model_env}", "").strip()
+                     or (os.environ.get(f"{prefix}_MODEL", "").strip() if suffix == "text" else ""))
+            if not model:
+                continue
+            role_prefix = f"{prefix}_{suffix.upper()}"
+            profiles.append(_environment_profile(
+                profile_id=f"{provider}-{suffix}", model_id=model, role=role,
+                capabilities=capabilities, vision=vision,
+                input_cost=(_float_env(f"{role_prefix}_INPUT_COST_USD_PER_MILLION")
+                            if os.environ.get(f"{role_prefix}_INPUT_COST_USD_PER_MILLION", "").strip()
+                            else _float_env(f"{prefix}_INPUT_COST_USD_PER_MILLION")),
+                output_cost=(_float_env(f"{role_prefix}_OUTPUT_COST_USD_PER_MILLION")
+                             if os.environ.get(f"{role_prefix}_OUTPUT_COST_USD_PER_MILLION", "").strip()
+                             else _float_env(f"{prefix}_OUTPUT_COST_USD_PER_MILLION")),
+                **common,
+            ))
+    return profiles
+
+
 def _environment_profile(*, provider: str, profile_id: str, model_id: str,
                          role: ModelProfileRole, capabilities: list[ModelCapability],
                          api_key: str, base_url: str, timeout: int,
-                         vision: bool = False, model_family: str | None = None) -> ModelProfile:
+                         vision: bool = False, model_family: str | None = None,
+                         input_cost: float | None = None,
+                         output_cost: float | None = None,
+                         routing_priority: int = 100) -> ModelProfile:
     return ModelProfile(
         provider=provider,
         profile_id=profile_id,
@@ -440,6 +528,9 @@ def _environment_profile(*, provider: str, profile_id: str, model_id: str,
         trace_namespace=f"provider-trace:{profile_id}",
         cache_namespace=f"provider-cache:{profile_id}",
         model_family=model_family,
+        input_cost_usd_per_million=input_cost,
+        output_cost_usd_per_million=output_cost,
+        routing_priority=routing_priority,
     )
 
 

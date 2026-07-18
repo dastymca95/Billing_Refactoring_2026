@@ -22,10 +22,14 @@ thresholds:
   blocking_ambiguity: 0.04
 
 semantic_indicators:
-  material: [material, materials, supply, supplies, part, parts, gallon, gallons, primer, brush, brushes, roller, rollers, filter, filters, bulb, bulbs, breaker, breakers, fitting, fittings, valve, valves, hardware, chemical, chemicals]
+  retail_abbreviations: {acc: accessory, gft: gift, slg: sunglasses, tex: textile, sta: stationery}
+  material: [material, materials, supply, supplies, merchandise, accessory, accessories, sunglasses, stationery, textile, textiles, decor, decorative, gift, gifts, part, parts, gallon, gallons, primer, brush, brushes, roller, rollers, filter, filters, bulb, bulbs, breaker, breakers, fitting, fittings, valve, valves, hardware, chemical, chemicals, blind, blinds, shade, shades, drapery, curtain, curtains]
   service: [labor, service, repair, maintenance, install, installation, replace, painting, cleaning, refinish, resurface, inspection, leak, leaks, diagnostic, diagnosis]
   recurring: [monthly, recurring, subscription, membership, renewal, annual service]
   fee: [fee, late charge, service charge, connection fee, reconnect fee, trip charge]
+  # Expense subjects describe what was purchased. Billing-form words such as
+  # "fee" or "charge" must not erase a stronger subject classification.
+  subscription_membership_subject: [subscription, membership, member dues, association dues, annual dues, renewal, license renewal, software license, platform license, saas]
   capital: [capital, renovation, renovate, remodel, full replacement, complete replacement]
   trades:
     plumbing: [plumbing, plumber, pipe, leak, leaks, toilet, drain, faucet, water heater]
@@ -36,17 +40,31 @@ semantic_indicators:
     landscaping: [landscape, landscaping, lawn, mowing, mulch, grounds]
     pest: [pest, extermination, termite, roach, bed bug]
     appliance: [appliance, refrigerator, dishwasher, stove, washer, dryer]
-    flooring: [flooring, carpet, vinyl, tile, plank, subfloor]
+    flooring: [flooring, floor tile, carpet, vinyl, plank, subfloor]
     cabinets: [cabinet, cabinets]
-    countertop: [countertop, counter top]
-    tub_refinishing: [tub refinishing, tub resurfacing, reglazing, bathtub refinish]
+    countertop: [countertop, counter top, kitchen counter, bath counter]
+    tub_refinishing: [tub refinishing, tub resurfacing, reglazing, bathtub refinish, bath tub, tub mat, wall tile]
     legal: [legal, attorney, court, eviction]
-    insurance: [insurance, premium, policy coverage]
+    insurance: [insurance, insurance premium, policy premium, policy coverage]
+    renters_insurance: [property placed insurance, property-placed insurance, renters insurance, renter insurance, resident liability insurance]
+    processing_fee: [processing fee, convenience fee, service charge, transaction fee]
+    window_coverings: [blind, blinds, window blind, window blinds, shade, shades, drapery, curtain, curtains, window treatment, window treatments]
+    administrative_supplies: [stationery, office supply, office supplies, desk supplies, printer supplies]
+    education: [education, training, seminar, classroom, course]
+    software_license: [software, software license, platform license, saas, hosted software]
+    license_click_service: [click and lease, click lease, license and clicks, license clicks]
     utility: [electric usage, electric service, water usage, water service, sewer usage, sewer service, gas usage, gas service, utility consumption, trash service, waste service, trash collection, fuel recovery adjustment]
     general_maintenance: [maintenance, handyman, work order, minor repair]
 
 gl_overrides:
+  "6512": {gl_family: countertop, trade_families: [countertop], compatible_work_modes: [labor_service], specificity: specific}
+  "6570": {gl_family: tub_refinishing, trade_families: [tub_refinishing], compatible_work_modes: [labor_service], specificity: specific}
+  "6157": {gl_family: administrative_supplies, trade_families: [administrative_supplies, admin], compatible_work_modes: [material_purchase], specificity: specific}
+  "6171": {gl_family: renters_insurance, trade_families: [renters_insurance], compatible_work_modes: [recurring_service, renewal], specificity: specific}
+  "6173": {gl_family: fee, trade_families: [processing_fee, admin], compatible_work_modes: [one_time_fee], specificity: specific}
+  "6184": {gl_family: education, trade_families: [education, admin], compatible_work_modes: [material_purchase, one_time_fee], specificity: specific}
   "6118": {gl_family: subscription_membership, trade_families: [admin], compatible_work_modes: [renewal, recurring_service], specificity: specific}
+  "6136": {gl_family: software_license, trade_families: [software_license], compatible_work_modes: [renewal, recurring_service], specificity: specific}
   "6188": {gl_family: fee, trade_families: [admin], compatible_work_modes: [one_time_fee], specificity: specific}
   "6200": {gl_family: legal, trade_families: [legal], compatible_work_modes: [labor_service], specificity: broad}
   "6205": {gl_family: legal, trade_families: [legal], compatible_work_modes: [labor_service], specificity: specific}
@@ -61,8 +79,9 @@ gl_overrides:
   "6615": {gl_family: general_maintenance, trade_families: [general_maintenance], compatible_work_modes: [labor_service], specificity: broad}
   "6627": {gl_family: electrical, trade_families: [electrical], compatible_work_modes: [material_purchase], specificity: specific}
   "6654": {gl_family: hvac, trade_families: [hvac], compatible_work_modes: [material_purchase], specificity: specific}
-  "6669": {gl_family: general_maintenance, trade_families: [general_maintenance], compatible_work_modes: [material_purchase], specificity: broad}
+  "6669": {gl_family: materials, trade_families: [general_maintenance], compatible_work_modes: [material_purchase], specificity: broad}
   "6675": {gl_family: plumbing, trade_families: [plumbing], compatible_work_modes: [material_purchase], specificity: specific}
+  "6710": {gl_family: window_coverings, trade_families: [window_coverings], compatible_work_modes: [material_purchase], specificity: specific}
   "6730": {gl_family: cleaning, trade_families: [cleaning], compatible_work_modes: [material_purchase], specificity: specific}
   "6750": {gl_family: cleaning, trade_families: [cleaning], compatible_work_modes: [labor_service, recurring_service], specificity: specific}
   "6760": {gl_family: painting, trade_families: [painting], compatible_work_modes: [labor_service], specificity: specific}
@@ -75,5 +94,6 @@ gl_overrides:
   "6956": {gl_family: fee, trade_families: [utility, admin], compatible_work_modes: [one_time_fee], specificity: specific}
   "6995": {gl_family: utility, trade_families: [utility], compatible_work_modes: [recurring_service], specificity: specific}
   "7120": {gl_family: insurance, trade_families: [insurance], compatible_work_modes: [recurring_service, renewal], specificity: specific}
+  "7536": {gl_family: flooring, trade_families: [flooring], compatible_work_modes: [labor_service, material_purchase], specificity: specific}
   "7595": {gl_family: capital, trade_families: [general_maintenance, painting, flooring, cabinets, countertop], compatible_work_modes: [labor_service], specificity: broad, capital_context: capital}
   "8050": {gl_family: legal, trade_families: [legal], compatible_work_modes: [labor_service], specificity: specific}

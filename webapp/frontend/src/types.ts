@@ -24,7 +24,7 @@ export type UploadFileProgress = {
   size_bytes: number;
   extension: string;
   percent: number;
-  status: "queued" | "uploading" | "done" | "failed";
+  status: "queued" | "uploading" | "saving" | "done" | "failed";
   error?: string;
 };
 
@@ -115,7 +115,10 @@ export type PreviewRowMeta = {
   invoice_number?: string | null;
   invoice_index?: number;
   invoice_row_index?: number;
+  line_item_id?: string | null;
   row_index?: number;
+  readiness_snapshot_id?: string;
+  readiness_status?: "ready" | "needs_review" | "blocked";
   // Phase 2J — opaque ids of the extraction trace items (regions on
   // the source PDF) that fed this row. Drives the row ↔ overlay
   // highlight in the document viewer.
@@ -132,17 +135,82 @@ export type PreviewRowMeta = {
   ai_mapping_provenance?: Record<string, unknown>[];
   ai_detected_vendor?: string | null;
   ai_property_candidate?: string | null;
+  ai_raw_property_candidate?: string | null;
   ai_service_address?: string | null;
+  ai_sold_to_raw_text?: string | null;
+  ai_job_site_raw_text?: string | null;
   ai_source_gl_candidate?: string | null;
-  ai_generated_description?: boolean;
-  ai_tax_handling?: string | null;
-  ai_invoice_date_source?: string | null;
-  ai_zero_amount_lines_excluded?: number;
-  readiness_snapshot_id?: string;
-  readiness_status?: "ready" | "needs_review" | "blocked";
+  ai_gl_accounting_reasoning?: Record<string, unknown> | null;
   accounting_decision?: Record<string, unknown> | null;
   semantic_classification?: Record<string, unknown> | null;
   document_facts?: Record<string, unknown> | null;
+  ai_gl_accounting_confidence?: number | null;
+  ai_line_semantics?: Record<string, unknown> | null;
+  ai_line_activity?: string | null;
+  ai_line_location?: string | null;
+  ai_line_location_candidate?: string | null;
+  ai_generated_description?: boolean;
+  ai_item_plain_language_description?: string | null;
+  ai_tax_handling?: string | null;
+  ai_invoice_date_source?: string | null;
+  ai_service_date?: string | null;
+  ai_service_date_raw?: string | null;
+  ai_payment_terms?: string | null;
+  ai_due_date_text?: string | null;
+  ai_unresolved_visual_field_candidates?: Record<string, unknown>[];
+  ai_critical_header_verification?: Record<string, unknown>;
+  ai_date_provenance?: Record<string, unknown>[];
+  tenant_document_policy?: Record<string, unknown>;
+  ai_row_identity_evidence?: Record<string, unknown>;
+  row_identity_needs_confirmation?: boolean;
+  ai_handwritten_row_identities?: Record<string, unknown>[];
+  ai_row_identity_verification?: Record<string, unknown>;
+  ai_excluded_paid_rows?: Record<string, unknown>[];
+  ai_zero_amount_lines_excluded?: number;
+  line_type?: string | null;
+  line_classification?: string | null;
+  line_classification_reason?: string | null;
+  line_classification_keywords?: string[];
+  source_charge_components?: unknown[];
+  allocated_charge_components?: unknown[];
+  tax_total?: string | null;
+  tax_allocated?: string | null;
+  human_adjudication_badges?: Record<string, HumanAdjudicationBadge[]>;
+  human_adjudication_applied?: Record<string, {
+    revision_id: string;
+    revision_number: number;
+    reviewer_id: string;
+    created_at: string;
+    rationale: string;
+  }>;
+};
+
+export type HumanAdjudicationBadge =
+  | "manually_corrected"
+  | "benchmark_approved"
+  | "learning_approved"
+  | "governed_by_rule";
+
+export type HumanAdjudicationOptions = {
+  rationale: string;
+  add_to_benchmark: boolean;
+  approve_learning_example: boolean;
+  propose_reusable_rule: boolean;
+};
+
+export type HumanAdjudicationContext = {
+  contract_version: string;
+  reviewer_id: string;
+  role: "property_manager" | "accountant_ap" | "accounting_manager_controller" | "platform_admin";
+  tenant_id: string;
+  permissions: {
+    invoice_correction: boolean;
+    benchmark_submission: boolean;
+    learning_approval: boolean;
+    rule_proposal: boolean;
+    rule_approval: boolean;
+    shared_knowledge_promotion: boolean;
+  };
 };
 
 export type AiVendorCandidate = {
@@ -320,6 +388,413 @@ export type AccountingReadiness = {
   evaluated_at: string;
 };
 
+export type AccountingAssistantCorrection = {
+  row_index: number;
+  field: "GL Account" | "Property Abbreviation" | "Location" | "Invoice Description" | "Line Item Description";
+  new_value: string;
+  rationale: string;
+  evidence: string[];
+};
+
+export type AccountingRuleScope = {
+  document_family?: string | null;
+  line_family?: string | null;
+  trade_family?: string | null;
+  work_mode?: string | null;
+  description_terms: string[];
+  term_match: "any" | "all";
+};
+
+export type AccountingRuleConstraint = {
+  allowed_gl_codes: string[];
+  minimum_gl_code?: string | null;
+  maximum_gl_code?: string | null;
+};
+
+export type OperatorAccountingRule = {
+  contract_version: string;
+  rule_id: string;
+  title: string;
+  description: string;
+  scope: AccountingRuleScope;
+  constraint: AccountingRuleConstraint;
+  status: "draft" | "active" | "disabled" | "rejected";
+  created_at: string;
+  updated_at: string;
+  approved_by?: string | null;
+  approved_at?: string | null;
+  source_interaction_id?: string | null;
+  audit: {
+    event: string;
+    actor: string;
+    at: string;
+    details: Record<string, unknown>;
+  }[];
+};
+
+export type TenantVendorEntity = {
+  contract_version: string;
+  tenant_id: string;
+  conversation_mode: "lightweight" | "advisory" | "action";
+  action_extraction_status: "not_requested" | "succeeded" | "failed_safe";
+  vendor_entity_id: string;
+  canonical_name: string;
+  erp_vendor_id?: string | null;
+  aliases: string[];
+  created_at: string;
+  updated_at: string;
+  audit: { event: string; actor: string; at: string; details: Record<string, unknown> }[];
+};
+
+export type ResManDatasetKind =
+  | "vendors"
+  | "properties_units"
+  | "gl_accounts"
+  | "general_ledger"
+  | "invoice_history";
+
+export type ResManSnapshot = {
+  contract_version: string;
+  snapshot_id: string;
+  import_id: string;
+  tenant_id: string;
+  dataset: ResManDatasetKind;
+  original_filename: string;
+  sha256: string;
+  record_count: number;
+  created_at: string;
+  activated_at: string;
+  active: boolean;
+};
+
+export type ResManDatasetStatus = {
+  contract_version: string;
+  tenant_id: string;
+  dataset: ResManDatasetKind;
+  current_snapshot?: ResManSnapshot | null;
+  effective_record_count: number;
+  manual_overlay_count: number;
+  staged_import_count: number;
+};
+
+export type ResManImportPreview = {
+  contract_version: string;
+  import_id: string;
+  tenant_id: string;
+  dataset: ResManDatasetKind;
+  original_filename: string;
+  sha256: string;
+  size_bytes: number;
+  parsed_records: number;
+  added_records: number;
+  changed_records: number;
+  removed_records: number;
+  unchanged_records: number;
+  sample_records: Record<string, unknown>[];
+  issues: { code: string; severity: "error" | "warning" | "info"; message: string; source_row?: number | null }[];
+  excluded_sensitive_columns: string[];
+  status: "preview_ready" | "invalid";
+  created_at: string;
+};
+
+export type ResManContextRecord = Record<string, unknown> & {
+  _record: {
+    natural_key: string;
+    source_kind: "resman_import" | "manual_overlay";
+    source_snapshot_id?: string | null;
+    updated_at?: string;
+  };
+};
+
+export type ResManRecordPage = {
+  contract_version: string;
+  tenant_id: string;
+  dataset: ResManDatasetKind;
+  page: number;
+  page_size: number;
+  total: number;
+  items: ResManContextRecord[];
+};
+
+export type ContextFrequencyItem = {
+  key: string;
+  label: string;
+  count: number;
+  amount: string;
+  share: number;
+};
+
+export type DeterministicPatternField = {
+  path: string;
+  label: string;
+  values: string[];
+  editable: boolean;
+};
+
+export type DeterministicCoverage = {
+  contract_version: string;
+  vendor_key: string;
+  display_name: string;
+  aliases: string[];
+  status: "active" | "inactive" | "registered_unavailable";
+  implementation_kind: "hybrid" | "code_managed";
+  processor_module: string;
+  processor_entrypoint: string;
+  processor_available: boolean;
+  config_present: boolean;
+  config_name?: string | null;
+  editable: boolean;
+  pattern_count: number;
+  patterns: DeterministicPatternField[];
+  failure_code?: string | null;
+};
+
+export type DeterministicBuilderSample = {
+  sample_id: string;
+  original_filename: string;
+  source_type: string;
+  size_bytes: number;
+  page_count: number;
+  sha256: string;
+  text_available: boolean;
+  warnings: string[];
+  uploaded_at: string;
+};
+
+export type DeterministicBuilderMessage = {
+  message_id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at: string;
+  provider_profile_id?: string | null;
+  estimated_cost_usd: number;
+  proposed_paths: string[];
+};
+
+export type DeterministicBuilderPreview = {
+  status: "not_run" | "passed" | "failed";
+  revision: number;
+  columns: string[];
+  rows: Record<string, unknown>[];
+  row_count: number;
+  warnings: string[];
+  generated_at?: string | null;
+};
+
+export type DeterministicBuilderSession = {
+  contract_version: string;
+  session_id: string;
+  vendor_key: string;
+  vendor_name: string;
+  status: "draft" | "previewed" | "approved" | "rejected";
+  revision: number;
+  selected_column?: string | null;
+  samples: DeterministicBuilderSample[];
+  messages: DeterministicBuilderMessage[];
+  draft_patch: Record<string, unknown>;
+  draft_rationales: Record<string, string>;
+  validation_issues: { path?: string; message?: string }[];
+  preview: DeterministicBuilderPreview;
+  created_at: string;
+  updated_at: string;
+  audit: Record<string, unknown>[];
+};
+
+export type VendorContextProfile = {
+  vendor_key: string;
+  vendor_name: string;
+  vendor_abbreviation?: string | null;
+  active: boolean;
+  invoice_count: number;
+  allocation_count: number;
+  ledger_posting_count: number;
+  ledger_total_amount: string;
+  active_months: number;
+  history_span_months: number;
+  total_amount: string;
+  average_invoice_amount: string;
+  top_gl_share: number;
+  top_property_share: number;
+  gl_usage: ContextFrequencyItem[];
+  property_usage: ContextFrequencyItem[];
+  property_gl_usage: Record<string, ContextFrequencyItem[]>;
+  first_accounting_date?: string | null;
+  last_accounting_date?: string | null;
+  statistical_score: number;
+  recommended_mode: "deterministic_candidate" | "review_candidate" | "variable" | "insufficient_history";
+  recommendation_reasons: string[];
+  governance_status: "unreviewed" | "approved_candidate" | "excluded" | "needs_review";
+  reviewer_notes?: string | null;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
+  deterministic_coverage?: DeterministicCoverage | null;
+};
+
+export type PropertyContextProfile = {
+  property_key: string;
+  property_name: string;
+  property_code?: string | null;
+  invoice_count: number;
+  allocation_count: number;
+  ledger_posting_count: number;
+  total_amount: string;
+  gl_usage: ContextFrequencyItem[];
+  vendor_usage: ContextFrequencyItem[];
+};
+
+export type ContextIntelligenceSnapshotSummary = {
+  contract_version: string;
+  analytics_version: string;
+  snapshot_id: string;
+  tenant_id: string;
+  generated_at: string;
+  generated_by: string;
+  source_hashes: Record<string, string>;
+  vendor_count: number;
+  property_count: number;
+  invoice_count: number;
+  allocation_count: number;
+  gl_account_count: number;
+  ledger_record_count: number;
+  deterministic_candidate_count: number;
+  review_candidate_count: number;
+};
+
+export type ContextIntelligenceStatus = {
+  contract_version: string;
+  tenant_id: string;
+  state: "not_generated" | "ready" | "stale";
+  required_datasets: ResManDatasetKind[];
+  missing_datasets: ResManDatasetKind[];
+  current_source_hashes: Record<string, string>;
+  snapshot?: ContextIntelligenceSnapshotSummary | null;
+};
+
+export type ContextMatrixPage = {
+  contract_version: string;
+  snapshot_id: string;
+  tenant_id: string;
+  page: number;
+  page_size: number;
+  total: number;
+  items: (VendorContextProfile | PropertyContextProfile)[];
+};
+
+export type TenantPolicyScope = {
+  vendor_entity_id?: string | null;
+  property_ids: string[];
+  document_family?: string | null;
+  line_family?: string | null;
+  trade_family?: string | null;
+  work_mode?: string | null;
+  description_terms: string[];
+  term_match: "any" | "all";
+};
+
+export type TenantPolicyAction = {
+  allowed_gl_codes: string[];
+  expected_amount?: string | number | null;
+  amount_tolerance: string | number;
+  amount_mismatch_behavior: "review" | "warning";
+};
+
+export type TenantPolicySimulationReport = {
+  contract_version: string;
+  simulation_id: string;
+  tenant_id: string;
+  policy_id: string;
+  policy_version: number;
+  snapshot_id: string;
+  evaluated_lines: number;
+  matched_lines: number;
+  would_constrain_lines: number;
+  unchanged_lines: number;
+  amount_mismatches: number;
+  blocking_conflicts: number;
+  missing_vendor_identity: number;
+  examples: Record<string, unknown>[];
+  simulated_at: string;
+  simulated_by: string;
+};
+
+export type TenantAccountingPolicy = {
+  contract_version: string;
+  tenant_id: string;
+  policy_id: string;
+  version: number;
+  title: string;
+  description: string;
+  policy_type: "semantic_gl" | "vendor_service_gl";
+  scope: TenantPolicyScope;
+  action: TenantPolicyAction;
+  status: "draft" | "simulated" | "active" | "disabled" | "rejected" | "superseded";
+  created_at: string;
+  updated_at: string;
+  approved_by?: string | null;
+  approved_at?: string | null;
+  source_interaction_id?: string | null;
+  latest_simulation?: TenantPolicySimulationReport | null;
+  audit: { event: string; actor: string; at: string; details: Record<string, unknown> }[];
+};
+
+export type AccountingAssistantChatResult = {
+  contract_version: string;
+  interaction_id: string;
+  batch_id: string;
+  invoice_group_id: string;
+  tenant_id: string;
+  assistant_message: string;
+  corrections: AccountingAssistantCorrection[];
+  proposed_rule?: OperatorAccountingRule | null;
+  proposed_tenant_policy?: TenantAccountingPolicy | null;
+  requires_correction_confirmation: boolean;
+  requires_rule_confirmation: boolean;
+  requires_tenant_policy_simulation: boolean;
+  accounting_readiness_changed: false;
+  export_authorized: false;
+  provider_profile_id: string;
+  estimated_cost_usd: number;
+  created_at: string;
+  correction_status: "not_applicable" | "pending" | "applied" | "rejected";
+  corrections_decided_at?: string | null;
+  corrections_decided_by?: string | null;
+};
+
+export type AccountingAssistantInteraction = {
+  user_message: string;
+  result: AccountingAssistantChatResult;
+};
+
+export type ApprovedInvoiceCorrection = {
+  contract_version: string;
+  correction_id: string;
+  interaction_id: string;
+  batch_id: string;
+  invoice_group_id: string;
+  local_row_index: number;
+  line_fingerprint: string;
+  field: AccountingAssistantCorrection["field"];
+  new_value: string;
+  rationale: string;
+  evidence: string[];
+  approved_by: string;
+  approved_at: string;
+  status: "active" | "revoked";
+};
+
+export type OperatorActivityEvent = {
+  contract_version: string;
+  event_id: string;
+  batch_id: string;
+  invoice_group_id?: string | null;
+  event_type: string;
+  source: "manual" | "ai" | "rule" | "system";
+  actor: string;
+  summary: string;
+  details: Record<string, unknown>;
+  created_at: string;
+};
+
 export type PreviewResponse = {
   batch_id: string;
   summary: ProcessResult["summary"];
@@ -441,6 +916,77 @@ export type AiFallbackPolicy =
   | "only_low_confidence"
   | "only_manual_review"
   | "always_assist";
+
+// Cost authorization for document processing.  This is distinct from
+// DocumentMode (physical input format) and from AccountingReadiness.
+export type ProcessingRouteMode =
+  | "auto_cost_safe"
+  | "deterministic_only"
+  | "ai_fallback_allowed";
+
+export type EffectiveProcessingRoute = "deterministic" | "ai" | "blocked";
+
+export type ProcessingRouteResolution = {
+  contract_version: string;
+  batch_id: string;
+  filename?: string | null;
+  page?: number | null;
+  requested_mode: ProcessingRouteMode;
+  inherited_from: "page" | "document" | "batch" | "default";
+  configured_by?: string | null;
+  configured_at?: string | null;
+};
+
+export type ProcessingRouteDecision = {
+  contract_version: string;
+  policy_contract_version: string;
+  batch_id: string;
+  filename?: string | null;
+  page?: number | null;
+  requested_mode: ProcessingRouteMode;
+  inherited_from: "page" | "document" | "batch" | "default";
+  effective_route: EffectiveProcessingRoute;
+  deterministic_available: boolean;
+  vendor_key?: string | null;
+  processor_id?: string | null;
+  ai_fallback_authorized: boolean;
+  reason_code: string;
+};
+
+export type ProcessingRouteDocument = {
+  filename: string;
+  detection: {
+    vendor_key?: string | null;
+    confidence?: number | null;
+    reason?: string | null;
+  };
+  decision: ProcessingRouteDecision;
+};
+
+export type ProcessingRoutePage = {
+  filename: string;
+  page: number;
+  decision: ProcessingRouteDecision;
+};
+
+export type ProcessingRouteSnapshot = {
+  contract_version: string;
+  policy_version: string;
+  batch: { resolution: ProcessingRouteResolution };
+  documents: ProcessingRouteDocument[];
+  pages: ProcessingRoutePage[];
+  audit: Array<Record<string, unknown>>;
+};
+
+export type ProcessingRouteUpdate = {
+  scope: "batch" | "document" | "page";
+  mode: ProcessingRouteMode | null;
+  filename?: string;
+  page?: number;
+  actor?: string;
+  reset_exceptions?: boolean;
+  expected_policy_version?: string;
+};
 
 export const DOCUMENT_MODES: DocumentMode[] = [
   "auto_detect",
@@ -768,6 +1314,11 @@ export type ExportResponse = {
   export_used_edited_rows?: boolean;
   edited_rows_count?: number;
   rows_written?: number;
+  document_url_warnings?: string[];
+  document_url_updates?: {
+    by_source_file?: Record<string, string>;
+    by_invoice_number?: Record<string, string>;
+  };
   accounting_readiness?: AccountingReadiness;
 };
 
@@ -785,7 +1336,11 @@ export type BillingV2AuditResponse = {
   count: number;
   available_count: number;
   processors: BillingV2ProcessorAuditEntry[];
-  ai_fallback_module: { module: string; available: boolean; error?: string };
+  ai_fallback_module: {
+    module: string;
+    available: boolean;
+    error?: string;
+  };
 };
 
 export type BillingV2PrepareLinksResponse = {
@@ -797,6 +1352,11 @@ export type BillingV2PrepareLinksResponse = {
   rows_total: number;
   rows_with_links: number;
   rows_missing_links: number;
-  links: { local_webapp: number; dropbox: number; external: number; missing: number };
+  links: {
+    local_webapp: number;
+    dropbox: number;
+    external: number;
+    missing: number;
+  };
   audit_dir?: string;
 };

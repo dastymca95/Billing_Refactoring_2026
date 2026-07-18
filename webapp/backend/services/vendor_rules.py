@@ -36,6 +36,7 @@ from typing import Any, Iterable
 import yaml
 
 from ..settings import PROJECT_ROOT
+from . import deterministic_coverage
 
 
 VENDORS_DIR = PROJECT_ROOT / "config" / "vendors"
@@ -45,24 +46,6 @@ BACKUPS_DIR = VENDORS_DIR / "backups"
 # ----------------------------------------------------------------------------
 # Vendor whitelist + display metadata
 # ----------------------------------------------------------------------------
-
-# Phase 1Z exposes Hopkinsville first (priority); Richmond available too.
-# Both have YAML at config/vendors/<key>.yaml. To enable a third vendor, add
-# its YAML key here AND make sure its YAML follows the same shape (see
-# `editable_groups`). Do not add a vendor that doesn't have a YAML on disk.
-_EDITABLE_VENDORS: list[dict[str, str]] = [
-    {
-        "vendor_key": "hopkinsville_water_environment_authority",
-        "display_name": "Hopkinsville Water Environment Authority",
-        "category": "Water - Sewer",
-    },
-    {
-        "vendor_key": "richmond_utilities",
-        "display_name": "Richmond Utilities",
-        "category": "Water - Sewer",
-    },
-]
-
 
 # ----------------------------------------------------------------------------
 # Editable section whitelist
@@ -127,16 +110,25 @@ _VENDOR_KEY_RE = re.compile(r"^[a-z0-9_]+$")
 def _check_vendor_key(vendor_key: str) -> str:
     if not vendor_key or not _VENDOR_KEY_RE.match(vendor_key):
         raise VendorRulesError("Invalid vendor key.")
-    if vendor_key not in {v["vendor_key"] for v in _EDITABLE_VENDORS}:
+    coverage = deterministic_coverage.coverage_for_key(vendor_key)
+    if coverage is None:
         raise VendorRulesError(
-            f"Vendor '{vendor_key}' is not editable in this build."
+            f"Vendor '{vendor_key}' has no registered deterministic processor."
+        )
+    if not coverage.config_present:
+        raise VendorRulesError(
+            f"Vendor '{vendor_key}' is code-managed and has no editable declarative configuration."
         )
     return vendor_key
 
 
 def _vendor_yaml_path(vendor_key: str) -> Path:
     """Resolve and traversal-check the YAML path."""
-    candidate = (VENDORS_DIR / f"{vendor_key}.yaml").resolve()
+    coverage = deterministic_coverage.coverage_for_key(vendor_key)
+    configured = deterministic_coverage.config_path_for_key(
+        vendor_key, coverage.processor_module if coverage else "",
+    )
+    candidate = configured.resolve() if configured else (VENDORS_DIR / f"{vendor_key}.yaml").resolve()
     base = VENDORS_DIR.resolve()
     try:
         candidate.relative_to(base)
@@ -155,32 +147,38 @@ def _vendor_yaml_path(vendor_key: str) -> Path:
 def list_editable_vendors() -> list[dict[str, Any]]:
     """Return UI-shaped list of vendors the studio can edit."""
     out: list[dict[str, Any]] = []
-    for v in _EDITABLE_VENDORS:
-        path = VENDORS_DIR / f"{v['vendor_key']}.yaml"
-        status = "active"
+    for coverage in deterministic_coverage.inventory():
+        if not coverage.config_present:
+            continue
+        path = deterministic_coverage.config_path_for_key(
+            coverage.vendor_key, coverage.processor_module,
+        )
+        status = coverage.status
         last_updated: str | None = None
-        if path.is_file():
+        category = "Deterministic processor"
+        if path and path.is_file():
             try:
                 rules = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
             except yaml.YAMLError:
                 rules = {}
                 status = "yaml_error"
             identity = (rules or {}).get("vendor_identity") or {}
+            category = str(identity.get("category") or category)
             if not identity.get("active", True):
                 status = "inactive"
             mtime = _dt.datetime.fromtimestamp(
                 path.stat().st_mtime, tz=_dt.timezone.utc
             )
             last_updated = mtime.isoformat()
-        else:
-            status = "missing"
         out.append(
             {
-                "vendor_key": v["vendor_key"],
-                "display_name": v["display_name"],
-                "category": v["category"],
+                "vendor_key": coverage.vendor_key,
+                "display_name": coverage.display_name,
+                "category": category,
                 "status": status,
                 "last_updated": last_updated,
+                "editable": coverage.editable,
+                "implementation_kind": coverage.implementation_kind,
             }
         )
     return out
@@ -228,7 +226,7 @@ def _field(
         "label": label,
         "path": path,
         "type": type_,
-        "editable": any(path.startswith(p) for p in EDITABLE_PREFIXES),
+        "editable": _is_editable_path(path),
     }
     if description:
         f["description"] = description
@@ -251,6 +249,24 @@ def editable_groups(vendor_key: str) -> list[dict[str, Any]]:
     rules = load_vendor_rules(vendor_key)
 
     groups: list[dict[str, Any]] = []
+
+    coverage = deterministic_coverage.coverage_for_key(vendor_key)
+    pattern_fields = [
+        _field(
+            item.label,
+            item.path,
+            "string_list",
+            description="Declarative matching evidence. Changes are validated, backed up and auditable.",
+        )
+        for item in (coverage.patterns if coverage else [])
+        if item.path not in {"vendor_identity.aliases", "vendor_identity.detection_keywords"}
+    ]
+    groups.append({
+        "key": "deterministic_patterns",
+        "label": "Deterministic matching patterns",
+        "description": "Safe declarative patterns used by this registered processor. Python logic remains read-only.",
+        "fields": pattern_fields,
+    })
 
     # 1. Vendor Identity ------------------------------------------------------
     groups.append(
@@ -545,7 +561,10 @@ def _summarize_section(value: Any) -> dict[str, Any]:
 
 
 def _is_editable_path(dotted: str) -> bool:
-    return any(dotted == p or dotted.startswith(p + ".") for p in EDITABLE_PREFIXES)
+    if any(dotted == p or dotted.startswith(p + ".") for p in EDITABLE_PREFIXES):
+        return True
+    leaf = dotted.rsplit(".", 1)[-1].casefold()
+    return any(token in leaf for token in ("pattern", "keyword", "alias", "contains"))
 
 
 def _set_dotted(data: dict, dotted: str, value: Any) -> None:
@@ -567,6 +586,7 @@ _FILE_TYPE_RE = re.compile(r"^[a-z0-9]{1,8}$")
 def validate_patch(vendor_key: str, patch: dict[str, Any]) -> list[dict[str, Any]]:
     """Return a list of validation issues. Empty list = OK."""
     _check_vendor_key(vendor_key)
+    rules = load_vendor_rules(vendor_key)
     issues: list[dict[str, Any]] = []
 
     if not isinstance(patch, dict) or not patch:
@@ -581,6 +601,15 @@ def validate_patch(vendor_key: str, patch: dict[str, Any]) -> list[dict[str, Any
                 }
             )
             continue
+
+        if not any(dotted == p or dotted.startswith(p + ".") for p in EDITABLE_PREFIXES):
+            current = _get_dotted(rules, dotted, default=None)
+            if not isinstance(current, list) or not all(isinstance(item, str) for item in current):
+                issues.append({
+                    "path": dotted,
+                    "message": "Only existing declarative string-list patterns may be edited.",
+                })
+                continue
 
         # Per-field type/value validation.
         try:
@@ -616,6 +645,14 @@ def _validate_value(dotted: str, value: Any) -> None:
     if dotted in ("vendor_identity.aliases", "vendor_identity.detection_keywords"):
         if not isinstance(value, list) or not all(isinstance(s, str) for s in value):
             raise VendorRulesError("Must be a list of strings.")
+        return
+
+    leaf = dotted.rsplit(".", 1)[-1].casefold()
+    if any(token in leaf for token in ("pattern", "keyword", "alias", "contains")):
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise VendorRulesError("Pattern values must be a list of strings.")
+        if any(len(item) > 1000 for item in value) or len(value) > 500:
+            raise VendorRulesError("Pattern list exceeds the safe size limit.")
         return
 
     # File types
@@ -765,6 +802,8 @@ def apply_patch(vendor_key: str, patch: dict[str, Any]) -> dict[str, Any]:
             except OSError:
                 pass
 
+    deterministic_coverage.invalidate_inventory_cache()
+
     return {
         "vendor_key": vendor_key,
         "written_paths": sorted(flat.keys()),
@@ -795,4 +834,5 @@ def restore_latest_backup(vendor_key: str) -> dict[str, Any]:
         raise VendorRulesError("No backups available for this vendor.")
     latest = candidates[0]
     yaml_path.write_bytes(latest.read_bytes())
+    deterministic_coverage.invalidate_inventory_cache()
     return {"vendor_key": vendor_key, "restored_from": latest.name}

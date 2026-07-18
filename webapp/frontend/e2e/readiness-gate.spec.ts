@@ -30,11 +30,23 @@ const blocked = (): Readiness => ({
   ...ready("missing-gl"),
   status: "blocked",
   export_allowed: false,
-  blockers: [{ code: "gl_invalid", field: "GL Account" }],
+  blockers: [{
+    code: "gl_invalid", severity: "blocking", scope: "line_item",
+    invoice_id: "UI-1", line_item_id: "0", field: "GL Account",
+    message: "GL Account must be a valid chart account.", source: "accounting_readiness",
+    evidence: [{ row_index: 0, field: "GL Account" }], resolution_required: true,
+    resolved: false,
+  }],
   validated_fields: { "GL Account": false, "Property Abbreviation": true, Amount: true },
 });
 
-async function mockBilling(page: Page, initial: Readiness, gl: string, onReadiness?: () => void) {
+async function mockBilling(
+  page: Page,
+  initial: Readiness,
+  gl: string,
+  onReadiness?: () => void,
+  onRouteUpdate?: (body: Record<string, unknown>) => void,
+) {
   const columns = ["Invoice Number", "Vendor", "Property Abbreviation", "GL Account", "Amount"];
   const row = {
     "Invoice Number": "UI-1",
@@ -76,6 +88,49 @@ async function mockBilling(page: Page, initial: Readiness, gl: string, onReadine
     else if (path.endsWith("/preview")) body = preview;
     else if (path.endsWith("/manual-review")) body = { batch_id: "readiness-ui", items: [] };
     else if (path.endsWith("/revisions")) body = { batch_id: "readiness-ui", current_revision_id: null, revisions: [] };
+    else if (path.endsWith("/processing-routes")) {
+      const update = route.request().method() === "PATCH"
+        ? route.request().postDataJSON() as Record<string, unknown>
+        : null;
+      if (update) onRouteUpdate?.(update);
+      const requestedMode = String(update?.mode || "auto_cost_safe");
+      const inheritedFrom = update?.scope === "document" ? "document" : update?.scope === "batch" ? "batch" : "default";
+      const aiAllowed = requestedMode === "ai_fallback_allowed";
+      body = {
+        contract_version: "processing-route-api/1.0",
+        policy_version: update ? "prp_sha256_updated" : "prp_sha256_initial",
+        batch: {
+          resolution: {
+            contract_version: "processing-route-policy/1.0",
+            batch_id: "readiness-ui",
+            requested_mode: update?.scope === "batch" ? requestedMode : "auto_cost_safe",
+            inherited_from: update?.scope === "batch" ? "batch" : "default",
+          },
+        },
+        documents: [{
+          filename: "invoice.pdf",
+          detection: { vendor_key: "fixture_vendor", confidence: 0.99, reason: "registered identity" },
+          decision: {
+            contract_version: "processing-route-decision/1.0",
+            policy_contract_version: "processing-route-policy/1.0",
+            batch_id: "readiness-ui",
+            filename: "invoice.pdf",
+            requested_mode: requestedMode,
+            inherited_from: inheritedFrom,
+            effective_route: "deterministic",
+            deterministic_available: true,
+            vendor_key: "fixture_vendor",
+            processor_id: "fixture_vendor.process",
+            ai_fallback_authorized: aiAllowed,
+            reason_code: aiAllowed
+              ? "deterministic_first_ai_fallback_authorized"
+              : "cost_safe_deterministic_default",
+          },
+        }],
+        pages: [],
+        audit: [],
+      };
+    }
     else if (path.endsWith("/readiness")) {
       const requestBody = route.request().postDataJSON() as { rows?: Record<string, unknown>[] } | null;
       const editedGl = String(requestBody?.rows?.[0]?.["GL Account"] ?? "").trim();
@@ -90,17 +145,16 @@ async function mockBilling(page: Page, initial: Readiness, gl: string, onReadine
 test("valid batch and OCR-only warning keep Export enabled", async ({ page }) => {
   await mockBilling(page, ready("ocr-warning", "needs_review"), "6100");
   await page.goto("/");
-  await page.getByTestId("explorer-batch-row").click();
-  await expect(page.getByTestId("panel-template")).toBeVisible();
-  await expect(page.getByTestId("template-export-button")).toBeEnabled();
+  await expect(page.getByRole("main", { name: "ResMan template grid" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Export", exact: true })).toBeEnabled();
 });
 
 test("missing GL disables Export and editing GL refreshes backend readiness", async ({ page }) => {
   let readinessCalls = 0;
   await mockBilling(page, blocked(), "", () => { readinessCalls += 1; });
   await page.goto("/");
-  await page.getByTestId("explorer-batch-row").click();
-  const exportButton = page.getByTestId("template-export-button");
+  await expect(page.getByRole("main", { name: "ResMan template grid" })).toBeVisible();
+  const exportButton = page.getByRole("button", { name: "Export", exact: true });
   await expect(exportButton).toBeDisabled();
 
   const row = page.getByTestId("template-row");
@@ -108,10 +162,46 @@ test("missing GL disables Export and editing GL refreshes backend readiness", as
   const glHeader = headers.filter({ hasText: "GL Account" });
   const headerIndex = await glHeader.evaluate((node) => Array.from(node.parentElement!.children).indexOf(node));
   const glCell = row.locator("td").nth(headerIndex);
+  const explanation = glCell.getByRole("button", { name: "Explain missing GL Account" });
+  await expect(explanation).toBeVisible();
+  await explanation.hover();
+  const tooltip = page.getByRole("tooltip");
+  await expect(tooltip.getByText("Required field missing", { exact: true })).toBeVisible();
+  await expect(tooltip.getByText("GL Account must be a valid chart account.")).toBeVisible();
   await glCell.dblclick();
   await glCell.locator("input").fill("6100");
   await glCell.locator("input").press("Enter");
 
   await expect.poll(() => readinessCalls).toBeGreaterThan(0);
   await expect(exportButton).toBeEnabled();
+});
+
+test("routing control persists document and bulk AI authorization in backend", async ({ page }) => {
+  const updates: Record<string, unknown>[] = [];
+  await mockBilling(page, ready("routing"), "6100", undefined, (body) => updates.push(body));
+  page.on("dialog", (dialog) => void dialog.accept());
+  await page.goto("/");
+
+  const control = page.getByTestId("processing-route-control");
+  await expect(control.locator("summary")).toContainText("Deterministic locked");
+  await control.locator("summary").click();
+  await control.locator(".processing-route-options button", { hasText: "Allow AI fallback" }).click();
+  await expect.poll(() => updates.length).toBe(1);
+  expect(updates[0]).toMatchObject({
+    scope: "document",
+    filename: "invoice.pdf",
+    mode: "ai_fallback_allowed",
+    actor: "local_operator",
+  });
+
+  await control.locator("summary").click();
+  await control.locator("summary").click();
+  await control.locator(".processing-route-bulk-actions button", { hasText: "Deterministic only" }).click();
+  await expect.poll(() => updates.length).toBe(2);
+  expect(updates[1]).toMatchObject({
+    scope: "batch",
+    mode: "deterministic_only",
+    reset_exceptions: true,
+    actor: "local_operator",
+  });
 });

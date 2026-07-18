@@ -52,7 +52,10 @@ from __future__ import annotations
 import logging
 import os
 import base64
+import http.client
 import json
+import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -343,9 +346,21 @@ class DropboxUploader:
                                 error_kind="api",
                                 error_message=f"API error creating share link: {type(e).__name__}")
         except Exception as e:
+            detail = type(e).__name__
+            self.logger.warning(
+                "Dropbox SDK share-link lookup failed with %s; retrying with system HTTP fallback.",
+                detail,
+            )
+            fallback = self._upload_with_stdlib(
+                local_path=local_path,
+                dropbox_path=dropbox_path,
+                overwrite=overwrite,
+            )
+            if fallback.success:
+                return fallback
             return UploadResult(success=False, dropbox_path=dropbox_path,
-                                error_kind="io",
-                                error_message=f"Unexpected share-link error: {type(e).__name__}")
+                                error_kind=fallback.error_kind or "io",
+                                error_message=fallback.error_message or f"Unexpected share-link error: {detail}")
 
         # Legacy share links of the form ".../<file>?dl=0" get rewritten
         # to "?dl=1" (direct download) — the original convention. The
@@ -378,6 +393,7 @@ class DropboxUploader:
                 "Authorization": f"Bearer {token}",
                 "Dropbox-API-Arg": json.dumps(arg),
                 "Content-Type": "application/octet-stream",
+                "User-Agent": _DROPBOX_HTTP_USER_AGENT,
             }
             _stdlib_request(
                 "https://content.dropboxapi.com/2/files/upload",
@@ -446,6 +462,8 @@ class DropboxUploader:
         headers = {
             "Authorization": "Basic " + base64.b64encode(credentials).decode("ascii"),
             "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": _DROPBOX_HTTP_USER_AGENT,
         }
         data = urllib.parse.urlencode({
             "grant_type": "refresh_token",
@@ -467,10 +485,64 @@ def _looks_like_ssl_error(exc: Exception) -> bool:
     return "ssl" in text or "certificate_verify_failed" in text or "certificateverifyfailed" in text
 
 
-def _stdlib_request(url: str, *, headers: dict[str, str], data: bytes, timeout: int = 100) -> bytes:
-    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+_RETRYABLE_NETWORK_ERRORS = (
+    http.client.RemoteDisconnected,
+    ConnectionResetError,
+    TimeoutError,
+    socket.timeout,
+)
+
+_DROPBOX_HTTP_USER_AGENT = "BillingRefactoring2026/1.0"
+
+
+def _is_retryable_url_error(exc: urllib.error.URLError) -> bool:
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, _RETRYABLE_NETWORK_ERRORS):
+        return True
+    text = f"{type(reason).__name__}: {reason}".lower()
+    return (
+        "remotedisconnected" in text
+        or "connection reset" in text
+        or "timed out" in text
+        or "temporarily unavailable" in text
+    )
+
+
+def _stdlib_request(
+    url: str,
+    *,
+    headers: dict[str, str],
+    data: bytes,
+    timeout: int = 100,
+    attempts: int = 3,
+) -> bytes:
+    last_error: Exception | None = None
+    request_headers = {
+        "User-Agent": _DROPBOX_HTTP_USER_AGENT,
+        "Accept": "*/*",
+        "Connection": "close",
+        **headers,
+    }
+    for attempt in range(max(1, attempts)):
+        request = urllib.request.Request(url, data=data, headers=request_headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as exc:
+            if not _is_retryable_url_error(exc):
+                raise
+            last_error = exc
+        except _RETRYABLE_NETWORK_ERRORS as exc:
+            last_error = exc
+
+        if attempt < attempts - 1:
+            time.sleep(min(0.35 * (2 ** attempt), 2.0))
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Dropbox request failed without an error detail.")
 
 
 def _stdlib_request_json(url: str, *, token: str, payload: dict, timeout: int = 100) -> dict:
@@ -480,6 +552,8 @@ def _stdlib_request_json(url: str, *, token: str, payload: dict, timeout: int = 
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": _DROPBOX_HTTP_USER_AGENT,
         },
         data=data,
         timeout=timeout,

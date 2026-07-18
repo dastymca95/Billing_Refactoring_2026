@@ -12,17 +12,32 @@ ACRONYMS = {
     "CDE",
     "CPWS",
     "EPB",
+    "FACTA",
     "GL",
     "HWEA",
+    "HVAC",
     "ID",
     "KUB",
+    "LED",
     "OCR",
+    "OC",
     "PDF",
     "PO",
+    "PVC",
+    "MV",
     "RECC",
+    "SAE",
     "TK",
     "TVA",
     "URL",
+    "GFCI",
+}
+
+BRAND_WORDS = {
+    "kwh": "kWh",
+    "neverkink": "NeverKink",
+    "resman": "ResMan",
+    "smartkey": "SmartKey",
 }
 
 TITLE_WORDS = {
@@ -66,6 +81,10 @@ SMALL_WORDS = {"and", "or", "of", "the", "to", "for", "by", "in", "on", "at"}
 
 _WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+[A-Za-z]*|\S")
 _STATE_ZIP_RE = re.compile(r"\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b", re.I)
+_NON_CITY_SERVICE_SUFFIX_RE = re.compile(
+    r"\b(?:Apt\s+[A-Z0-9-]+|Unit\s+[A-Z0-9-]+|Other\s+Sign|Office|Bldg\s+Office|Building\s+Office|Clubhs|Clubhouse|Hsmtr(?:\s+Bldg\s+\d+)?|House\s+Meter(?:\s+Bldg)?\s*\d*)$",
+    re.I,
+)
 
 
 def compact_spaces(value: Any) -> str:
@@ -89,6 +108,12 @@ def proper_case_preserve_acronyms(value: Any) -> str:
     rendered = re.sub(r"\s+([,.;:])", r"\1", rendered)
     rendered = re.sub(r",(?=\S)", ", ", rendered)
     rendered = re.sub(r"([(])\s+", r"\1", rendered)
+    rendered = re.sub(
+        r"(^|\s-\s|:\s)(the|and|or|of|to|for|by|in|on|at)\b",
+        lambda m: f"{m.group(1)}{m.group(2).capitalize()}",
+        rendered,
+        flags=re.I,
+    )
     return rendered.strip()
 
 
@@ -114,7 +139,7 @@ def normalize_service_address_for_description(value: Any) -> str:
         text,
         flags=re.I,
     )
-    if match:
+    if match and not _NON_CITY_SERVICE_SUFFIX_RE.search(match.group("city")):
         text = match.group("street")
     return proper_case_preserve_acronyms(text)
 
@@ -155,6 +180,10 @@ def _proper_token(token: str) -> str:
         return token
     if "-" in core:
         return prefix + "-".join(_proper_word(part, lower_small_words=False) for part in core.split("-")) + suffix
+    if "/" in core:
+        return prefix + "/".join(_proper_word(part, lower_small_words=False) for part in core.split("/")) + suffix
+    if "_" in core:
+        return prefix + "_".join(_proper_word(part, lower_small_words=False) for part in core.split("_")) + suffix
     return prefix + _proper_word(core) + suffix
 
 
@@ -165,6 +194,8 @@ def _proper_word(word: str, *, lower_small_words: bool = True) -> str:
     lower = word.lower()
     if upper in ACRONYMS:
         return upper
+    if lower in BRAND_WORDS:
+        return BRAND_WORDS[lower]
     if lower in TITLE_WORDS:
         return TITLE_WORDS[lower]
     if lower_small_words and lower in SMALL_WORDS:
@@ -189,6 +220,7 @@ def _proper_alphanumeric(token: str) -> str:
 
 __all__ = [
     "ACRONYMS",
+    "BRAND_WORDS",
     "compact_spaces",
     "looks_like_city_state_zip",
     "normalize_service_address_for_description",

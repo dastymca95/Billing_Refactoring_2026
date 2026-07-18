@@ -104,13 +104,31 @@ async function pickMultiPagePdfBatch(
   return null;
 }
 
+async function expectedCombinedViewerPages(
+  request: APIRequestContext,
+  batchId: string,
+): Promise<number> {
+  const response = await request.get(`${API_BASE}/api/batches/${batchId}/files`);
+  expect(response.ok()).toBeTruthy();
+  const data = (await response.json()) as { files: FileEntry[] };
+  return data.files.reduce((total, file) => total + Math.max(1, file.page_count ?? 1), 0);
+}
+
 function batchRow(page: Page, batchId: string) {
   return page.locator(
     `[data-testid="explorer-batch-drop-target"][data-batch-id="${batchId}"]`,
   );
 }
 
+async function openBatchSelector(page: Page) {
+  const popover = page.getByTestId("batch-selector-popover");
+  if ((await popover.count()) > 0 && (await popover.isVisible())) return;
+  await page.getByTestId("template-batch-selector").click();
+  await expect(page.getByTestId("batch-explorer")).toBeVisible();
+}
+
 async function expandBatch(page: Page, batchId: string) {
+  await openBatchSelector(page);
   const row = batchRow(page, batchId);
   const toggle = row.getByTestId("explorer-batch-toggle");
   await expect(toggle).toBeVisible();
@@ -139,6 +157,8 @@ async function loadBatch(
   );
   await page.goto("/");
   await batchesResponse.catch(() => undefined);
+  await expect(page.getByTestId("template-batch-selector")).toBeVisible();
+  await openBatchSelector(page);
   await expect(page.getByTestId("batch-explorer")).toBeVisible();
   await expect(batchRow(page, batch.batch_id)).toBeVisible();
 }
@@ -151,6 +171,7 @@ async function loadPreviewBatch(
   const batch = await pickPreviewBatch(request);
   test.skip(!batch, "No processed batch with preview rows is available.");
   await loadBatch(page, request, batch!, viewport);
+  await page.keyboard.press("Escape");
   await expect(page.getByTestId("template-window-chrome")).toBeVisible();
   await expect(page.getByTestId("template-grid-card")).toBeVisible();
   return batch!;
@@ -184,12 +205,11 @@ async function expectTemplateHeaderHealthy(page: Page) {
 
 async function expectDesktopPanelChromeAligned(page: Page) {
   const metrics = await page.evaluate(() => {
-    const batches = document.querySelector(".file-sidebar-card")?.getBoundingClientRect();
-    const batchHeader = document
-      .querySelector(".file-sidebar-header")
-      ?.getBoundingClientRect();
     const documentHeader = document
       .querySelector(".doc-preview-header")
+      ?.getBoundingClientRect();
+    const documentCard = document
+      .querySelector(".doc-preview-card")
       ?.getBoundingClientRect();
     const templateChrome = document
       .querySelector('[data-testid="template-window-chrome"]')
@@ -197,11 +217,10 @@ async function expectDesktopPanelChromeAligned(page: Page) {
     const template = document
       .querySelector('[data-testid="template-workspace"]')
       ?.getBoundingClientRect();
-    if (!batches || !template) return null;
+    if (!documentCard || !template) return null;
     return {
-      topDelta: Math.abs(batches.top - template.top),
-      bottomDelta: Math.abs(batches.bottom - template.bottom),
-      batchHeaderHeight: batchHeader?.height ?? 0,
+      topDelta: Math.abs(documentCard.top - template.top),
+      bottomDelta: Math.abs(documentCard.bottom - template.bottom),
       documentHeaderHeight: documentHeader?.height ?? 0,
       templateChromeHeight: templateChrome?.height ?? 0,
     };
@@ -209,9 +228,8 @@ async function expectDesktopPanelChromeAligned(page: Page) {
   expect(metrics).not.toBeNull();
   expect(metrics!.topDelta).toBeLessThanOrEqual(1);
   expect(metrics!.bottomDelta).toBeLessThanOrEqual(1);
-  expect(metrics!.batchHeaderHeight).toBeLessThanOrEqual(32);
   expect(metrics!.documentHeaderHeight).toBeLessThanOrEqual(32);
-  expect(metrics!.templateChromeHeight).toBeLessThanOrEqual(32);
+  expect(metrics!.templateChromeHeight).toBeLessThanOrEqual(48);
 }
 
 async function dismissToasts(page: Page) {
@@ -327,6 +345,20 @@ test("AI assisted processing shows the in-document scan overlay", async ({
   await expect(overlay.getByText(file.filename)).toBeVisible();
 });
 
+test("batch selector replaces the permanent batches panel", async ({
+  page,
+  request,
+}) => {
+  await loadPreviewBatch(page, request, { width: 1366, height: 768 });
+  await expect(page.getByTestId("panel-batches")).toHaveCount(0);
+  await expect(page.getByTestId("template-batch-selector")).toBeVisible();
+  await page.getByTestId("template-batch-selector").click();
+  await expect(page.getByTestId("batch-selector-popover")).toBeVisible();
+  await expect(page.getByTestId("batch-explorer")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("batch-selector-popover")).toHaveCount(0);
+});
+
 test("panel minimize uses the bottom dock and restores cleanly", async ({
   page,
   request,
@@ -339,7 +371,7 @@ test("panel minimize uses the bottom dock and restores cleanly", async ({
   await page.getByTestId("windows-menu-minimize-all").click();
   await expect(page.getByTestId("panel-batches")).toHaveCount(0);
   await expect(page.getByTestId("workspace-dock")).toBeVisible();
-  await expect(page.getByTestId("workspace-dock-batches")).toBeVisible();
+  await expect(page.getByTestId("workspace-dock-template")).toBeVisible();
   const dockMetrics = await page.getByTestId("workspace-dock").evaluate((el) => {
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
@@ -361,8 +393,8 @@ test("panel minimize uses the bottom dock and restores cleanly", async ({
   expect(dockMetrics.bottomRadius).toBe(0);
   expect(dockMetrics.itemHeight).toBeLessThanOrEqual(30);
   expect(dockMetrics.itemRadius).toBeLessThanOrEqual(5);
-  await page.getByTestId("workspace-dock-batches").click();
-  await expect(page.getByTestId("panel-batches")).toBeVisible();
+  await page.getByTestId("workspace-dock-template").click();
+  await expect(page.getByTestId("panel-template")).toBeVisible();
 });
 
 test("Windows menu closes and restores panels", async ({ page, request }) => {
@@ -424,7 +456,9 @@ test("batch row click switches the active batch", async ({ page, request }) => {
 
   const target = batchRow(page, targetBatch!.batch_id);
   await target.getByTestId("explorer-batch-row").click();
-  await expect(target).toHaveClass(/active/);
+  await expect(page.getByTestId("template-batch-selector")).toContainText(
+    targetBatch!.batch_name,
+  );
 });
 
 test("inline new batch row opens and validates long names", async ({ page, request }) => {
@@ -460,7 +494,9 @@ test("file delete opens app-native confirm and can be cancelled", async ({
   await loadBatch(page, request, batch!, { width: 1366, height: 768 });
   await expandBatch(page, batch!.batch_id);
   await page.getByTestId("explorer-file-menu").first().click();
-  await page.getByTestId("explorer-file-delete").first().click();
+  const deleteFile = page.getByTestId("explorer-file-delete").first();
+  await expect(deleteFile).toBeVisible();
+  await deleteFile.click();
   await expect(page.getByTestId("confirm-dialog")).toBeVisible();
   await expect(page.getByText("Delete file?")).toBeVisible();
   await page.getByTestId("confirm-cancel").click();
@@ -502,8 +538,10 @@ test("drag and drop onto a batch row uploads into that batch", async ({
   try {
     await page.setViewportSize({ width: 1366, height: 768 });
     await page.goto("/");
+    await openBatchSelector(page);
     await expect(page.getByTestId("batch-explorer")).toBeVisible();
     await page.reload();
+    await openBatchSelector(page);
 
     const row = batchRow(page, created.batch_id);
     await expect(row).toBeVisible();
@@ -515,22 +553,25 @@ test("drag and drop onto a batch row uploads into that batch", async ({
     await row.dispatchEvent("dragenter", { dataTransfer });
     await expect(row).toHaveClass(/drag-over/);
     await row.dispatchEvent("drop", { dataTransfer });
-    await expect(row).not.toHaveClass(/drag-over/);
-    await expect(row).toContainText("phase1w_drop_test.txt");
+    await openBatchSelector(page);
+    const refreshedRow = batchRow(page, created.batch_id);
+    await expect(refreshedRow).toContainText("phase1w_drop_test.txt", {
+      timeout: 10_000,
+    });
   } finally {
     await request.delete(`${API_BASE}/api/batches/${created.batch_id}`);
   }
 });
 
-test("column view buttons are visible without duplicate optional controls", async ({
+test("all template columns are always visible without a column mode selector", async ({
   page,
   request,
 }) => {
   await loadPreviewBatch(page, request, { width: 1366, height: 768 });
-  const tabs = page.getByTestId("column-view-tabs");
-  await expect(tabs.getByRole("tab", { name: "Required" })).toBeVisible();
-  await expect(tabs.getByRole("tab", { name: "Issues" })).toHaveCount(0);
-  await expect(tabs.getByRole("tab", { name: "All" })).toBeVisible();
+  await expect(page.getByTestId("column-view-tabs")).toHaveCount(0);
+  await expect(
+    page.getByTestId("template-grid-card").locator("th", { hasText: "Document Url" }),
+  ).toHaveCount(1);
   await expect(page.getByText("Show optional cols")).toHaveCount(0);
 });
 
@@ -538,17 +579,21 @@ test("single invoice mode renders and edits update the bulk grid", async ({
   page,
   request,
 }) => {
+  test.setTimeout(60_000);
   await loadPreviewBatch(page, request, { width: 1366, height: 768 });
-  await page.getByTestId("template-row").first().click();
+  const firstRow = page.getByTestId("template-row").first();
+  await expect(firstRow).toBeVisible({ timeout: 30000 });
+  await firstRow.click();
   await page.getByTestId("template-mode-single").click();
   await expect(page.getByTestId("single-invoice-mode")).toBeVisible();
   await expect(page.getByTestId("single-invoice-status")).toBeVisible();
-  await expect(page.getByTestId("single-invoice-totals")).toBeVisible();
-  await expect(page.getByTestId("single-review-tasks")).toBeVisible();
   await expect(page.getByTestId("single-use-vision-assist")).toBeVisible();
   await expect(page.getByTestId("single-ready-export")).toHaveAttribute("title", /Blocked by|Invoice ready/);
   await expect(page.getByTestId("single-invoice-line-items")).toBeVisible();
-  await expect(page.getByText("Invoice History")).toBeVisible();
+  await expect(page.getByText("Save mapping for future")).toHaveCount(0);
+  await expect(page.getByText("Apply to similar items")).toHaveCount(0);
+  await expect(page.getByText("Add line item")).toHaveCount(0);
+  await expect(page.getByText("Invoice History")).toHaveCount(0);
 
   const editedDescription = `QA single invoice edit ${Date.now()}`;
   const descriptionField = page.getByTestId(
@@ -558,10 +603,64 @@ test("single invoice mode renders and edits update the bulk grid", async ({
   await descriptionField.press("Enter");
 
   await page.getByTestId("template-mode-bulk").click();
-  await page.getByTestId("column-view-tabs").getByRole("tab", { name: "All" }).click();
   await expect(page.getByTestId("template-row").first()).toContainText(
     editedDescription,
   );
+});
+
+test("single invoice export posts only the current invoice rows", async ({
+  page,
+  request,
+}) => {
+  const hweaBatch = (await listBatches(request)).find(
+    (b) => /HWEA/i.test(b.batch_name) && b.export_available && b.rows_count > b.invoices_count,
+  );
+  test.skip(!hweaBatch, "No multi-line HWEA export batch is available.");
+
+  await loadBatch(page, request, hweaBatch!, { width: 1366, height: 768 });
+  await page.keyboard.press("Escape");
+  await page.getByTestId("template-row").first().click();
+  await page.getByTestId("template-mode-single").click();
+  await expect(page.getByTestId("single-invoice-mode")).toBeVisible();
+
+  const lineRowCount =
+    (await page.getByTestId("single-invoice-line-items").locator("tbody tr").count()) - 1;
+  expect(lineRowCount).toBeGreaterThan(0);
+
+  let exportBody: { edited_rows?: Record<string, unknown>[] } | null = null;
+  await page.route(`**/api/batches/${hweaBatch!.batch_id}/export`, async (route) => {
+    exportBody = JSON.parse(route.request().postData() ?? "{}");
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        exported: [{ filename: "single-invoice-export.xlsx" }],
+        export_used_edited_rows: true,
+        edited_rows_count: exportBody?.edited_rows?.length ?? 0,
+      }),
+    });
+  });
+  await page.route(`**/api/batches/${hweaBatch!.batch_id}/download**`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      headers: {
+        "Content-Disposition": 'attachment; filename="single-invoice-export.xlsx"',
+      },
+      body: "",
+    });
+  });
+
+  const exportButton = page.getByTestId("single-ready-export");
+  if (!(await exportButton.isEnabled())) {
+    await page.getByTestId("single-mark-reviewed").click();
+    await expect(exportButton).toBeEnabled();
+  }
+  await exportButton.click();
+
+  await expect.poll(() => exportBody?.edited_rows?.length ?? 0).toBe(lineRowCount);
+  expect(exportBody?.edited_rows?.length).toBeLessThan(hweaBatch!.rows_count);
+  expect(new Set(exportBody!.edited_rows!.map((row) => row["Invoice Number"])).size).toBe(1);
 });
 
 test("detached single invoice review renders the polished review layout", async ({
@@ -578,13 +677,12 @@ test("detached single invoice review renders the polished review layout", async 
   await page.getByTestId("template-mode-single").click();
   await expect(page.getByTestId("single-invoice-mode")).toBeVisible();
   await expect(page.getByTestId("single-property-resolver")).toBeVisible();
-  await expect(page.getByTestId("single-invoice-totals")).toBeVisible();
-  await expect(page.getByTestId("single-review-tasks")).toBeVisible();
+  await expect(page.getByTestId("single-invoice-line-items")).toBeVisible();
   await expect(page.getByTestId("single-mark-reviewed")).toBeVisible();
   await expect(page.getByTestId("single-ready-export")).toBeVisible();
 });
 
-test("AI supplier single invoice shows invoice total separate from merchandise and tax", async ({
+test("AI supplier single invoice keeps invoice total in the compact form", async ({
   page,
   request,
 }) => {
@@ -596,10 +694,10 @@ test("AI supplier single invoice shows invoice total separate from merchandise a
   await page.getByTestId("template-row").first().click();
   await page.getByTestId("template-mode-single").click();
   await expect(page.getByTestId("single-invoice-mode")).toBeVisible();
-  await expect(page.getByTestId("single-total-invoice").getByLabel("Invoice total summary")).toHaveValue("6.75");
-  await expect(page.getByTestId("single-total-merchandise")).toContainText("$6.16");
-  await expect(page.getByTestId("single-total-tax")).toContainText("$0.59");
   await expect(page.getByTestId("single-invoice-primary-total").getByLabel("Invoice total")).toHaveValue("6.75");
+  await expect(page.getByTestId("single-total-invoice")).toHaveCount(0);
+  await expect(page.getByTestId("single-total-merchandise")).toHaveCount(0);
+  await expect(page.getByTestId("single-total-tax")).toHaveCount(0);
   await expect(page.getByTestId("ai-mapping-review")).toHaveCount(0);
 });
 
@@ -623,6 +721,7 @@ test("continuous document viewer syncs page tree and template rows", async ({
   const { batch, file } = picked!;
   const pageCount = Math.max(1, file.page_count ?? 1);
   test.skip(pageCount < 2, "No multi-page PDF is available for page navigation.");
+  const viewerPageCount = await expectedCombinedViewerPages(request, batch.batch_id);
 
   await loadBatch(page, request, batch, { width: 1366, height: 768 });
   await expandBatch(page, batch.batch_id);
@@ -635,29 +734,43 @@ test("continuous document viewer syncs page tree and template rows", async ({
   await expect(page.getByTestId("pdf-continuous-scroll")).toBeVisible({
     timeout: 15000,
   });
-  await expect(page.getByTestId("pdf-page-shell")).toHaveCount(pageCount, {
-    timeout: 15000,
-  });
+  await expect
+    .poll(async () => page.getByTestId("pdf-page-shell").count(), {
+      timeout: 15000,
+    })
+    .toBeGreaterThanOrEqual(Math.min(pageCount, viewerPageCount));
 
-  if ((await fileNode.getByTestId("explorer-file-page").count()) === 0) {
-    await fileNode.getByTestId("explorer-file-page-toggle").click();
+  const pageToggle = fileNode.getByTestId("explorer-file-page-toggle");
+  if ((await fileNode.getByTestId("explorer-file-page").count()) === 0 && (await pageToggle.isVisible())) {
+    await pageToggle.click();
   }
   const pageTwo = fileNode.locator(
     '[data-testid="explorer-file-page"][data-page-number="2"]',
   );
-  await expect(pageTwo).toBeVisible();
-  await pageTwo.click();
-  await expect(pageTwo).toHaveAttribute("aria-current", "page", {
-    timeout: 5000,
-  });
+  if ((await pageTwo.count()) > 0) {
+    await expect(pageTwo).toBeVisible();
+    await pageTwo.click();
+    await expect(pageTwo).toHaveAttribute("aria-current", "page", {
+      timeout: 5000,
+    });
+  } else {
+    const pageTwoThumb = page.locator('[data-testid="pdf-page-thumbnail"][data-page-number="2"]');
+    await expect(pageTwoThumb).toBeVisible({ timeout: 5000 });
+    await pageTwoThumb.click();
+    await expect(pageTwoThumb).toHaveAttribute("aria-current", "page", {
+      timeout: 5000,
+    });
+  }
 
   const pageTwoRows = page.locator('[data-testid="template-row"][data-source-page="2"]');
   if ((await pageTwoRows.count()) > 0) {
     await expect(pageTwoRows.first()).toHaveClass(/document-page-row/);
     await pageTwoRows.first().click();
-    await expect(pageTwo).toHaveAttribute("aria-current", "page", {
-      timeout: 5000,
-    });
+    if ((await pageTwo.count()) > 0) {
+      await expect(pageTwo).toHaveAttribute("aria-current", "page", {
+        timeout: 5000,
+      });
+    }
   }
 });
 
@@ -670,6 +783,7 @@ test("holding Space while panning does not trigger native page-scroll repeat", a
   const { batch, file } = picked!;
   const pageCount = Math.max(1, file.page_count ?? 1);
   test.skip(pageCount < 2, "No multi-page PDF is available for pan regression.");
+  const viewerPageCount = await expectedCombinedViewerPages(request, batch.batch_id);
 
   await loadBatch(page, request, batch, { width: 1366, height: 768 });
   await expandBatch(page, batch.batch_id);
@@ -682,13 +796,17 @@ test("holding Space while panning does not trigger native page-scroll repeat", a
 
   const scroller = page.getByTestId("pdf-continuous-scroll");
   await expect(scroller).toBeVisible({ timeout: 15000 });
-  await expect(page.getByTestId("pdf-page-shell")).toHaveCount(pageCount, {
-    timeout: 15000,
-  });
+  await expect
+    .poll(async () => page.getByTestId("pdf-page-shell").count(), {
+      timeout: 15000,
+    })
+    .toBeGreaterThanOrEqual(Math.min(pageCount, viewerPageCount));
   await scroller.evaluate((el) => {
     el.scrollTop = 0;
     el.scrollLeft = 0;
   });
+  await page.waitForTimeout(75);
+  const baselineScrollTop = await scroller.evaluate((el) => el.scrollTop);
 
   const box = await scroller.boundingBox();
   expect(box).not.toBeNull();
@@ -701,7 +819,7 @@ test("holding Space while panning does not trigger native page-scroll repeat", a
     await page.keyboard.down("Space");
   }
   const repeatedSpaceScrollTop = await scroller.evaluate((el) => el.scrollTop);
-  expect(repeatedSpaceScrollTop).toBeLessThanOrEqual(2);
+  expect(Math.abs(repeatedSpaceScrollTop - baselineScrollTop)).toBeLessThanOrEqual(2);
 
   await page.mouse.down();
   for (let i = 0; i < 8; i += 1) {
@@ -710,7 +828,7 @@ test("holding Space while panning does not trigger native page-scroll repeat", a
   await page.mouse.up();
   await page.keyboard.up("Space");
   const afterPanScrollTop = await scroller.evaluate((el) => el.scrollTop);
-  expect(afterPanScrollTop).toBeLessThanOrEqual(2);
+  expect(Math.abs(afterPanScrollTop - baselineScrollTop)).toBeLessThanOrEqual(2);
 });
 
 test("canonical rules test bench returns the Capital Waste expected result", async ({

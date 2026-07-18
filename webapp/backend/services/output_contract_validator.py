@@ -55,10 +55,29 @@ def validate_row_contract(
         or "",
     )
     property_name = str(meta.get("matched_property_name") or meta.get("property_name") or "").strip()
+    vendor_text = str(row.get("Vendor") or meta.get("ai_detected_vendor") or "").lower()
+    property_level_service = gl in {"6810", "6760"} or any(
+        token in vendor_text
+        for token in ("landscap", "lawn", "pest", "termite", "exterminat")
+    )
+    one_off_invoice = str(meta.get("ai_category") or "").strip().lower() == "other_infrequent"
 
-    if service_address and invoice_description and service_address not in invoice_description:
+    if (
+        service_address
+        and invoice_description
+        and service_address not in invoice_description
+        and not property_level_service
+        and not one_off_invoice
+    ):
         flags.append("invoice_description_missing_service_address")
-    if service_address and property_name and property_name in invoice_description and service_address not in invoice_description:
+    if (
+        service_address
+        and property_name
+        and property_name in invoice_description
+        and service_address not in invoice_description
+        and not property_level_service
+        and not one_off_invoice
+    ):
         flags.append("invoice_description_uses_property_instead_of_service_address")
     if looks_like_city_state_zip(invoice_description):
         flags.append("invoice_description_contains_city_state_zip")

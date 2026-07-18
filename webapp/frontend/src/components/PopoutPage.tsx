@@ -214,13 +214,18 @@ export default function PopoutPage({ query }: { query: PopoutQuery }) {
         setStatus(s);
         if (query.kind === "template") {
           if (s.preview_available) {
-            const [p, r] = await Promise.all([
+            const [p, r] = await Promise.allSettled([
               api.preview(query.batch),
               api.manualReview(query.batch),
             ]);
             if (cancelled) return;
-            setPreview(p);
-            setReview(r.items);
+            if (p.status === "fulfilled") {
+              setPreview(p.value);
+            } else {
+              setPreview(null);
+              setError(getFriendlyErrorMessage(p.reason, "Load popout preview"));
+            }
+            setReview(r.status === "fulfilled" ? r.value.items : []);
           } else {
             setPreview(null);
             setReview([]);

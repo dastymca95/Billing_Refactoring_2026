@@ -6,12 +6,15 @@ names + summary stats without re-reading the result cache."""
 from __future__ import annotations
 
 import json
+import hashlib
 import re
+from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..services import batch_store
@@ -37,6 +40,9 @@ DEFAULT_DOCUMENT_MODE = "auto_detect"
 DEFAULT_AI_FALLBACK_POLICY = "only_low_confidence"
 DEFAULT_UNTITLED_BATCH_NAME = "Untitled batch"
 DETECTION_CACHE_VERSION = 3
+SUMMARY_CACHE_VERSION = 1
+LIST_CACHE_WARM_LIMIT = 64
+_SUMMARY_CACHE: dict[str, tuple[tuple, dict]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +83,69 @@ def _write_metadata(batch_id: str, **fields) -> dict:
 
 def _display_batch_name(meta: dict) -> str:
     return str(meta.get("batch_name") or "").strip() or DEFAULT_UNTITLED_BATCH_NAME
+
+
+def _stat_sig(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return (int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return None
+
+
+def _batch_summary_signature(batch_id: str, files: list[Path]) -> tuple:
+    bdir = batch_store.get_batch_dir(batch_id)
+    processed_dir = batch_store.get_processed_dir(batch_id)
+    export_dir = batch_store.get_export_dir(batch_id)
+    file_parts = []
+    for p in files:
+        sig = _stat_sig(p)
+        if sig is not None:
+            file_parts.append((p.name, sig[0], sig[1]))
+    export_parts = []
+    for p in sorted(export_dir.glob("*resman_import*.xlsx")):
+        sig = _stat_sig(p)
+        if sig is not None:
+            export_parts.append((p.name, sig[0], sig[1]))
+    return (
+        SUMMARY_CACHE_VERSION,
+        int(bdir.stat().st_ctime_ns),
+        tuple(file_parts),
+        _stat_sig(processed_dir / "_webapp_result.json"),
+        tuple(export_parts),
+    )
+
+
+def _summary_signature_token(signature: tuple) -> str:
+    raw = json.dumps(signature, separators=(",", ":"), default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _write_summary_cache(batch_id: str, live: dict, signature: tuple | None = None) -> None:
+    payload = {
+        "version": SUMMARY_CACHE_VERSION,
+        "signature_token": _summary_signature_token(signature) if signature is not None else None,
+        "files_count": live.get("files_count", 0),
+        "invoices_count": live.get("invoices_count", 0),
+        "rows_count": live.get("rows_count", 0),
+        "manual_review_count": live.get("manual_review_count", 0),
+        "export_available": live.get("export_available", False),
+        "last_export_file": live.get("last_export_file"),
+        "export_filenames": live.get("export_filenames") or [],
+        "supported_vendor_summary": live.get("supported_vendor_summary") or {},
+        "summary": live.get("summary") or {},
+        "preview_available": live.get("preview_available", False),
+        "created_at": live.get("created_at"),
+    }
+    try:
+        p = _metadata_path(batch_id)
+        meta = _read_metadata(batch_id)
+        if meta.get("summary_cache") == payload:
+            return
+        meta["summary_cache"] = payload
+        p.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -189,11 +258,169 @@ def _detect_files_cached(batch_id: str, files: list) -> list[dict]:
     return entries
 
 
+def _source_type_from_suffix(suffix: str) -> tuple[str, str, str, str]:
+    suffix = suffix.lower()
+    if suffix == ".pdf":
+        return (
+            "pdf_pending",
+            "pending",
+            "PDF",
+            "Uploaded PDF; detailed detection runs outside the upload path.",
+        )
+    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}:
+        return (
+            "image",
+            "limited",
+            "Image",
+            "Uploaded image; OCR or vision may be recommended during processing.",
+        )
+    if suffix in {".xlsx", ".xls"}:
+        return ("excel", "supported", "Excel", "Spreadsheet uploaded.")
+    if suffix == ".csv":
+        return ("csv", "supported", "CSV", "CSV file uploaded.")
+    if suffix in {".docx", ".doc"}:
+        return ("word", "limited", "Word", "Word document uploaded.")
+    return ("unknown", "unsupported", "Unsupported", "This file type is not supported.")
+
+
+def _list_files_light(
+    batch_id: str,
+    files: list[Path],
+    *,
+    detect_support: bool = False,
+    include_pdf_page_count: bool = False,
+) -> list[dict]:
+    """Latency-safe file list for upload UI refreshes.
+
+    This must not open PDFs or run vendor detectors. It may reuse cached
+    metadata from a prior full detection, but new uploads are returned as
+    immediately visible "pending" entries.
+    """
+    meta = _read_metadata(batch_id)
+    cache = meta.get("file_detection_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+
+    entries: list[dict] = []
+    cache_dirty = False
+    for p in files:
+        try:
+            stat = p.stat()
+        except FileNotFoundError:
+            continue
+        size_bytes = stat.st_size
+        mtime = int(stat.st_mtime)
+        cached = cache.get(p.name)
+        cached_valid = (
+            isinstance(cached, dict)
+            and cached.get("size_bytes") == size_bytes
+            and cached.get("mtime") == mtime
+            and cached.get("detector_version") == DETECTION_CACHE_VERSION
+        )
+        page_count = cached.get("page_count") if cached_valid else None
+        counted_pdf_pages = False
+        source_type, support_status, support_label, support_reason = _source_type_from_suffix(
+            p.suffix
+        )
+        if detect_support and not cached_valid:
+            try:
+                support = document_ingestion.detect_file_support(p)
+                source_type = support.get("source_type") or source_type
+                support_status = support.get("file_support_status") or support_status
+                support_label = support.get("file_support_label") or support_label
+                support_reason = support.get("file_support_reason") or support_reason
+            except Exception:
+                pass
+        if p.suffix.lower() == ".pdf" and page_count is None and (
+            detect_support or include_pdf_page_count
+        ):
+            try:
+                page_count = pdf_page_count(p)
+                counted_pdf_pages = page_count is not None
+            except Exception:
+                page_count = None
+        if counted_pdf_pages:
+            cached_payload = dict(cached) if isinstance(cached, dict) else {}
+            cached_payload.update(
+                {
+                    "size_bytes": size_bytes,
+                    "mtime": mtime,
+                    "detector_version": DETECTION_CACHE_VERSION,
+                    "page_count": page_count,
+                }
+            )
+            cache[p.name] = cached_payload
+            cache_dirty = True
+        entry = {
+            "filename": p.name,
+            "size_bytes": size_bytes,
+            "extension": p.suffix.lower(),
+            "vendor_key": "unknown",
+            "vendor_confidence": 0.0,
+            "vendor_detection_reason": "Detection pending after upload.",
+            "supported_in_phase_1": False,
+            "source_type": source_type,
+            "file_support_status": support_status,
+            "file_support_label": support_label,
+            "file_support_reason": support_reason,
+        }
+        if page_count is not None:
+            entry["page_count"] = page_count
+        if cached_valid:
+            entry.update(
+                {
+                    "vendor_key": cached.get("vendor_key", "unknown"),
+                    "vendor_confidence": cached.get("confidence", 0.0),
+                    "vendor_detection_reason": cached.get("reason", ""),
+                    "supported_in_phase_1": cached.get("supported_in_phase_1", False),
+                    "source_type": cached.get("source_type") or source_type,
+                    "file_support_status": cached.get("file_support_status") or support_status,
+                    "file_support_label": cached.get("file_support_label") or support_label,
+                    "file_support_reason": cached.get("file_support_reason") or support_reason,
+                }
+            )
+        entries.append(entry)
+    if cache_dirty:
+        try:
+            _write_metadata(batch_id, file_detection_cache=cache)
+        except Exception:
+            pass
+    return entries
+
+
 def _summary_for_batch(batch_id: str) -> dict:
     """Inspect the batch folder + cached result + export folder to
     compute the live counts the metadata sidecar may be missing."""
     bdir = batch_store.get_batch_dir(batch_id)
     files = batch_store.list_files_in_batch(batch_id)
+    signature = _batch_summary_signature(batch_id, files)
+    cached_entry = _SUMMARY_CACHE.get(batch_id)
+    if cached_entry and cached_entry[0] == signature:
+        return deepcopy(cached_entry[1])
+    signature_token = _summary_signature_token(signature)
+    meta = _read_metadata(batch_id)
+    persistent_cache = meta.get("summary_cache")
+    if (
+        isinstance(persistent_cache, dict)
+        and persistent_cache.get("version") == SUMMARY_CACHE_VERSION
+        and persistent_cache.get("signature_token") == signature_token
+    ):
+        live = {
+            "files_count": int(persistent_cache.get("files_count") or 0),
+            "invoices_count": int(persistent_cache.get("invoices_count") or 0),
+            "rows_count": int(persistent_cache.get("rows_count") or 0),
+            "manual_review_count": int(persistent_cache.get("manual_review_count") or 0),
+            "export_available": bool(persistent_cache.get("export_available")),
+            "last_export_file": persistent_cache.get("last_export_file"),
+            "supported_vendor_summary": persistent_cache.get("supported_vendor_summary") or {},
+            "summary": persistent_cache.get("summary") or {},
+            "preview_available": bool(persistent_cache.get("preview_available")),
+            "created_at": persistent_cache.get("created_at")
+            or datetime.fromtimestamp(bdir.stat().st_ctime).isoformat(timespec="seconds"),
+            "export_filenames": persistent_cache.get("export_filenames") or [],
+        }
+        _SUMMARY_CACHE[batch_id] = (signature, deepcopy(live))
+        return deepcopy(live)
 
     processed_dir = batch_store.get_processed_dir(batch_id)
     cache_path = processed_dir / "_webapp_result.json"
@@ -218,8 +445,11 @@ def _summary_for_batch(batch_id: str) -> dict:
             pass
 
     export_dir = batch_store.get_export_dir(batch_id)
-    export_files = sorted(export_dir.glob("*resman_import*.xlsx"))
-    return {
+    export_files = sorted(
+        export_dir.glob("*resman_import*.xlsx"),
+        key=lambda p: (p.stat().st_mtime, p.name),
+    )
+    live = {
         "files_count": len(files),
         "invoices_count": invoices_count,
         "rows_count": rows_count,
@@ -231,6 +461,40 @@ def _summary_for_batch(batch_id: str) -> dict:
         "preview_available": cache_path.is_file(),
         "created_at": datetime.fromtimestamp(bdir.stat().st_ctime).isoformat(timespec="seconds"),
         "export_filenames": [p.name for p in export_files],
+    }
+    _SUMMARY_CACHE[batch_id] = (signature, deepcopy(live))
+    _write_summary_cache(batch_id, live, signature=signature)
+    return live
+
+
+def _summary_for_batch_light(batch_id: str, meta: dict) -> dict:
+    """Fast list-view summary.
+
+    The batch dropdown is opened constantly, so it must not parse every
+    historical `_webapp_result.json`. Exact counts are refreshed by
+    `GET /api/batches/{id}` and stored as `summary_cache`; list view can
+    safely use the last known values plus live file/export existence.
+    """
+    bdir = batch_store.get_batch_dir(batch_id)
+    files_count = len(batch_store.list_files_in_batch(batch_id))
+    processed_dir = batch_store.get_processed_dir(batch_id)
+    cache_path = processed_dir / "_webapp_result.json"
+    export_dir = batch_store.get_export_dir(batch_id)
+    export_files = sorted(
+        export_dir.glob("*resman_import*.xlsx"),
+        key=lambda p: (p.stat().st_mtime, p.name),
+    )
+    cached = meta.get("summary_cache") if isinstance(meta.get("summary_cache"), dict) else {}
+    return {
+        "files_count": files_count,
+        "invoices_count": int(cached.get("invoices_count") or 0),
+        "rows_count": int(cached.get("rows_count") or 0),
+        "manual_review_count": int(cached.get("manual_review_count") or 0),
+        "export_available": bool(export_files) or bool(cached.get("export_available")),
+        "last_export_file": export_files[-1].name if export_files else cached.get("last_export_file"),
+        "supported_vendor_summary": cached.get("supported_vendor_summary") or {},
+        "preview_available": cache_path.is_file(),
+        "created_at": datetime.fromtimestamp(bdir.stat().st_ctime).isoformat(timespec="seconds"),
     }
 
 
@@ -350,15 +614,29 @@ def create_batch_endpoint(body: CreateBatchBody | None = Body(default=None)) -> 
 def list_batches_endpoint() -> dict:
     """List every batch on disk with its metadata + live counts. Sorted
     most-recent first by `created_at`."""
-    out = []
-    for entry in batch_store.list_batches():
+    entries = batch_store.list_batches()
+
+    def build(index_entry: tuple[int, dict]) -> dict | None:
+        index, entry = index_entry
         bid = entry["batch_id"]
         try:
             meta = _read_metadata(bid)
-            live = _summary_for_batch(bid)
+            summary_cache = meta.get("summary_cache")
+            has_valid_summary_cache = (
+                isinstance(summary_cache, dict)
+                and summary_cache.get("version") == SUMMARY_CACHE_VERSION
+            )
+            result_cache = batch_store.get_processed_dir(bid) / "_webapp_result.json"
+            live = (
+                _summary_for_batch_light(bid, meta)
+                if has_valid_summary_cache
+                or not result_cache.is_file()
+                or index >= LIST_CACHE_WARM_LIMIT
+                else _summary_for_batch(bid)
+            )
         except FileNotFoundError:
-            continue
-        out.append({
+            return None
+        return {
             "batch_id": bid,
             "batch_name": _display_batch_name(meta),
             "created_at": live.get("created_at") or meta.get("created_at"),
@@ -371,7 +649,13 @@ def list_batches_endpoint() -> dict:
             "export_available": live["export_available"],
             "last_export_file": live["last_export_file"],
             "supported_vendor_summary": live["supported_vendor_summary"],
-        })
+        }
+
+    if len(entries) > 24:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            out = [item for item in pool.map(build, enumerate(entries)) if item is not None]
+    else:
+        out = [item for item in (build(item) for item in enumerate(entries)) if item is not None]
     out.sort(key=lambda b: b.get("created_at") or "", reverse=True)
     return {"batches": out}
 
@@ -417,9 +701,9 @@ def get_batch_endpoint(batch_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
 
     files = batch_store.list_files_in_batch(batch_id)
-    # Phase 1U — cached vendor detection (was the dominant cost of this
-    # endpoint; 1–3 s for a 10-file batch on every switch).
-    file_entries = _detect_files_cached(batch_id, files)
+    # Keep restore/switching latency-safe. Full vendor detection stays out of
+    # the navigation/upload path; cached results are reused when available.
+    file_entries = _list_files_light(batch_id, files, include_pdf_page_count=False)
 
     meta = _read_metadata(batch_id)
     live = _summary_for_batch(batch_id)
@@ -440,7 +724,10 @@ def get_batch_endpoint(batch_id: str) -> dict:
 
 
 @router.get("/{batch_id}/files")
-def list_files_endpoint(batch_id: str) -> dict:
+def list_files_endpoint(
+    batch_id: str,
+    detail: Literal["light", "full"] = Query("light"),
+) -> dict:
     try:
         files = batch_store.list_files_in_batch(batch_id)
     except FileNotFoundError:
@@ -450,6 +737,11 @@ def list_files_endpoint(batch_id: str) -> dict:
     # detector alone takes 10-50 seconds on a screenshot). Fast-mode
     # skips heavy OCR; if the cache is empty the file shows as
     # vendor=unknown and the real detection runs at process time.
+    if detail == "light":
+        return {
+            "batch_id": batch_id,
+            "files": _list_files_light(batch_id, files, detect_support=False),
+        }
     from ..services.vendor_detection import fast_detection_context
     with fast_detection_context():
         out = _detect_files_cached(batch_id, files)

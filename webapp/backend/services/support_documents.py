@@ -8,6 +8,7 @@ the same behavior here instead of returning a localhost-only preview URL.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -117,6 +118,14 @@ def upload_source_document_to_dropbox(
         billing_date=billing_date,
         filename=safe_name,
     )
+    cached = _cached_support_document_link(
+        batch_id=batch_id,
+        local_path=local_path,
+        source_file=safe_name,
+        dropbox_path=dropbox_path,
+    )
+    if cached:
+        return cached
     result = uploader.upload(
         local_path=local_path,
         dropbox_path=dropbox_path,
@@ -138,12 +147,122 @@ def upload_source_document_to_dropbox(
                 f"{result.error_message or 'Review Dropbox configuration.'}"
             ),
         )
-    return SupportDocumentLink(
+    link = SupportDocumentLink(
         success=True,
         url=result.shared_link,
         status="dropbox_uploaded",
         dropbox_path=result.dropbox_path,
     )
+    _remember_support_document_link(
+        batch_id=batch_id,
+        local_path=local_path,
+        source_file=safe_name,
+        link=link,
+    )
+    return link
+
+
+def _support_link_cache_path(batch_id: str) -> Path:
+    return batch_store.get_batch_dir(batch_id) / "audit" / "support_document_links.json"
+
+
+def _support_link_key(local_path: Path, source_file: str, dropbox_path: str) -> str:
+    stat = local_path.stat()
+    return "|".join((source_file, str(stat.st_size), str(stat.st_mtime_ns), dropbox_path))
+
+
+def _cached_support_document_link(
+    *,
+    batch_id: str,
+    local_path: Path,
+    source_file: str,
+    dropbox_path: str,
+) -> SupportDocumentLink | None:
+    cache_path = _support_link_cache_path(batch_id)
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        data = {}
+    key = _support_link_key(local_path, source_file, dropbox_path)
+    entry = data.get(key) if isinstance(data, dict) else None
+    if isinstance(entry, dict) and str(entry.get("url") or "").startswith("https://"):
+        return SupportDocumentLink(
+            success=True,
+            url=str(entry["url"]),
+            status="dropbox_cached",
+            dropbox_path=str(entry.get("dropbox_path") or dropbox_path),
+        )
+
+    # Seed the cache from a prior completed revision. This makes the first
+    # run after an application upgrade fast as well; no Dropbox request is
+    # needed when the exact batch source already has a verified shared link.
+    revision_dir = batch_store.get_batch_dir(batch_id) / "revisions"
+    try:
+        index = json.loads((revision_dir / "index.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        index = []
+    for revision in index[:10] if isinstance(index, list) else []:
+        snapshot_name = str((revision or {}).get("snapshot_filename") or "")
+        if not snapshot_name:
+            continue
+        try:
+            snapshot = json.loads((revision_dir / snapshot_name).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        for invoice in snapshot.get("all_invoices") or []:
+            if str(invoice.get("source_file") or "") != source_file:
+                continue
+            for row in invoice.get("rows") or []:
+                url = str(row.get("Document Url") or "")
+                meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+                stored_path = str(meta.get("support_document_dropbox_path") or "")
+                if url.startswith("https://") and (not stored_path or stored_path == dropbox_path):
+                    link = SupportDocumentLink(
+                        success=True,
+                        url=url,
+                        status="dropbox_cached",
+                        dropbox_path=stored_path or dropbox_path,
+                    )
+                    _remember_support_document_link(
+                        batch_id=batch_id,
+                        local_path=local_path,
+                        source_file=source_file,
+                        link=link,
+                    )
+                    return link
+    return None
+
+
+def _remember_support_document_link(
+    *,
+    batch_id: str,
+    local_path: Path,
+    source_file: str,
+    link: SupportDocumentLink,
+) -> None:
+    if not link.success or not link.url.startswith("https://"):
+        return
+    cache_path = _support_link_cache_path(batch_id)
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[_support_link_key(local_path, source_file, link.dropbox_path)] = {
+        "url": link.url,
+        "dropbox_path": link.dropbox_path,
+    }
+    tmp = cache_path.with_suffix(".tmp")
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(cache_path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _safe_vendor_folder(vendor_name: str) -> str:
@@ -159,7 +278,7 @@ def _parse_date(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
         return None
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d", "%m-%d-%Y", "%m-%d-%y"):
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d", "%m-%d-%Y", "%m-%d-%y", "%d-%b-%Y", "%d-%b-%y"):
         try:
             return datetime.strptime(text, fmt)
         except ValueError:

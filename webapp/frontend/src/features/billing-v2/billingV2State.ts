@@ -81,6 +81,10 @@ export type BillingV2Action =
   | { type: "setActiveBatch"; batchId: string | null; batchName?: string }
   | { type: "setFiles"; files: FileEntry[] }
   | { type: "setPreview"; preview: PreviewResponse | null }
+  | {
+      type: "setAccountingReadiness";
+      accountingReadiness: PreviewResponse["accounting_readiness"];
+    }
   | { type: "setProgress"; progress: BatchProgress | null }
   | { type: "setProcessing"; processing: boolean }
   | { type: "setCancelling"; cancelling: boolean }
@@ -211,6 +215,16 @@ export function billingV2Reducer(
         selectedColumnKey: null,
         edits: {},
       };
+    case "setAccountingReadiness":
+      return state.preview
+        ? {
+            ...state,
+            preview: {
+              ...state.preview,
+              accounting_readiness: action.accountingReadiness,
+            },
+          }
+        : state;
     case "setProgress":
       return { ...state, progress: action.progress };
     case "setProcessing":

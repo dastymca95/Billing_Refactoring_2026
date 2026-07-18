@@ -285,14 +285,24 @@ def _ingest_pdf(
     if source_type == "pdf_scanned":
         if not allow_ocr:
             warnings.append("pdf_ocr_skipped")
-            ocr_text = ""
+            ocr_pages: list[str] = []
         else:
-            ocr_text = _ocr_pdf(path, page_limit=page_limit, warnings=warnings)
-        if ocr_text:
-            if not pages:
-                pages.append(PageCandidate(page_number=1, text=ocr_text, ocr_confidence=None))
-            else:
-                pages[0].text = (pages[0].text + "\n" + ocr_text).strip()
+            ocr_pages = _ocr_pdf_pages(path, page_limit=page_limit, warnings=warnings)
+        if any(text.strip() for text in ocr_pages):
+            for page_index, ocr_text in enumerate(ocr_pages, start=1):
+                if page_index > len(pages):
+                    pages.append(
+                        PageCandidate(
+                            page_number=page_index,
+                            text=ocr_text,
+                            ocr_confidence=None,
+                        )
+                    )
+                    continue
+                if ocr_text.strip():
+                    pages[page_index - 1].text = (
+                        pages[page_index - 1].text + "\n" + ocr_text
+                    ).strip()
             document_text = _join_page_text(pages)
         else:
             warnings.append("pdf_ocr_unavailable_or_empty")
@@ -586,20 +596,46 @@ def _source_type_label(source_type: str) -> str:
     }.get(source_type, "Unsupported")
 
 
-def _ocr_pdf(path: Path, *, page_limit: int, warnings: list[str]) -> str:
+def _ocr_pdf_pages(path: Path, *, page_limit: int, warnings: list[str]) -> list[str]:
+    """Return OCR text aligned to source PDF pages.
+
+    Keeping page boundaries is essential for PDFs that contain several
+    independent invoices. The former implementation returned one concatenated
+    string and assigned it to page 1, which made downstream invoice grouping
+    impossible and left the remaining page candidates blank.
+    """
+    cache_dpi = 180
+    try:
+        from utils import ocr_cache  # type: ignore
+    except Exception:
+        ocr_cache = None  # type: ignore
+    if ocr_cache is not None:
+        try:
+            cached = ocr_cache.lookup(path, cache_dpi)
+        except Exception:
+            cached = None
+        if cached and int(cached.get("page_limit") or 0) >= page_limit:
+            page_texts = [
+                str(page.get("text") or "").strip()
+                for page in (cached.get("pages") or [])[:page_limit]
+                if isinstance(page, dict)
+            ]
+            if any(page_texts):
+                return page_texts
     try:
         import pypdfium2 as pdfium  # type: ignore
         from PIL import ImageEnhance, ImageOps  # type: ignore
         import pytesseract  # type: ignore
     except Exception:
         warnings.append("pdf_ocr_dependencies_unavailable")
-        return ""
+        return []
     try:
         doc = pdfium.PdfDocument(str(path))
     except Exception as exc:
         warnings.append(f"pdf_render_failed:{type(exc).__name__}")
-        return ""
+        return []
     texts: list[str] = []
+    cached_pages: list[dict[str, Any]] = []
     try:
         for page_index in range(min(len(doc), page_limit)):
             page = doc[page_index]
@@ -612,14 +648,39 @@ def _ocr_pdf(path: Path, *, page_limit: int, warnings: list[str]) -> str:
                 text = pytesseract.image_to_string(img, config="--psm 6").strip()
             except Exception:
                 text = ""
-            if text:
-                texts.append(text)
+            texts.append(text)
+            cached_pages.append({
+                "page_number": page_index + 1,
+                "text": text,
+                "width": float(img.width),
+                "height": float(img.height),
+                "words": [],
+            })
     finally:
         try:
             doc.close()
         except Exception:
             pass
-    return "\n\n".join(texts)
+    if ocr_cache is not None and any(texts):
+        try:
+            ocr_cache.store(path, cache_dpi, {
+                "pages": cached_pages,
+                "page_limit": page_limit,
+                "extraction_method": "pdf_ocr",
+                "confidence": 0.0,
+                "warnings": [],
+            })
+        except Exception:
+            pass
+    return texts
+
+
+def _ocr_pdf(path: Path, *, page_limit: int, warnings: list[str]) -> str:
+    """Backward-compatible concatenated OCR text helper."""
+    return "\n\n".join(
+        text for text in _ocr_pdf_pages(path, page_limit=page_limit, warnings=warnings)
+        if text
+    )
 
 
 def _ocr_image(path: Path, *, warnings: list[str]) -> str:
@@ -744,10 +805,12 @@ def _quality(candidate: DocumentCandidate) -> dict[str, Any]:
     table_count = len(candidate.tables)
     image_count = len(candidate.images)
     quality = _text_quality_score(text)
+    field_evidence = _invoice_field_evidence(text)
+    accounting_completeness = float(field_evidence["score"])
     quality_label = _quality_label(quality, has_tables=table_count > 0)
     needs_vision = (
         candidate.source_type in {"image", "screenshot", "pdf_scanned"}
-        and quality < 0.45
+        and (quality < 0.45 or accounting_completeness < 0.72)
     )
     return {
         "label": quality_label,
@@ -756,6 +819,9 @@ def _quality(candidate: DocumentCandidate) -> dict[str, Any]:
         "table_count": table_count,
         "image_count": image_count,
         "text_quality_score": quality,
+        "accounting_completeness": accounting_completeness,
+        "critical_fields_found": field_evidence["found"],
+        "critical_fields_missing": field_evidence["missing"],
         "needs_ocr": candidate.source_type in {"pdf_scanned", "image", "screenshot"} and not text.strip(),
         "vision_recommended": needs_vision,
         "warnings_count": len(candidate.warnings),
@@ -825,10 +891,123 @@ def _text_quality_score(text: str) -> float:
     normalized = re.sub(r"\s+", " ", text or "").strip()
     if not normalized:
         return 0.0
+    lowered = normalized.lower()
+    tokens = re.findall(r"[a-z0-9$.,/#-]+", lowered)
     alnum = sum(ch.isalnum() for ch in normalized)
-    ratio = alnum / max(1, len(normalized))
-    invoice_terms = sum(1 for term in ("invoice", "account", "total", "date", "amount") if term in normalized.lower())
-    return round(min(1.0, ratio * 0.75 + min(0.25, invoice_terms * 0.06)), 3)
+    alnum_ratio = alnum / max(1, len(normalized))
+
+    # Character density alone is a poor OCR signal: a page full of plausible
+    # looking nonsense still has a high alphanumeric ratio. Require invoice
+    # semantics and structured values before calling scanned text usable.
+    label_terms = (
+        "invoice", "account", "total", "amount", "date", "due",
+        "description", "quantity", "price", "subtotal", "tax",
+    )
+    label_hits = sum(1 for term in label_terms if re.search(rf"\b{term}\b", lowered))
+    has_money = bool(re.search(r"(?:\$\s*)?\d{1,3}(?:,\d{3})*(?:\.\d{2})\b", normalized))
+    has_date = bool(
+        re.search(r"\b\d{1,2}[/-]\d{1,2}[/-](?:\d{2}|\d{4})\b", normalized)
+        or re.search(
+            r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b",
+            lowered,
+        )
+    )
+    has_invoice_id = bool(
+        re.search(r"\binvoice\s*(?:#|no\.?|number)?\s*[:#-]?\s*[a-z0-9-]{2,}\b", lowered)
+    )
+    short_noise_ratio = (
+        sum(1 for token in tokens if len(re.sub(r"[^a-z0-9]", "", token)) <= 2)
+        / max(1, len(tokens))
+    )
+
+    score = min(0.38, alnum_ratio * 0.45)
+    score += min(0.30, label_hits * 0.05)
+    score += 0.12 if has_money else 0.0
+    score += 0.10 if has_date else 0.0
+    score += 0.10 if has_invoice_id else 0.0
+    if len(tokens) < 12:
+        score -= 0.10
+    if short_noise_ratio > 0.30:
+        score -= min(0.18, (short_noise_ratio - 0.30) * 0.60)
+    evidence = _invoice_field_evidence(normalized)
+    missing = set(evidence["missing"])
+    if {"invoice_number", "total_amount"}.issubset(missing):
+        score = min(score, 0.54)
+    elif {"invoice_number", "total_amount"} & missing:
+        score = min(score, 0.68)
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def _invoice_field_evidence(text: str) -> dict[str, Any]:
+    """Measure whether OCR captured values, not merely invoice labels."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (text or "").splitlines()]
+    lines = [line for line in lines if line]
+    lowered = [line.lower() for line in lines]
+
+    invoice_number = False
+    for index, line in enumerate(lowered):
+        match = re.search(r"\binvoice\s*(?:number|no\.?|#)\s*[:#-]?\s*(.*)$", line)
+        if not match:
+            continue
+        candidates = [match.group(1)]
+        if index + 1 < len(lowered) and not re.search(
+            r"\b(?:sold|bill|ship)\s+to\b", lowered[index + 1],
+        ):
+            candidates.append(lowered[index + 1])
+        for candidate in candidates:
+            candidate = re.split(
+                r"\b(?:account|sales|location|invoice\s+date|date|terms)\b",
+                candidate,
+                maxsplit=1,
+            )[0]
+            if re.search(r"\b(?=[a-z0-9-]*\d)[a-z0-9-]{3,}\b", candidate):
+                invoice_number = True
+                break
+        if invoice_number:
+            break
+
+    date_found = bool(re.search(
+        r"\b\d{1,2}[/-]\d{1,2}[/-](?:\d{2}|\d{4})\b",
+        "\n".join(lines),
+    ))
+    money_pattern = r"(?:\$\s*)?\d{1,3}(?:,\d{3})*(?:\.\d{2})\b"
+    money_values = re.findall(money_pattern, "\n".join(lines))
+    total_found = any(
+        re.search(r"\b(?:grand\s+total|invoice\s+total|total\s+due|amount\s+due|total)\b", line)
+        and re.search(money_pattern, line)
+        for line in lowered
+    )
+    line_amount = len(money_values) >= 1
+    vendor_identity = any(
+        len(re.findall(r"[a-z]{3,}", line)) >= 2
+        and not re.search(r"\b(?:invoice|account|description|quantity|subtotal|total)\b", line)
+        for line in lowered[:8]
+    )
+    property_evidence = bool(
+        re.search(r"\b(?:sold|bill|ship|service|install)\s+to\b", "\n".join(lowered))
+        or re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", "\n".join(lowered))
+    )
+    found_map = {
+        "vendor_name": vendor_identity,
+        "invoice_number": invoice_number,
+        "invoice_date": date_found,
+        "total_amount": total_found,
+        "line_amounts": line_amount,
+        "property_context": property_evidence,
+    }
+    weights = {
+        "vendor_name": 0.15,
+        "invoice_number": 0.20,
+        "invoice_date": 0.15,
+        "total_amount": 0.25,
+        "line_amounts": 0.15,
+        "property_context": 0.10,
+    }
+    return {
+        "score": round(sum(weights[key] for key, found in found_map.items() if found), 3),
+        "found": [key for key, found in found_map.items() if found],
+        "missing": [key for key, found in found_map.items() if not found],
+    }
 
 
 def detect_vendor_hint(candidate: DocumentCandidate) -> str:

@@ -1,0 +1,38 @@
+/* Backend-authoritative deterministic/AI routing controls. */
+.processing-route-control { position: relative; margin-left: auto; }
+.processing-route-control > summary { list-style: none; }
+.processing-route-control > summary::-webkit-details-marker { display: none; }
+.processing-route-summary { display: flex; align-items: center; gap: 6px; max-width: 245px; border: 1px solid #b8cff0; border-radius: 999px; background: #f4f8ff; color: #285786; padding: 6px 10px; font-size: 11px; font-weight: 750; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.processing-route-summary.route-deterministic { border-color: #9fd7bd; background: #ebfaf3; color: #166845; }
+.processing-route-summary.route-ai { border-color: #9fc2ff; background: #edf4ff; color: #135bb5; }
+.processing-route-summary.route-blocked { border-color: #efc37a; background: #fff7e7; color: #865c0d; }
+.processing-route-shield { font-size: 9px; }
+.processing-route-spinner { width: 10px; height: 10px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: processing-route-spin .7s linear infinite; }
+@keyframes processing-route-spin { to { transform: rotate(360deg); } }
+.processing-route-popover { position: absolute; z-index: 9500; top: calc(100% + 8px); right: 0; width: min(440px, 82vw); max-height: min(720px, 78vh); overflow: auto; border: 1px solid #c9d9ee; border-radius: 14px; background: #fff; box-shadow: 0 20px 50px #173a6b38; padding: 14px; color: #17375f; }
+.processing-route-popover header { display: flex; justify-content: space-between; gap: 10px; border-bottom: 1px solid #e3ebf6; padding-bottom: 10px; }
+.processing-route-popover header p,
+.processing-route-popover section > p { margin: 3px 0; color: #667b98; font-size: 11px; }
+.processing-route-popover header button { border: 1px solid #c8d8ed; border-radius: 8px; background: #fff; padding: 6px 9px; }
+.processing-route-popover section { padding-top: 12px; }
+.processing-route-popover h4 { margin: 0 0 5px; }
+.processing-route-current { font-weight: 750; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.processing-route-explanation { border-radius: 8px; background: #f3f7fd; padding: 8px !important; color: #365a84 !important; }
+.processing-route-error { border: 1px solid #ffc5c5; border-radius: 8px; background: #fff0f0; color: #a72c2c; padding: 8px; font-size: 11px; }
+.processing-route-options { display: grid; gap: 7px; }
+.processing-route-options button { display: flex; flex-direction: column; align-items: flex-start; text-align: left; border: 1px solid #d7e2f1; border-radius: 9px; background: #fff; padding: 8px 10px; color: #1c3d67; }
+.processing-route-options button.active { border-color: #2474e8; background: #edf5ff; box-shadow: 0 0 0 1px #2474e8; }
+.processing-route-options button span { margin-top: 2px; color: #6c7f99; font-size: 10px; font-weight: 400; }
+.processing-route-bulk { border-top: 1px solid #e3ebf6; margin-top: 12px; }
+.processing-route-bulk-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.processing-route-bulk-actions button { border: 1px solid #bfd0e5; border-radius: 8px; background: #f7faff; padding: 7px 9px; color: #274c76; font-size: 10px; font-weight: 700; }
+.processing-route-bulk-actions button.active { border-color: #2474e8; background: #2474e8; color: #fff; }
+.processing-route-popover button:disabled { opacity: .5; cursor: not-allowed; }
+.pdf-page-route-badge { position: absolute; z-index: 3; left: 6px; bottom: 5px; min-width: 24px; border: 1px solid #a9bfdc; border-radius: 999px; background: #f3f7fc; color: #45617f; padding: 2px 5px; text-align: center; font-size: 9px; font-weight: 850; box-shadow: 0 1px 4px #173a6b22; }
+.pdf-page-route-badge.route-deterministic { border-color: #8bc9aa; background: #e7f8ef; color: #156743; }
+.pdf-page-route-badge.route-ai { border-color: #8bb4f6; background: #eaf2ff; color: #135db9; }
+.pdf-page-route-badge.route-blocked { border-color: #e1af5c; background: #fff4de; color: #875b0c; }
+@media (max-width: 850px) {
+  .processing-route-summary { max-width: 150px; }
+  .processing-route-popover { position: fixed; top: 70px; right: 12px; left: 12px; width: auto; }
+}

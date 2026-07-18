@@ -393,13 +393,16 @@ def apply_learned_mappings_to_normalized(normalized: dict[str, Any]) -> dict[str
         desc = str(item.get("description") or "")
         mapping = learned_gl_mapping(vendor_for_gl, desc)
         if mapping:
-            item["gl_account_candidate"] = mapping.get("gl_account") or mapping.get("gl_code") or ""
+            account = validate_gl_account(mapping.get("gl_account") or mapping.get("gl_code") or "")
+            if not account or not is_payable_gl_account(account):
+                continue
+            item["gl_account_candidate"] = account["gl_code"]
             item["gl_mapping_confirmed"] = True
             item["gl_mapping_reason"] = f"User-confirmed mapping: {mapping.get('display_pattern') or mapping.get('pattern')}"
             applied.append({
                 "kind": "gl_mapping",
                 "pattern": mapping.get("display_pattern") or mapping.get("pattern"),
-                "gl_account": mapping.get("gl_account"),
+                "gl_account": account["gl_code"],
                 "line_item_description": desc,
             })
             gl_applied = True
@@ -525,19 +528,25 @@ def _gl_score(desc_norm: str, account: dict[str, str]) -> tuple[float, str]:
     )
     phone_terms = ("telephone", "phone", "voice", "telecom")
     cable_terms = ("cable", "television", "tv")
-    if any(term in desc_norm for term in internet_terms):
+    if any(_contains_normalized_term(desc_norm, term) for term in internet_terms):
         if "internet" in name_norm:
             return 0.94, "Service keyword match: internet/fiber"
-        if "telephone" in name_norm and any(term in desc_norm for term in phone_terms):
+        if "telephone" in name_norm and any(_contains_normalized_term(desc_norm, term) for term in phone_terms):
             return 0.86, "Service keyword match: telecom/phone"
-        if "cable" in name_norm and any(term in desc_norm for term in cable_terms):
+        if "cable" in name_norm and any(_contains_normalized_term(desc_norm, term) for term in cable_terms):
             return 0.84, "Service keyword match: cable"
-    if any(term in desc_norm for term in phone_terms) and "telephone" in name_norm:
+    if any(_contains_normalized_term(desc_norm, term) for term in phone_terms) and "telephone" in name_norm:
         return 0.93, "Service keyword match: telephone"
-    if any(term in desc_norm for term in cable_terms) and "cable" in name_norm:
+    if any(_contains_normalized_term(desc_norm, term) for term in cable_terms) and "cable" in name_norm:
         return 0.92, "Service keyword match: cable"
 
     keyword_map = {
+        "landscap": ("landscape",),
+        "lawn": ("landscape", "lawn", "trees", "shrubs"),
+        "limb": ("landscape", "lawn", "trees", "shrubs"),
+        "tree": ("landscape", "lawn", "trees", "shrubs"),
+        "shrub": ("landscape", "lawn", "trees", "shrubs"),
+        "mow": ("landscape", "lawn"),
         "paint": ("paint", "painting"),
         "hardware": ("hardware", "building", "maintenance", "repair"),
         "bar": ("hardware", "building", "maintenance", "repair"),
@@ -545,6 +554,8 @@ def _gl_score(desc_norm: str, account: dict[str, str]) -> tuple[float, str]:
         "mailbox": ("hardware", "building", "maintenance", "repair"),
         "lock": ("hardware", "building", "maintenance", "repair"),
         "bulb": ("light", "bulb", "fixture"),
+        "light": ("light", "bulb", "fixture"),
+        "lighting": ("light", "bulb", "fixture"),
         "cfl": ("light", "bulb", "fixture"),
         "fixture": ("light", "bulb", "fixture"),
         "water heater": ("water heater", "plumbing"),
@@ -560,12 +571,16 @@ def _gl_score(desc_norm: str, account: dict[str, str]) -> tuple[float, str]:
     }
     for item_key, gl_keys in keyword_map.items():
         if item_key in desc_norm and any(k in name_norm for k in gl_keys):
+            if item_key in {"landscap", "lawn", "limb", "tree", "shrub", "mow"} and account.get("gl_code") == "6810":
+                return 0.94, f"Keyword match: {item_key} + landscape contract"
             if item_key in {"hardware", "bar", "pull", "door", "mailbox", "lock"} and "hardware" in name_norm:
                 return 0.90, f"Keyword match: {item_key} + hardware"
-            if item_key in {"bulb", "cfl", "fixture"} and any(
+            if item_key in {"bulb", "light", "lighting", "cfl", "fixture"} and any(
                 k in name_norm for k in ("light", "bulb", "fixture")
             ):
                 return 0.91, f"Keyword match: {item_key} + lighting"
+            if item_key == "paint" and account.get("gl_code") == "6770":
+                return 0.91, "Keyword match: paint supplies"
             if item_key in {"water heater", "wtr htr", "htr"} and "water heater" in name_norm:
                 return 0.90, f"Keyword match: {item_key} + water heater"
             return 0.82, f"Keyword match: {item_key}"
@@ -578,6 +593,13 @@ def _gl_score(desc_norm: str, account: dict[str, str]) -> tuple[float, str]:
     if score >= 0.38:
         return score, "Description similarity"
     return 0, ""
+
+
+def _contains_normalized_term(haystack: str, term: str) -> bool:
+    needle = normalize_key(term)
+    if not needle:
+        return False
+    return re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", haystack) is not None
 
 
 def _token_overlap(left: str, right: str) -> float:
@@ -595,11 +617,19 @@ def _candidate_from_account(account: dict[str, str], score: float, reason: str) 
         "gl_account": account["gl_code"],
         "gl_code": account["gl_code"],
         "gl_name": account["gl_name"],
+        "gl_account_type": account.get("gl_account_type", ""),
         "score": round(min(score, 0.99), 3),
         "reason": reason,
         "learned": False,
         "valid": True,
     }
+
+
+def is_payable_gl_account(account: dict[str, str]) -> bool:
+    account_type = normalize_key(account.get("gl_account_type", ""))
+    if not account_type:
+        return True
+    return "expense" in account_type and "asset" not in account_type
 
 
 @lru_cache(maxsize=1)
@@ -639,7 +669,7 @@ def _vendor_by_name(name: str) -> dict[str, str] | None:
 
 @lru_cache(maxsize=1)
 def _load_property_rows() -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
+    raw_rows: list[dict[str, str]] = []
     for path in (
         settings.PROJECT_ROOT / "Properties" / "Unit Info Clean.csv",
         settings.PROJECT_ROOT / "Properties" / "Properties.csv",
@@ -660,7 +690,7 @@ def _load_property_rows() -> list[dict[str, str]]:
                     address = str(row.get("Address") or row.get("Service Address") or "").strip()
                     if not abbr and not name:
                         continue
-                    rows.append({
+                    raw_rows.append({
                         "property_abbreviation": abbr,
                         "property_name": name,
                         "location": location,
@@ -668,6 +698,20 @@ def _load_property_rows() -> list[dict[str, str]]:
                     })
         except (OSError, UnicodeDecodeError):
             continue
+    abbreviation_by_name = {
+        normalize_key(row["property_name"]): row["property_abbreviation"]
+        for row in raw_rows
+        if row["property_name"] and row["property_abbreviation"]
+    }
+    rows: list[dict[str, str]] = []
+    for row in raw_rows:
+        enriched = dict(row)
+        if not enriched["property_abbreviation"] and enriched["property_name"]:
+            enriched["property_abbreviation"] = abbreviation_by_name.get(
+                normalize_key(enriched["property_name"]),
+                "",
+            )
+        rows.append(enriched)
     return rows
 
 

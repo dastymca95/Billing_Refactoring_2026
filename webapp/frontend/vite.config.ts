@@ -8,10 +8,12 @@ import react from "@vitejs/plugin-react";
 // Two ways to point the dev proxy at a different backend:
 //   * VITE_API_BASE_URL=http://backend:8000   (Docker compose case —
 //     containers see each other by service name)
-//   * VITE_BACKEND_PORT=8001                  (local dev case — same host)
+//   * VITE_BACKEND_PORT=8002                  (local dev case — same host)
 // `VITE_API_BASE_URL` wins when both are set. Restart Vite after edits.
 const explicitBase = process.env.VITE_API_BASE_URL?.trim();
-const backendPort = process.env.VITE_BACKEND_PORT ?? "8000";
+// The checked-in local launcher serves FastAPI on 8002. Keep this default in
+// sync so a plain `npm run dev` cannot silently proxy to an absent backend.
+const backendPort = process.env.VITE_BACKEND_PORT ?? "8002";
 const proxyTarget = explicitBase || `http://localhost:${backendPort}`;
 
 export default defineConfig({

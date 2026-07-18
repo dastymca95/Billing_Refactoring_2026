@@ -100,3 +100,42 @@ git rm webapp/_phase1d_batch.txt webapp/_phase1d_export.xlsx
 ```
 
 Followed by adding `docs/archive/bootstrap-may-1/README.md` describing each file's original purpose. The moves are tracked by git so history is preserved.
+
+---
+
+# Phase PERF-2 Addendum
+
+> **Run on**: 2026-05-21<br>
+> **Scope**: performance-related cleanup audit only. No source bills, `.env`,
+> `Output/Template.xlsx`, or `Old Scripts/` were modified.
+
+## Safe Moves Performed
+
+No repository files were moved or deleted. Runtime-only temporary profiling
+batches created by `scripts/profile_processing_performance.py` were removed
+from `webapp_data/batches/` after verifying each path resolved under the
+runtime batches directory.
+
+## Files Left Intentionally
+
+| Path | Decision |
+|---|---|
+| `docs/reports/phases/screenshots/phase_perf2/` | Kept as PERF-2 evidence: baseline/current metrics, profile JSON, and QA screenshots. |
+| `tmp_3046895_p1.png`, `tmp_3046895_p2.png`, `tmp_3046912_p1.png`, `tmp_3046912_p2.png` | Left untouched because they pre-existed this phase and may belong to visual debugging. |
+| `webapp/frontend/src/brand-refresh.css` | Left untouched; visual refresh work predates PERF-2. |
+| `webapp_data/` | Runtime data; still ignored by `.gitignore`. |
+
+## Cleanup Opportunities Deferred
+
+| Opportunity | Reason deferred |
+|---|---|
+| Splitting `webapp/frontend/src/styles.css` | The file is large, but PERF-2 prioritized runtime fluidity. CSS module splitting would be high visual-regression risk in this phase. |
+| Removing old phase screenshots | They are report deliverables and should remain available for visual regression comparison. |
+| Deleting old root scratch PNGs | They are untracked/user-adjacent artifacts; not removed without explicit approval. |
+| Pruning stale runtime batches | Not safe to infer which batches are operator data. Only profiler-owned temp batches were removed. |
+
+## Ignore Coverage Verified
+
+`.gitignore` already covers `.env`, `webapp_data/`, frontend build output,
+`node_modules/`, `Output/`, `Training Bills_Invoices/`, and `Old Scripts/`.
+No additional ignore rule was required for PERF-2.

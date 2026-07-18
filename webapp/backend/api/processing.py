@@ -12,9 +12,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import threading
 import traceback
+from datetime import datetime
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -23,13 +28,20 @@ from ..services import (
     batch_store,
     batch_processor,
     cancel_registry,
+    human_adjudication,
     learned_corrections as lc_service,
+    perf_timer,
     processing_queue,
     revisions as revisions_service,
     row_normalizer,
 )
 from ..services.template_rules import get_template_rules
 from ..services.vendor_detection import detect_vendors_for_files
+from ..services.invoice_identity import (
+    build_invoice_identities,
+    invoice_source_file,
+    invoice_source_page,
+)
 
 # Phase 2J — Extraction Trace Overlay
 try:
@@ -126,21 +138,13 @@ def _float_or_none(value) -> float | None:
 
 
 def _invoice_source_file(inv: dict) -> str:
-    debug = inv.get("debug_info") if isinstance(inv.get("debug_info"), dict) else {}
-    for key in ("source_file", "file_name", "filename"):
-        value = inv.get(key) or debug.get(key)
-        if value:
-            return str(value)
-    return ""
+    """Compatibility adapter for callers of the former local helper."""
+    return invoice_source_file(inv)
 
 
 def _invoice_source_page(inv: dict) -> int | None:
-    debug = inv.get("debug_info") if isinstance(inv.get("debug_info"), dict) else {}
-    for key in ("source_page", "source_page_number", "pdf_page_number", "page_number"):
-        page = _int_or_none(inv.get(key) or debug.get(key))
-        if page is not None:
-            return page
-    return None
+    """Compatibility adapter for callers of the former local helper."""
+    return invoice_source_page(inv)
 
 
 def _invoice_total_metadata(inv: dict, raw_rows: list[dict]) -> dict:
@@ -199,35 +203,16 @@ def _preview_rows_with_navigation(result: dict, columns: list[str]) -> list[dict
     navigable without changing vendor extraction or export columns.
     """
     invoices = list(result.get("all_invoices", []) or [])
-    source_counts: dict[str, int] = {}
-    for inv in invoices:
-        source = _invoice_source_file(inv)
-        if source:
-            source_counts[source] = source_counts.get(source, 0) + 1
-
-    source_seen: dict[str, int] = {}
+    identities = build_invoice_identities(invoices)
     out: list[dict] = []
-    for invoice_index, inv in enumerate(invoices):
+    for identity, inv in zip(identities, invoices):
+        invoice_index = identity.invoice_index
         raw_rows = list(inv.get("rows", []) or [])
         invoice_totals = _invoice_total_metadata(inv, raw_rows)
-        source_file = _invoice_source_file(inv)
-        explicit_page = _invoice_source_page(inv)
-        if source_file:
-            source_seen[source_file] = source_seen.get(source_file, 0) + 1
-        fallback_page = (
-            source_seen.get(source_file, 1)
-            if source_file and source_counts.get(source_file, 0) > 1
-            else 1
-        )
-        source_page = explicit_page or fallback_page
-        invoice_number = str(inv.get("invoice_number") or "").strip()
-        invoice_group_id = "::".join(
-            [
-                source_file or "unknown-file",
-                f"page-{source_page}",
-                invoice_number or f"invoice-{invoice_index + 1}",
-            ]
-        )
+        source_file = identity.source_file
+        source_page = identity.source_page
+        invoice_number = identity.invoice_number
+        invoice_group_id = identity.group_id
 
         for invoice_row_index, row in enumerate(raw_rows):
             padded = _pad_row_to_template(row, columns)
@@ -243,6 +228,9 @@ def _preview_rows_with_navigation(result: dict, columns: list[str]) -> list[dict
                     provenance = {}
                 provenance = {**invoice_totals, **provenance}
                 meta["ai_provenance"] = provenance
+            validation = inv.get("validation_summary") if isinstance(inv.get("validation_summary"), dict) else {}
+            if "total_reconciliation_passed" in validation:
+                meta["total_reconciliation_passed"] = validation.get("total_reconciliation_passed")
             meta["invoice_index"] = invoice_index
             meta["invoice_row_index"] = invoice_row_index
             meta["row_index"] = len(out)
@@ -360,12 +348,13 @@ def _record_revision_for_result(batch_id: str, result: dict) -> None:
     failure to record the revision must never poison the live preview
     cache the operator already has."""
     try:
-        revisions_service.record_revision(
-            batch_id,
-            result=result,
-            export_name=_read_export_name_from_metadata(batch_id),
-            status="completed",
-        )
+        with perf_timer.perf_step("revision.write", batch_id=batch_id):
+            revisions_service.record_revision(
+                batch_id,
+                result=result,
+                export_name=_read_export_name_from_metadata(batch_id),
+                status="completed",
+            )
     except Exception:  # pragma: no cover - belt-and-braces
         _LOG.exception("Could not record revision for %s", batch_id)
 
@@ -384,6 +373,20 @@ def _source_file_name(item: dict | None) -> str:
     return ""
 
 
+def _source_page_number(item: dict | None) -> int | None:
+    """Return the source page carried by an invoice/review payload."""
+    if not isinstance(item, dict):
+        return None
+    debug = item.get("debug_info") if isinstance(item.get("debug_info"), dict) else {}
+    meta = item.get("_meta") if isinstance(item.get("_meta"), dict) else {}
+    for payload in (item, debug, meta):
+        for key in ("source_page", "source_page_number", "pdf_page_number", "page_number"):
+            page = _int_or_none(payload.get(key))
+            if page is not None:
+                return page
+    return None
+
+
 def _source_file_count(items: list[dict]) -> int:
     return len({
         src for src in (_source_file_name(item) for item in items) if src
@@ -392,6 +395,13 @@ def _source_file_count(items: list[dict]) -> int:
 
 def _is_payload_for_file(item: dict | None, filename: str) -> bool:
     return _source_file_name(item) == Path(filename).name
+
+
+def _is_payload_for_file_page(item: dict | None, filename: str, page: int) -> bool:
+    return (
+        _source_file_name(item) == Path(filename).name
+        and _source_page_number(item) == page
+    )
 
 
 def _row_count(invoices: list[dict]) -> int:
@@ -557,6 +567,91 @@ def _merge_single_file_result(batch_id: str, filename: str, fresh: dict) -> dict
     return merged
 
 
+def _merge_single_page_result(
+    batch_id: str,
+    filename: str,
+    page: int,
+    fresh: dict,
+) -> dict:
+    """Add/replace one extracted PDF page without discarding sibling pages."""
+    target = Path(filename).name
+    try:
+        cache_path = _result_cache_path(batch_id)
+        if not cache_path.is_file():
+            return _mark_single_page_result(batch_id, target, page, fresh)
+        with open(cache_path, "r", encoding="utf-8") as f:
+            existing = json.load(f) or {}
+    except Exception:
+        return _mark_single_page_result(batch_id, target, page, fresh)
+
+    merged = dict(existing)
+    merged["batch_id"] = batch_id
+    merged["scope"] = {
+        "type": "template",
+        "last_added_file": target,
+        "last_added_page": page,
+    }
+    merged["all_invoices"] = [
+        *[
+            inv for inv in (existing.get("all_invoices") or [])
+            if not _is_payload_for_file_page(inv, target, page)
+        ],
+        *list(fresh.get("all_invoices") or []),
+    ]
+    merged["all_manual_review"] = [
+        *[
+            item for item in (existing.get("all_manual_review") or [])
+            if not _is_payload_for_file_page(item, target, page)
+        ],
+        *list(fresh.get("all_manual_review") or []),
+    ]
+    merged["unsupported_files"] = _dedupe_unsupported_files([
+        *[
+            item for item in (existing.get("unsupported_files") or [])
+            if not _is_payload_for_file_page(item, target, page)
+        ],
+        *list(fresh.get("unsupported_files") or []),
+    ])
+
+    detection = dict(existing.get("detection") or {})
+    detection.update(fresh.get("detection") or {})
+    merged["detection"] = detection
+
+    by_vendor: dict[str, dict] = {}
+    for vendor_key, payload in (existing.get("by_vendor") or {}).items():
+        payload = dict(payload or {})
+        payload["invoices"] = [
+            inv for inv in (payload.get("invoices") or [])
+            if not _is_payload_for_file_page(inv, target, page)
+        ]
+        payload["manual_review_rows"] = [
+            item for item in (payload.get("manual_review_rows") or [])
+            if not _is_payload_for_file_page(item, target, page)
+        ]
+        if payload["invoices"] or payload["manual_review_rows"]:
+            by_vendor[vendor_key] = _refresh_vendor_summary(payload)
+
+    for vendor_key, fresh_payload in (fresh.get("by_vendor") or {}).items():
+        fresh_payload = dict(fresh_payload or {})
+        payload = dict(by_vendor.get(vendor_key) or {})
+        for key, value in fresh_payload.items():
+            if key not in {"invoices", "manual_review_rows", "summary"}:
+                payload[key] = value
+        payload["invoices"] = [
+            *list(payload.get("invoices") or []),
+            *list(fresh_payload.get("invoices") or []),
+        ]
+        payload["manual_review_rows"] = [
+            *list(payload.get("manual_review_rows") or []),
+            *list(fresh_payload.get("manual_review_rows") or []),
+        ]
+        by_vendor[vendor_key] = _refresh_vendor_summary(payload)
+
+    merged["by_vendor"] = by_vendor
+    _recompute_template_summary(merged, scope="template")
+    return merged
+
+
 def _mark_single_file_result(batch_id: str, filename: str, result: dict) -> dict:
     """Stamp a single-file run as an isolated template revision."""
     target = Path(filename).name
@@ -573,6 +668,34 @@ def _mark_single_file_result(batch_id: str, filename: str, result: dict) -> dict
     summary.update({
         "scope": "file",
         "source_file": target,
+        "files_total": max(1, source_count + len(unsupported)),
+        "files_supported": source_count,
+        "files_unsupported": len(unsupported),
+        "invoices_total": len(invoices),
+        "manual_review_total": len(review),
+    })
+    result["summary"] = summary
+    return result
+
+
+def _mark_single_page_result(batch_id: str, filename: str, page: int, result: dict) -> dict:
+    """Stamp a page-only run as an isolated template revision."""
+    target = Path(filename).name
+    result["batch_id"] = batch_id
+    result["scope"] = {
+        "type": "page",
+        "source_file": target,
+        "source_page": page,
+    }
+    summary = dict(result.get("summary") or {})
+    invoices = list(result.get("all_invoices") or [])
+    review = list(result.get("all_manual_review") or [])
+    unsupported = list(result.get("unsupported_files") or [])
+    source_count = _source_file_count(invoices) or (0 if unsupported else 1)
+    summary.update({
+        "scope": "page",
+        "source_file": target,
+        "source_page": page,
         "files_total": max(1, source_count + len(unsupported)),
         "files_supported": source_count,
         "files_unsupported": len(unsupported),
@@ -618,6 +741,8 @@ def _stamp_cancelled(batch_id: str) -> None:
         progress_path = batch_store.get_batch_dir(batch_id) / "progress.json"
         t = ProgressTracker(progress_path, batch_id=batch_id)
         t.cancelled()
+        perf_timer.record(batch_id, "cancel.settled", 0.0)
+        perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
         return
     except Exception:
         pass
@@ -631,8 +756,103 @@ def _stamp_cancelled(batch_id: str) -> None:
         snap["percent"] = 100.0
         snap["current_step"] = "Processing cancelled"
         progress_path.write_text(json.dumps(snap, indent=2), encoding="utf-8")
+        perf_timer.record(batch_id, "cancel.settled", 0.0, meta={"fallback": True})
+        perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
     except Exception:
         pass
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name: str | None = None
+    with tempfile.NamedTemporaryFile(
+        "w",
+        dir=str(path.parent),
+        prefix=".progress_",
+        suffix=".tmp",
+        encoding="utf-8",
+        delete=False,
+    ) as tmp:
+        json.dump(payload, tmp, indent=2)
+        tmp_name = tmp.name
+    try:
+        os.replace(tmp_name, path)
+    except Exception:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        raise
+
+
+def _invalidate_batch_summary_cache(batch_id: str) -> None:
+    """Drop list-view summary counts after a preview cache rewrite.
+
+    `GET /api/batches/{id}` rebuilds this from `_webapp_result.json`. If we
+    leave the old metadata cache around after reprocessing an appended PDF, the
+    batch dropdown can keep showing the previous invoice/row counts.
+    """
+
+    try:
+        meta_path = batch_store.get_batch_dir(batch_id) / "batch_metadata.json"
+        if not meta_path.is_file():
+            return
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) or {}
+        if "summary_cache" not in meta:
+            return
+        meta.pop("summary_cache", None)
+        _atomic_write_json(meta_path, meta)
+    except Exception:
+        _LOG.debug("Could not invalidate summary cache for %s", batch_id, exc_info=True)
+
+
+def _stamp_completed_after_cache(batch_id: str, result: dict) -> None:
+    """Mark progress completed only after preview cache/revision writes land."""
+    try:
+        progress_path = batch_store.get_batch_dir(batch_id) / "progress.json"
+        snap: dict = {}
+        if progress_path.is_file():
+            try:
+                snap = json.loads(progress_path.read_text(encoding="utf-8")) or {}
+            except (OSError, ValueError):
+                snap = {}
+        summary = result.get("summary") or {}
+        invoices = result.get("all_invoices") or []
+        review = result.get("all_manual_review") or []
+        now = datetime.now().isoformat(timespec="seconds")
+        rows_created = sum(len((inv or {}).get("rows") or []) for inv in invoices)
+        files_total = int(summary.get("files_total") or snap.get("files_total") or 0)
+        for stage in snap.get("stages") or []:
+            if not isinstance(stage, dict):
+                continue
+            if stage.get("status") == "running":
+                stage["status"] = "completed"
+                stage["completed_at"] = now
+            if stage.get("key") == "ready":
+                stage["status"] = "completed"
+                stage["percent"] = 100.0
+                stage["completed_at"] = stage.get("completed_at") or now
+        snap.update(
+            {
+                "batch_id": batch_id,
+                "status": "completed",
+                "percent": 100.0,
+                "current_step": "Done",
+                "current_file": "",
+                "files_total": files_total,
+                "files_done": files_total,
+                "invoices_created": len(invoices),
+                "rows_created": rows_created,
+                "warnings_count": len(review),
+                "error_message": "",
+                "updated_at": now,
+            }
+        )
+        snap.setdefault("started_at", now)
+        _atomic_write_json(progress_path, snap)
+    except Exception:
+        _LOG.exception("Could not stamp completed progress for %s", batch_id)
 
 
 def _run_batch_in_background(batch_id: str) -> None:
@@ -647,11 +867,19 @@ def _run_batch_in_background(batch_id: str) -> None:
     Whatever the vendor processor managed to produce before the cancel
     checkpoint is logged but not persisted as a workspace state.
     """
+    perf_timer.record(batch_id, "queue.runner_start", 0.0)
+    try:
+        perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
+    except Exception:
+        pass
     try:
         if extraction_trace is not None:
             extraction_trace.start_batch(batch_id)
         try:
-            result = batch_processor.process_batch(batch_id)
+            result = batch_processor.process_batch(
+                batch_id,
+                finalize_progress=False,
+            )
         finally:
             # Persist whatever traces were captured, even on failure —
             # partial traces are useful when triaging a bad run.
@@ -678,18 +906,34 @@ def _run_batch_in_background(batch_id: str) -> None:
         # corrections layer so an operator-saved override always wins
         # over the defaults.
         try:
-            row_normalizer.normalize_result(result)
+            with perf_timer.perf_step("validation.row_normalizer", batch_id=batch_id):
+                row_normalizer.normalize_result(result)
         except Exception:  # pragma: no cover
             _LOG.exception("row normalizer failed")
         # Phase 2K — apply learned-correction value overrides BEFORE
         # writing the cache so the preview reflects the user's curated
         # state on first paint (no flicker, no separate refresh).
-        _apply_learned_corrections_to_result(result)
+        with perf_timer.perf_step("validation.learned_corrections", batch_id=batch_id):
+            _apply_learned_corrections_to_result(result)
+        # Human-approved assistant corrections are private runtime overlays.
+        # They are replayed after fresh extraction and re-enter V2 as candidates;
+        # they never bypass AccountingDecisionEngine or readiness.
+        from ..services import approved_invoice_corrections
+        with perf_timer.perf_step("validation.approved_invoice_corrections", batch_id=batch_id):
+            approved_invoice_corrections.apply_to_result(result, batch_id=batch_id)
+        from ..services import human_adjudication
+        with perf_timer.perf_step("validation.human_adjudication", batch_id=batch_id):
+            human_adjudication.apply_to_result(result, batch_id=batch_id)
         cache_path = _result_cache_path(batch_id)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, default=str, indent=2)
+        with perf_timer.perf_step("preview.cache_write", batch_id=batch_id):
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, default=str, indent=2)
+        _invalidate_batch_summary_cache(batch_id)
         _record_revision_for_result(batch_id, result)
+        with perf_timer.perf_step("progress.final_stamp", batch_id=batch_id):
+            _stamp_completed_after_cache(batch_id, result)
+        perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
     except Exception as e:
         _LOG.exception("Background batch processing failed for %s", batch_id)
         # Best-effort: stamp progress.json with failure so the polling
@@ -704,6 +948,96 @@ def _run_batch_in_background(batch_id: str) -> None:
     finally:
         with _RUNNING_LOCK:
             _RUNNING.pop(batch_id, None)
+
+
+def _resolve_batch_input_file(batch_id: str, filename: str) -> Path:
+    try:
+        in_dir = batch_store.get_input_dir(batch_id).resolve()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
+    safe_name = Path(filename).name
+    if not safe_name or safe_name in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    target = (in_dir / safe_name).resolve()
+    try:
+        target.relative_to(in_dir)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Path traversal blocked")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found in batch: {safe_name}")
+    return target
+
+
+def _create_single_page_input(batch_id: str, filename: str, page: int) -> Path:
+    source = _resolve_batch_input_file(batch_id, filename)
+    if source.suffix.lower() != ".pdf":
+        raise HTTPException(
+            status_code=415,
+            detail="Page-level processing is only available for PDFs.",
+        )
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="PDF page processing is not available on this backend.",
+        )
+
+    try:
+        reader = PdfReader(str(source))
+        page_count = len(reader.pages)
+        if page < 1 or page > page_count:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Page {page} is outside this document's {page_count} pages.",
+            )
+        writer = PdfWriter()
+        writer.add_page(reader.pages[page - 1])
+        temp_name = f".__page_process__{uuid4().hex}_{source.stem[:64]}_p{page}.pdf"
+        temp_path = source.with_name(temp_name)
+        with open(temp_path, "wb") as out:
+            writer.write(out)
+        return temp_path
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not isolate PDF page: {type(exc).__name__}",
+        )
+
+
+def _remap_single_page_result_sources(
+    payload: dict,
+    *,
+    temp_filename: str,
+    source_filename: str,
+    source_page: int,
+) -> dict:
+    target = Path(source_filename).name
+    temp = Path(temp_filename).name
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            matched_source = False
+            for key in ("source_file", "file_name", "filename"):
+                if Path(str(value.get(key) or "")).name == temp:
+                    value[key] = target
+                    matched_source = True
+            if matched_source or _source_file_name(value) == target:
+                value["source_page"] = source_page
+            for nested in value.values():
+                walk(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                walk(nested)
+
+    walk(payload)
+    detection = payload.get("detection")
+    if isinstance(detection, dict) and temp in detection:
+        page_detection = detection.pop(temp)
+        detection[target] = page_detection
+    return payload
 
 
 @router.post("/{batch_id}/detect")
@@ -721,6 +1055,7 @@ def process_endpoint(
     sync: bool = False,
     file: str | None = None,
     file_mode: str = "replace",
+    page: int | None = None,
 ) -> dict:
     """Kick off batch processing.
 
@@ -742,7 +1077,16 @@ def process_endpoint(
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
 
-    # Single-file path forces sync regardless of the ``sync`` flag.
+    if page is not None:
+        if not file:
+            raise HTTPException(
+                status_code=400,
+                detail="Page processing requires a filename.",
+            )
+        if page < 1:
+            raise HTTPException(status_code=400, detail="Invalid page number.")
+
+    # Single-file/page path forces sync regardless of the ``sync`` flag.
     if file:
         sync = True
         if file_mode not in {"replace", "merge"}:
@@ -752,12 +1096,21 @@ def process_endpoint(
             )
 
     if sync:
+        processing_file = file
+        page_temp_path: Path | None = None
+        if file and page is not None:
+            page_temp_path = _create_single_page_input(batch_id, file, page)
+            processing_file = page_temp_path.name
+
         if extraction_trace is not None:
             extraction_trace.start_batch(batch_id)
         try:
             try:
                 result = batch_processor.process_batch(
-                    batch_id, only_filename=file,
+                    batch_id,
+                    only_filename=processing_file,
+                    route_filename=file,
+                    route_page=page,
                 )
             except FileNotFoundError as e:
                 raise HTTPException(status_code=404, detail=str(e))
@@ -771,6 +1124,11 @@ def process_endpoint(
                 finally:
                     extraction_trace.end_batch(batch_id)
                     extraction_trace.clear_batch(batch_id)
+            if page_temp_path is not None:
+                try:
+                    page_temp_path.unlink(missing_ok=True)
+                except OSError:
+                    _LOG.warning("Could not remove temporary page file %s", page_temp_path)
         # Phase 2L — cross-vendor row normalisation: canonical Vendor
         # name from Vendor List.csv, sentence-case descriptions, and
         # dates parsed into ISO strings (the workbook writer turns
@@ -778,26 +1136,49 @@ def process_endpoint(
         # corrections layer so an operator-saved override always wins
         # over the defaults.
         try:
-            row_normalizer.normalize_result(result)
+            with perf_timer.perf_step("validation.row_normalizer", batch_id=batch_id):
+                row_normalizer.normalize_result(result)
         except Exception:  # pragma: no cover
             _LOG.exception("row normalizer failed")
         # Phase 2K — apply learned-correction value overrides BEFORE
         # writing the cache so the preview reflects the user's curated
         # state on first paint (no flicker, no separate refresh).
-        _apply_learned_corrections_to_result(result)
-        if file:
+        with perf_timer.perf_step("validation.learned_corrections", batch_id=batch_id):
+            _apply_learned_corrections_to_result(result)
+        if file and page is not None and page_temp_path is not None:
+            result = _remap_single_page_result_sources(
+                result,
+                temp_filename=page_temp_path.name,
+                source_filename=file,
+                source_page=page,
+            )
+            result = (
+                _merge_single_page_result(batch_id, file, page, result)
+                if file_mode == "merge"
+                else _mark_single_page_result(batch_id, file, page, result)
+            )
+        elif file:
             result = (
                 _merge_single_file_result(batch_id, file, result)
                 if file_mode == "merge"
                 else _mark_single_file_result(batch_id, file, result)
             )
+        from ..services import approved_invoice_corrections
+        with perf_timer.perf_step("validation.approved_invoice_corrections", batch_id=batch_id):
+            approved_invoice_corrections.apply_to_result(result, batch_id=batch_id)
+        from ..services import human_adjudication
+        with perf_timer.perf_step("validation.human_adjudication", batch_id=batch_id):
+            human_adjudication.apply_to_result(result, batch_id=batch_id)
         cache_path = _result_cache_path(batch_id)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, default=str, indent=2)
+        with perf_timer.perf_step("preview.cache_write", batch_id=batch_id):
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, default=str, indent=2)
+        _invalidate_batch_summary_cache(batch_id)
         # Phase 2D — sync runs (used by tests + CLI-style smokes) also
         # produce a revision so the UI sees them.
         _record_revision_for_result(batch_id, result)
+        perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
         return result
 
     # Phase 2D — submit to the cross-batch queue. Only one batch processes
@@ -805,6 +1186,8 @@ def process_endpoint(
     # start automatically when the running batch finishes. The legacy
     # per-batch `_RUNNING` dict is kept for compatibility (cancel paths
     # and tests still touch it), but the queue is the source of truth.
+    perf_timer.record(batch_id, "queue.submitted", 0.0)
+    perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
     submission = processing_queue.submit(
         batch_id, runner=_run_batch_in_background
     )
@@ -848,7 +1231,9 @@ def performance_endpoint(batch_id: str) -> dict:
     # Live in-memory timings take priority — they reflect the active run.
     live_summary = perf_timer.summarize(batch_id)
     persisted: dict[str, Any] | None = None
-    persisted_path = bdir / "audit" / "performance.json"
+    audit_dir = bdir / "audit"
+    persisted_path = audit_dir / "performance.json"
+    persisted_jsonl_path = audit_dir / "performance.jsonl"
     if persisted_path.is_file():
         try:
             with open(persisted_path, "r", encoding="utf-8") as f:
@@ -860,6 +1245,11 @@ def performance_endpoint(batch_id: str) -> dict:
         "batch_id": batch_id,
         "live": live_summary if live_summary["step_count"] else None,
         "persisted": persisted,
+        "events": perf_timer.read_jsonl(persisted_jsonl_path, limit=500),
+        "paths": {
+            "json": str(persisted_path) if persisted_path.is_file() else None,
+            "jsonl": str(persisted_jsonl_path) if persisted_jsonl_path.is_file() else None,
+        },
     }
     # OCR cache stats — useful to know how often the cache is hitting.
     try:
@@ -881,16 +1271,41 @@ def preview_endpoint(batch_id: str) -> dict:
             status_code=404,
             detail="No preview available — run POST /process first.",
         )
-    with open(cache_path, "r", encoding="utf-8") as f:
-        result = json.load(f)
+    with perf_timer.perf_step("preview.cache_read", batch_id=batch_id):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            result = json.load(f)
     try:
-        row_normalizer.normalize_result(result)
+        with perf_timer.perf_step("preview.normalize", batch_id=batch_id):
+            row_normalizer.normalize_result(result)
     except Exception:  # pragma: no cover - preview should stay available
         _LOG.exception("Could not normalize cached preview for %s", batch_id)
 
-    rules = get_template_rules()
+    with perf_timer.perf_step("preview.template_rules", batch_id=batch_id):
+        rules = get_template_rules()
     columns = rules["columns"]
-    rows = _preview_rows_with_navigation(result, columns)
+    with perf_timer.perf_step(
+        "preview.build_rows",
+        batch_id=batch_id,
+        meta={"invoices": len(result.get("all_invoices", []) or [])},
+    ):
+        rows = _preview_rows_with_navigation(result, columns)
+    from ..services import accounting_readiness
+    readiness = accounting_readiness.evaluate_and_record(batch_id, rows)
+    invoice_readiness: dict[str, dict] = {}
+    invoice_groups: dict[str, list[dict]] = {}
+    for row in rows:
+        meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+        group_id = str(meta.get("invoice_group_id") or row.get("Invoice Number") or "unknown")
+        invoice_groups.setdefault(group_id, []).append(row)
+    for group_id, group_rows in invoice_groups.items():
+        decision = accounting_readiness.evaluate_rows(group_rows)
+        invoice_readiness[group_id] = accounting_readiness.as_dict(decision)
+        for row in group_rows:
+            meta = row.setdefault("_meta", {})
+            if isinstance(meta, dict):
+                meta["readiness_snapshot_id"] = decision.snapshot_id
+                meta["readiness_status"] = decision.status.value
+    perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
 
     return {
         "batch_id": batch_id,
@@ -908,6 +1323,8 @@ def preview_endpoint(batch_id: str) -> dict:
         "invoice_count": len(result.get("all_invoices", [])),
         "row_count": len(rows),
         "unsupported_files": result.get("unsupported_files", []),
+        "accounting_readiness": accounting_readiness.as_dict(readiness),
+        "invoice_readiness": invoice_readiness,
     }
 
 
@@ -934,12 +1351,16 @@ def cancel_endpoint(batch_id: str) -> dict:
     # then fall through to the legacy in-process tracker flag.
     q_result = processing_queue.cancel(batch_id)
     if q_result.get("result") == "removed_from_queue":
+        perf_timer.record(batch_id, "cancel.removed_from_queue", 0.0)
+        perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
         return {
             "batch_id": batch_id,
             "status": "removed_from_queue",
             "message": "Removed from the processing queue.",
         }
     if q_result.get("result") == "cancel_requested":
+        perf_timer.record(batch_id, "cancel.requested", 0.0, meta={"source": "queue"})
+        perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
         return {
             "batch_id": batch_id,
             "status": "cancelling",
@@ -948,11 +1369,15 @@ def cancel_endpoint(batch_id: str) -> dict:
 
     flagged = cancel_registry.request_cancel(batch_id)
     if not flagged:
+        perf_timer.record(batch_id, "cancel.no_active_run", 0.0)
+        perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
         return {
             "batch_id": batch_id,
             "status": "no_active_run",
             "message": "No active processing thread for this batch.",
         }
+    perf_timer.record(batch_id, "cancel.requested", 0.0, meta={"source": "registry"})
+    perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
     return {
         "batch_id": batch_id,
         "status": "cancelling",
@@ -971,14 +1396,18 @@ def manual_review_endpoint(batch_id: str) -> dict:
             status_code=404,
             detail="No manual-review data available — run POST /process first.",
         )
-    with open(cache_path, "r", encoding="utf-8") as f:
-        result = json.load(f)
+    with perf_timer.perf_step("manual_review.cache_read", batch_id=batch_id):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            result = json.load(f)
     try:
-        row_normalizer.normalize_result(result)
+        with perf_timer.perf_step("manual_review.normalize", batch_id=batch_id):
+            row_normalizer.normalize_result(result)
     except Exception:  # pragma: no cover - review should stay available
         _LOG.exception("Could not normalize cached manual review for %s", batch_id)
-    items = list(result.get("all_manual_review") or [])
-    items.extend(_row_contract_manual_review_items(result))
+    with perf_timer.perf_step("manual_review.build_items", batch_id=batch_id):
+        items = list(result.get("all_manual_review") or [])
+        items.extend(_row_contract_manual_review_items(result))
+    perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
     return {"batch_id": batch_id, "items": items}
 
 
@@ -994,11 +1423,31 @@ def list_revisions_endpoint(batch_id: str) -> dict:
         batch_store.get_batch_dir(batch_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
-    items = revisions_service.list_revisions(batch_id)
+    with perf_timer.perf_step("revision.list", batch_id=batch_id):
+        items = revisions_service.list_revisions(batch_id)
+        current_revision_id = revisions_service.current_revision_id(batch_id)
+    perf_timer.flush_to_disk(batch_id, batch_store.get_batch_dir(batch_id) / "audit")
     return {
         "batch_id": batch_id,
-        "current_revision_id": revisions_service.current_revision_id(batch_id),
+        "current_revision_id": current_revision_id,
         "revisions": items,
+    }
+
+
+@router.get("/{batch_id}/activity")
+def list_activity_endpoint(batch_id: str, invoice_group_id: str | None = None, limit: int = 500) -> dict:
+    try:
+        batch_store.get_batch_dir(batch_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Batch not found: {batch_id}")
+    from ..services import operator_activity_log
+
+    events = operator_activity_log.list_events(
+        batch_id=batch_id, invoice_group_id=invoice_group_id, limit=limit,
+    )
+    return {
+        "contract_version": operator_activity_log.ACTIVITY_CONTRACT_VERSION,
+        "items": [event.model_dump(mode="json") for event in events],
     }
 
 
@@ -1033,6 +1482,7 @@ class SaveEditsRequest(BaseModel):
     """
 
     edits: dict[str, dict[str, object]] = Field(default_factory=dict)
+    adjudication: human_adjudication.AdjudicationOptions | None = None
 
 
 @router.post("/{batch_id}/save-edits")
@@ -1081,19 +1531,88 @@ def save_edits_endpoint(batch_id: str, body: SaveEditsRequest) -> dict:
 
     applied = 0
     skipped = 0
-    flat_index = 0
-    for inv in result.get("all_invoices", []) or []:
-        rows = inv.get("rows") or []
-        for row in rows:
-            patch = edits_by_idx.get(flat_index)
-            if patch:
-                for col, val in patch.items():
-                    if not isinstance(col, str):
-                        skipped += 1
-                        continue
-                    row[col] = val
-                    applied += 1
-            flat_index += 1
+    audit_changes: list[dict[str, object]] = []
+    adjudication_report: human_adjudication.AdjudicationApplyReport | None = None
+    if body.adjudication is not None:
+        try:
+            actor = human_adjudication.runtime_actor_context()
+            adjudication_report = human_adjudication.record_manual_edits(
+                result=result,
+                batch_id=batch_id,
+                edits_by_index=edits_by_idx,
+                options=body.adjudication,
+                actor=actor,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        applied = adjudication_report.recorded
+        revisions_by_id = {
+            item.revision_id: item
+            for item in human_adjudication.list_revisions(actor.tenant_id, batch_id=batch_id)
+        }
+        for revision_id in adjudication_report.revision_ids[:250]:
+            revision = revisions_by_id.get(revision_id)
+            if revision is None:
+                continue
+            audit_changes.append({
+                "row_index": revision.global_row_index,
+                "invoice_group_id": revision.invoice_group_id,
+                "field": revision.field,
+                "before": revision.previous_value,
+                "after": revision.corrected_value,
+                "adjudication_revision_id": revision.revision_id,
+            })
+    else:
+        # Backward-compatible adapter for older clients. The current Invoice
+        # Processor always sends the adjudication contract; legacy callers
+        # retain invoice-only save behavior until migrated.
+        flat_index = 0
+        for inv in result.get("all_invoices", []) or []:
+            rows = inv.get("rows") or []
+            for row in rows:
+                patch = edits_by_idx.get(flat_index)
+                if patch:
+                    for col, val in patch.items():
+                        if not isinstance(col, str):
+                            skipped += 1
+                            continue
+                        if col == "GL Account":
+                            meta = row.setdefault("_meta", {})
+                            if isinstance(meta, dict):
+                                meta["approved_operator_gl_candidate"] = str(val or "").strip()
+                        before = row.get(col)
+                        row[col] = val
+                        applied += 1
+                        if len(audit_changes) < 250:
+                            meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+                            audit_changes.append({
+                                "row_index": flat_index,
+                                "invoice_group_id": str(meta.get("invoice_group_id") or "") or None,
+                                "field": col,
+                                "before": before if isinstance(before, (str, int, float, bool)) or before is None else str(before),
+                                "after": val if isinstance(val, (str, int, float, bool)) or val is None else str(val),
+                            })
+                flat_index += 1
+
+    # Any persisted edit can change semantic context or invalidate a previous
+    # GL decision. Re-run only the accounting bridge over existing extracted
+    # facts; this does not repeat OCR/Vision extraction and only the bounded
+    # unknown-semantics gateway may call AI.
+    if applied and body.adjudication is None:
+        from ..services.accounting_integration_bridges import RowAccountingV2Adapter
+
+        for invoice_index, inv in enumerate(result.get("all_invoices", []) or []):
+            rows = inv.get("rows") or []
+            if not rows:
+                continue
+            source_file = str(inv.get("source_file") or ((rows[0].get("_meta") or {}).get("source_file")
+                              if isinstance(rows[0].get("_meta"), dict) else "") or batch_id)
+            RowAccountingV2Adapter().enrich_rows(rows, {
+                "document_id": source_file,
+                "extraction_route": "operator_edit_accounting_refresh",
+            })
 
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump(result, f, default=str, indent=2)
@@ -1113,11 +1632,63 @@ def save_edits_endpoint(batch_id: str, body: SaveEditsRequest) -> dict:
                 batch_id,
             )
 
+    if applied:
+        from ..services import operator_activity_log
+        operator_activity_log.record(
+            batch_id=batch_id,
+            event_type=("human_adjudication_saved" if adjudication_report else "manual_edits_saved"),
+            source="manual",
+            actor=(actor.reviewer_id if adjudication_report else "local_operator"),
+            summary=(
+                f"Saved {applied} evidence-backed human adjudication"
+                f"{'s' if applied != 1 else ''}."
+                if adjudication_report else
+                f"Saved {applied} manual cell change{'s' if applied != 1 else ''}."
+            ),
+            details={
+                "changes": audit_changes,
+                "skipped": skipped,
+                "adjudication": (
+                    adjudication_report.model_dump(mode="json")
+                    if adjudication_report else None
+                ),
+            },
+        )
+        if adjudication_report:
+            scoped_events = (
+                ("benchmark_submission", "manual", adjudication_report.benchmark_submissions,
+                 "Submitted human corrections for benchmark approval."),
+                ("learning_examples_approved", "manual", adjudication_report.learning_approvals,
+                 "Approved tenant-private learning examples."),
+                ("reusable_rule_proposals_created", "rule", adjudication_report.rule_proposals,
+                 "Created reusable accounting rule proposals; none were activated."),
+            )
+            for event_type, source, count, summary in scoped_events:
+                if not count:
+                    continue
+                operator_activity_log.record(
+                    batch_id=batch_id,
+                    event_type=event_type,
+                    source=source,
+                    actor=actor.reviewer_id,
+                    summary=summary,
+                    details={
+                        "count": count,
+                        "revision_ids": adjudication_report.revision_ids,
+                        "tenant_id": actor.tenant_id,
+                    },
+                )
+
     return {
         "batch_id": batch_id,
         "applied": applied,
         "skipped": skipped,
         "current_revision_id": current,
+        "accounting_refreshed": bool(applied),
+        "adjudication": (
+            adjudication_report.model_dump(mode="json")
+            if adjudication_report else None
+        ),
     }
 
 

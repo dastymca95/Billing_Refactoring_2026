@@ -125,6 +125,8 @@ test("AI-9 file rows show normalized ingestion support badges and preview metada
     await page.evaluate((id) => localStorage.setItem("billing_refactoring_active_batch_id", id), batchId);
     await page.reload();
     await expect(page.getByText("QA AI9 Ingestion")).toBeVisible();
+    await page.getByTestId("template-batch-selector").click();
+    await expect(page.getByTestId("batch-explorer")).toBeVisible();
     const toggle = page.locator(`[data-batch-id="${batchId}"] [data-testid="explorer-batch-toggle"]`).first();
     if ((await toggle.getAttribute("aria-expanded")) !== "true") {
       await toggle.click();

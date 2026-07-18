@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -109,6 +110,15 @@ CASES: list[UtilityE2ECase] = [
         require_rows=True,
         allow_manual_review=False,
         note="Image OCR route check. The deterministic Weakley parser should recover validated rows from the known QA image.",
+    ),
+    UtilityE2ECase(
+        key="weakley_outdoor_lights",
+        label="Weakley outdoor lights bill",
+        expected_vendor_key="weakley_county_municipal_electric_system",
+        relative_sample="Electricity - Power/Weakley County Municipal Electric System/Bills_Training/202184-132786 Apr 26.pdf",
+        require_rows=True,
+        allow_manual_review=False,
+        note="Outdoor lighting and pole-charge rows must code to Electric - Common Areas, not Electric - Vacant.",
     ),
 ]
 
@@ -262,6 +272,10 @@ def _validate_case(
         if validation.warnings:
             warnings.append(f"{case.label}: row warnings: {validation.warnings}")
         _validate_invoice_totals(case, invoices, failures, warnings)
+        if case.key == "clarksville_gas_water":
+            _validate_clarksville_case(rows, failures)
+        if case.key == "weakley_outdoor_lights":
+            _validate_weakley_outdoor_lights_case(rows, invoices, failures)
         if case.community_master:
             _validate_community_case(case, invoices, failures)
 
@@ -326,6 +340,44 @@ def _validate_community_case(
         if numbers != expected:
             failures.append(
                 f"{case.label}: invoice {inv_index} line item numbering is {numbers}, expected {expected}"
+            )
+
+
+def _validate_clarksville_case(rows: list[dict[str, Any]], failures: list[str]) -> None:
+    for idx, row in enumerate(rows, start=1):
+        invoice_number = str(row.get("Invoice Number") or "")
+        invoice_description = str(row.get("Invoice Description") or "")
+        line_description = str(row.get("Line Item Description") or "")
+        if "May 26" not in invoice_number:
+            failures.append(
+                f"Clarksville Gas and Water: row {idx} invoice number should use due-month suffix May 26, got {invoice_number!r}"
+            )
+        if re.search(r"-\s*[A-Za-z]{3,9}\s+\d{1,2}\s*(?:-|$)", invoice_description):
+            failures.append(
+                f"Clarksville Gas and Water: row {idx} invoice description uses a date fragment instead of meter location: {invoice_description!r}"
+            )
+        if re.search(r"-\s*[A-Za-z]{3,9}\s+\d{1,2}\s*-", line_description):
+            failures.append(
+                f"Clarksville Gas and Water: row {idx} line description uses a date fragment instead of meter location: {line_description!r}"
+            )
+
+
+def _validate_weakley_outdoor_lights_case(
+    rows: list[dict[str, Any]],
+    invoices: list[dict[str, Any]],
+    failures: list[str],
+) -> None:
+    if len(invoices) != 1:
+        failures.append(f"Weakley outdoor lights bill: expected one invoice, got {len(invoices)}")
+    if len(rows) != 6:
+        failures.append(f"Weakley outdoor lights bill: expected 6 charge rows, got {len(rows)}")
+    for idx, row in enumerate(rows, start=1):
+        gl = str(row.get("GL Account") or "").strip()
+        desc = str(row.get("Line Item Description") or "")
+        if gl != "6915":
+            failures.append(
+                f"Weakley outdoor lights bill: row {idx} should use GL 6915 Electric - Common Areas, "
+                f"got {gl!r} for {desc!r}"
             )
 
 

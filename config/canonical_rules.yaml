@@ -1,7 +1,7 @@
 version: 1
 source:
-  excel_path: C:\Users\Dasty\PycharmProjects\Billing_Refactoring_2026\Canonica rules.xlsx
-  runtime_source: C:\Users\Dasty\PycharmProjects\Billing_Refactoring_2026\config\canonical_rules.yaml
+  excel_path: Canonica rules.xlsx
+  runtime_source: config/canonical_rules.yaml
   notes: Generated from Canonica rules.xlsx and completed with runtime defaults.
   imported_rows:
   - column: Invoice Number
@@ -304,11 +304,11 @@ template_columns:
     formats:
       utilities: '{service_period} - {service_address_or_property}'
       trash_collection_services: '{service_period} - {property_or_site_name}'
-      pest_control: '{service_period} - {property_or_site_name}'
-      landscaping: '{service_period} - {property_or_site_name}'
+      pest_control: '{service_period} - {main_item_or_category}'
+      landscaping: '{service_period} - {main_item_or_category}'
       marketing: '{invoice_date_short} - {vendor_name} - {main_item_or_category}'
       subscriptions: '{invoice_date_short} - {vendor_name} - {main_item_or_category}'
-      other_infrequent: '{invoice_date_short} - {vendor_name} - {main_item_or_category}'
+      other_infrequent: '{main_item_or_category}'
       unknown: '{invoice_date_short} - {vendor_name} - {main_item_or_category}'
     canonical_matrix:
       utilities: '{first reading date}-(last reading date) - Service Addres including the unit number if appears in the bill  Put
@@ -376,8 +376,8 @@ template_columns:
     formats:
       utilities: '{service_period} - {service_address_or_property} - {line_item_description}'
       trash_collection_services: '{service_period} - {property_or_site_name} - {line_item_description}'
-      pest_control: '{service_period} - {property_or_site_name} - {line_item_description}'
-      landscaping: '{service_period} - {property_or_site_name} - {line_item_description}'
+      pest_control: '{service_period} - {line_item_description}'
+      landscaping: '{service_period} - {line_item_description}'
       marketing: '{vendor_name} - {line_item_description}'
       subscriptions: '{vendor_name} - {line_item_description}'
       other_infrequent: '{line_item_description}'

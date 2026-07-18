@@ -12,6 +12,8 @@ type Props = {
   traceCount?: number;
   tracesEnabled?: boolean;
   onToggleTraces?: () => void;
+  pagePanelOpen?: boolean;
+  onTogglePagePanel?: () => void;
 };
 
 export function ViewerToolbar({
@@ -28,6 +30,8 @@ export function ViewerToolbar({
   traceCount = 0,
   tracesEnabled = false,
   onToggleTraces,
+  pagePanelOpen = true,
+  onTogglePagePanel,
 }: Props) {
   const hasTraces = traceCount > 0 && onToggleTraces;
 
@@ -133,6 +137,37 @@ export function ViewerToolbar({
           </svg>
           <span>Traces</span>
           <span className="pdf-trace-count">{traceCount}</span>
+        </button>
+      )}
+
+      {onTogglePagePanel && (
+        <button
+          type="button"
+          className={`tool-btn tool-btn-icon viewer-pages-toggle ${
+            pagePanelOpen ? "is-on" : ""
+          }`}
+          onClick={onTogglePagePanel}
+          title={pagePanelOpen ? "Hide page thumbnails" : "Show page thumbnails"}
+          aria-label={pagePanelOpen ? "Hide page thumbnails" : "Show page thumbnails"}
+          aria-pressed={pagePanelOpen}
+          data-testid="pdf-page-panel-toggle"
+        >
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="4" y="4" width="13" height="16" rx="2" />
+            <path d="M8 8h5" />
+            <path d="M8 12h5" />
+            <path d="M20 7v10" />
+          </svg>
         </button>
       )}
     </div>

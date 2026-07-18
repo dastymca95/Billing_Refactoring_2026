@@ -62,6 +62,8 @@ def _assert_classifier_contract(failures: list[str]) -> None:
         "Sprinkler Service": ("fire_protection_service", "6860"),
         "Sanitation": ("trash_service", "6940"),
         "Trash Service": ("trash_service", "6940"),
+        "Stormwater User Fee": ("stormwater_service", "6995"),
+        "Storm Water": ("stormwater_service", "6995"),
         "Water Service": ("water_service", "6955"),
     }
     cfg = {

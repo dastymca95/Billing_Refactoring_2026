@@ -60,9 +60,6 @@ def _load() -> dict[str, str]:
         out: dict[str, str] = {}
         if not path.is_file():
             _LOG.warning("Vendor List not found at %s", path)
-            _CACHE = out
-            _CACHE_PATH = path
-            return out
         # Vendor List.csv is exported from Excel and often has stray
         # cp1252 / Latin-1 bytes (e.g. non-breaking spaces, smart
         # quotes). Fall through several encodings before giving up so
@@ -85,6 +82,24 @@ def _load() -> dict[str, str]:
             except Exception as e:  # pragma: no cover
                 _LOG.warning("Failed to read Vendor List with %s: %s", enc, e)
                 break
+        # Published ResMan vendor master is an exact-name adapter, not a
+        # learned rule. It augments the legacy CSV without overwriting an
+        # existing approved canonical spelling.
+        try:
+            from webapp.backend.services import resman_context_data as context_data
+            from webapp.backend.services.tenant_accounting_policies import default_tenant_id
+
+            for row in context_data.list_all_effective_records(
+                default_tenant_id(), context_data.DatasetKind.VENDORS,
+            ):
+                name = str(row.get("company") or "").strip()
+                abbreviation = str(row.get("abbreviation") or "").strip()
+                if name and bool(row.get("active", True)):
+                    out.setdefault(_to_key(name), name)
+                    if abbreviation:
+                        out.setdefault(_to_key(abbreviation), name)
+        except Exception:
+            pass
         _CACHE = out
         _CACHE_PATH = path
         return out

@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from webapp.backend.services.accounting_contracts import DocumentFacts, GLCandidate, LineItemFacts
+from webapp.backend.services.accounting_contracts import DocumentFacts, GLCandidate, GLAccountMetadata, LineItemFacts
 from webapp.backend.services.accounting_decision_engine import AccountingDecisionEngine
 from webapp.backend.services.gl_catalog import load_gl_catalog
 from webapp.backend.services.semantic_classifier import classify_line
@@ -59,6 +59,62 @@ def test_universal_non_trade_families(text, code, line_family):
 def test_specific_compatible_gl_beats_broad_gl():
     _, decision = decide("Painting labor service", [("6500", "vendor_default"), ("6760", "canonical_rule")])
     assert decision.selected_gl_code == "6760"
+
+
+def test_unsupported_specific_scope_cannot_beat_supported_material_account():
+    line = LineItemFacts(line_item_id="line-1", raw_description="5 GAL QX91Z77 color white", amount=Decimal("100"))
+    facts = DocumentFacts(document_id="doc", invoice_id="inv", line_items=[line], extraction_route="test")
+    semantics = classify_line(line, document_id="doc", document_context="paint products")
+    _, canonical = load_gl_catalog()
+    exterior = GLAccountMetadata(gl_code="7554", gl_name="Paint & Carpentry - Exterior",
+        gl_family="painting", trade_families=["painting"], compatible_work_modes=[],
+        specificity="specific", payable=True, description_tokens=["paint", "carpentry", "exterior"],
+        metadata_source="chart_inference", metadata_confidence=.65)
+    catalog = {"7554": exterior, "6770": canonical["6770"]}
+    candidates = [GLCandidate(gl_code="7554", gl_name=exterior.gl_name, source="deterministic_parser", base_score=.95),
+                  GLCandidate(gl_code="6770", gl_name=canonical["6770"].gl_name, source="service_reasoning_candidate", base_score=.62)]
+    decision = AccountingDecisionEngine().decide(facts, semantics, catalog, candidates, {})
+    assert decision.selected_gl_code == "6770"
+    assert any(item["gl_code"] == "7554" and "specific scope" in item["reason"] for item in decision.rejected_alternatives)
+
+
+def test_window_covering_merchandise_selects_window_covering_gl_not_insurance():
+    line = LineItemFacts(line_item_id="line-1", raw_description='Premium 2" cordless faux wood blind 34x60 - white', amount=Decimal("100"))
+    facts = DocumentFacts(document_id="doc", invoice_id="inv", line_items=[line], extraction_route="test")
+    semantics = classify_line(line, document_id="doc")
+    _, canonical = load_gl_catalog()
+    covering = GLAccountMetadata(gl_code="6710", gl_name="Blinds / Drapery Replacement",
+        gl_family="window_coverings", trade_families=["window_coverings"], compatible_work_modes=["material_purchase"],
+        specificity="specific", payable=True, description_tokens=["blinds", "drapery", "replacement"],
+        metadata_source="approved_config", metadata_confidence=.98)
+    catalog = {"6710": covering, "7120": canonical["7120"]}
+    candidates = [GLCandidate(gl_code="6710", gl_name=covering.gl_name, source="deterministic_parser", base_score=.95),
+                  GLCandidate(gl_code="7120", gl_name=canonical["7120"].gl_name, source="historical_mapping", base_score=.95)]
+    decision = AccountingDecisionEngine().decide(facts, semantics, catalog, candidates, {})
+    assert semantics.trade_family == "window_coverings"
+    assert semantics.work_mode == "material_purchase"
+    assert decision.selected_gl_code == "6710"
+    assert all(candidate.gl_code != "7120" for candidate in decision.candidates_ranked)
+
+
+def test_every_selected_gl_has_specific_source_grounded_explanation_and_comparison():
+    _, decision = decide("Painting labor service for apartment walls", [("6500", "vendor_default"), ("6760", "canonical_rule")])
+    assert decision.why_selected
+    assert "6760" in decision.why_selected
+    assert "Painting labor service for apartment walls" in decision.why_selected
+    assert "labor service" in decision.why_selected
+    assert "payable" in decision.why_selected
+    assert "6500" in decision.why_selected
+    assert "ranked above" in decision.why_selected
+    alternative = next(item for item in decision.rejected_alternatives if item["gl_code"] == "6500")
+    assert "Not selected" in alternative["reason"]
+    assert "support" in alternative["reason"]
+
+
+def test_explanation_never_uses_generated_description_as_observed_evidence():
+    _, decision = decide("maintenance labor", [("6530", "deterministic_parser")], generated="Invented roof replacement")
+    assert "maintenance labor" in decision.why_selected
+    assert "Invented roof replacement" not in decision.why_selected
 
 
 def test_vendor_default_and_history_cannot_beat_incompatible_line_evidence():

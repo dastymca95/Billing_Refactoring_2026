@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from datetime import datetime, timezone
 from enum import Enum
@@ -17,6 +19,7 @@ from .utility_processor_common import load_chart_of_accounts
 
 
 CONTRACT_VERSION = "accounting-readiness/1.0"
+_record_lock = threading.RLock()
 
 
 class ReadinessStatus(str, Enum):
@@ -101,6 +104,27 @@ def _issue(*, code: str, invoice_id: str, row_index: int | None, field: str | No
     )
 
 
+def _missing_field_message(row: dict[str, Any], field: str) -> str:
+    """Return a deterministic, backend-authored explanation for an empty field."""
+    if field == "GL Account":
+        return (
+            "No GL Account was selected because the accounting decision did not find a "
+            "payable chart account supported by sufficient current-line evidence. "
+            "Review the line description and confirm a valid GL Account."
+        )
+    if field == "Property Abbreviation":
+        return (
+            "No Property was assigned because the document evidence could not be validated "
+            "against the property reference. Confirm the property before export."
+        )
+    if field == "Amount":
+        return (
+            "No valid Amount is available because the extracted or entered value is not a "
+            "finite accounting amount. Confirm the line amount before export."
+        )
+    return f"{field} is missing and must be confirmed before export."
+
+
 def _reconciliation_for_group(group: list[dict[str, Any]]) -> tuple[str, ReadinessIssue | None]:
     first = group[0]
     meta = first.get("_meta") if isinstance(first.get("_meta"), dict) else {}
@@ -110,13 +134,38 @@ def _reconciliation_for_group(group: list[dict[str, Any]]) -> tuple[str, Readine
     if explicit is None:
         explicit = provenance.get("total_reconciliation_passed")
     expected = provenance.get("invoice_total")
-    actual = sum(float(row.get("Amount")) for row in group if _finite_amount(row.get("Amount")))
-    if explicit is False or (expected is not None and _finite_amount(expected) and abs(float(expected) - actual) > 0.01):
+    cent = Decimal("0.01")
+    actual = sum(
+        (
+            Decimal(str(row.get("Amount"))).quantize(cent, rounding=ROUND_HALF_UP)
+            for row in group
+            if _finite_amount(row.get("Amount"))
+        ),
+        Decimal("0.00"),
+    )
+    has_expected = expected is not None and _finite_amount(expected)
+    expected_amount = (
+        Decimal(str(expected)).quantize(cent, rounding=ROUND_HALF_UP)
+        if has_expected else None
+    )
+    computed_mismatch = bool(
+        expected_amount is not None
+        and abs(expected_amount - actual) > cent
+    )
+    # Readiness authorizes the current normalized snapshot.  A pre-allocation
+    # validation flag is provenance, not permission to contradict current
+    # arithmetic after rows were deterministically redistributed or edited.
+    failed = computed_mismatch or (not has_expected and explicit is False)
+    if failed:
         issue = _issue(code="total_mismatch", invoice_id=invoice_id, row_index=None,
                        field="Amount", message="Line amounts do not reconcile to the invoice total.")
-        issue.evidence = [{"invoice_total": expected, "line_total": round(actual, 2), "explicit_passed": explicit}]
+        issue.evidence = [{
+            "invoice_total": expected,
+            "line_total": float(actual),
+            "explicit_passed": explicit,
+        }]
         return "failed", issue
-    return ("passed" if explicit is True or expected is not None else "not_applicable"), None
+    return ("passed" if explicit is True or has_expected else "not_applicable"), None
 
 
 def evaluate_rows(rows: Iterable[dict[str, Any]], *, duplicate_status: str = "not_detected") -> AccountingReadiness:
@@ -140,26 +189,55 @@ def evaluate_rows(rows: Iterable[dict[str, Any]], *, duplicate_status: str = "no
         for column in required:
             if not str(row.get(column) if row.get(column) is not None else "").strip():
                 field_results[column] = False
-                blockers.append(_issue(code=f"required_field_missing:{column}", invoice_id=invoice_id,
-                                       row_index=index, field=column, message=f"{column} is required for export."))
+                blockers.append(_issue(
+                    code=f"required_field_missing:{column}", invoice_id=invoice_id,
+                    row_index=index, field=column,
+                    message=_missing_field_message(row, column),
+                ))
         prop = str(row.get("Property Abbreviation") or "").strip()
         if not prop and "Property Abbreviation" not in required:
             field_results["Property Abbreviation"] = False
-            blockers.append(_issue(code="property_missing", invoice_id=invoice_id, row_index=index,
-                                   field="Property Abbreviation", message="Property is required for export."))
+            blockers.append(_issue(
+                code="property_missing", invoice_id=invoice_id, row_index=index,
+                field="Property Abbreviation",
+                message=_missing_field_message(row, "Property Abbreviation"),
+            ))
         gl = str(row.get("GL Account") or "").strip()
         if not gl or not gl.isdigit() or (valid_gl and gl not in valid_gl):
             field_results["GL Account"] = False
             if not any(i.line_item_id == str(index) and i.field == "GL Account" for i in blockers):
-                blockers.append(_issue(code="gl_invalid", invoice_id=invoice_id, row_index=index,
-                                       field="GL Account", message="GL Account must be a valid chart account."))
+                blockers.append(_issue(
+                    code="gl_invalid", invoice_id=invoice_id, row_index=index,
+                    field="GL Account",
+                    message=(
+                        _missing_field_message(row, "GL Account") if not gl else
+                        f"GL Account '{gl}' is not a valid payable chart account. Confirm a valid GL Account before export."
+                    ),
+                ))
         if not _finite_amount(row.get("Amount")):
             field_results["Amount"] = False
             if not any(i.line_item_id == str(index) and i.field == "Amount" for i in blockers):
-                blockers.append(_issue(code="amount_invalid", invoice_id=invoice_id, row_index=index,
-                                       field="Amount", message="Amount must be a finite number."))
+                blockers.append(_issue(
+                    code="amount_invalid", invoice_id=invoice_id, row_index=index,
+                    field="Amount", message=_missing_field_message(row, "Amount"),
+                ))
 
         meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
+        if bool(meta.get("row_identity_needs_confirmation")) and not any(
+            issue.code == "row_identity_needs_confirmation" and issue.invoice_id == invoice_id
+            for issue in blockers
+        ):
+            blockers.append(_issue(
+                code="row_identity_needs_confirmation",
+                invoice_id=invoice_id,
+                row_index=index,
+                field="Location",
+                message=(
+                    "A payable handwritten Apt. # is unresolved. Confirm its source identity "
+                    "before unattended export."
+                ),
+                source="row_identity_verification",
+            ))
         for warning in meta.get("vision_warnings") or meta.get("ai_warnings") or []:
             non_blocking.append(ReadinessIssue(code="extraction_warning", severity=ReadinessSeverity.NON_BLOCKING,
                 scope="line_item", invoice_id=invoice_id, line_item_id=str(index), field=None,
@@ -192,35 +270,39 @@ def evaluate_and_record(batch_id: str, rows: Iterable[dict[str, Any]]) -> Accoun
 
     decision = evaluate_rows(rows)
     path = batch_store.get_batch_dir(batch_id) / "audit" / "accounting_readiness.json"
-    previous: dict[str, Any] = {}
-    if path.is_file():
-        try:
-            previous = json.loads(path.read_text(encoding="utf-8")) or {}
-        except (OSError, ValueError):
-            previous = {}
-    current_keys = {(issue.code, issue.invoice_id, issue.line_item_id) for issue in decision.blockers}
-    for raw in previous.get("blockers") or []:
-        key = (raw.get("code"), raw.get("invoice_id"), raw.get("line_item_id"))
-        if key in current_keys:
-            continue
-        try:
-            resolved = ReadinessIssue(**raw)
-        except Exception:
-            continue
-        resolved.severity = ReadinessSeverity.INFO
-        resolved.resolved = True
-        resolved.resolved_by = "backend_validation"
-        resolved.resolved_at = decision.evaluated_at
-        resolved.resolution_evidence = {
-            "previous_snapshot_id": previous.get("snapshot_id"),
-            "current_snapshot_id": decision.snapshot_id,
-            "validation": "blocker_condition_no_longer_present",
-        }
-        decision.non_blocking_issues.append(resolved)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = Path(str(path) + ".tmp")
-    temp.write_text(json.dumps(as_dict(decision), indent=2), encoding="utf-8")
-    temp.replace(path)
+    # Readiness is polled by several UI views at once. Serialize the complete
+    # read/merge/write transaction so concurrent requests cannot contend for a
+    # shared .tmp file or lose resolution evidence on Windows.
+    with _record_lock:
+        previous: dict[str, Any] = {}
+        if path.is_file():
+            try:
+                previous = json.loads(path.read_text(encoding="utf-8")) or {}
+            except (OSError, ValueError):
+                previous = {}
+        current_keys = {(issue.code, issue.invoice_id, issue.line_item_id) for issue in decision.blockers}
+        for raw in previous.get("blockers") or []:
+            key = (raw.get("code"), raw.get("invoice_id"), raw.get("line_item_id"))
+            if key in current_keys:
+                continue
+            try:
+                resolved = ReadinessIssue(**raw)
+            except Exception:
+                continue
+            resolved.severity = ReadinessSeverity.INFO
+            resolved.resolved = True
+            resolved.resolved_by = "backend_validation"
+            resolved.resolved_at = decision.evaluated_at
+            resolved.resolution_evidence = {
+                "previous_snapshot_id": previous.get("snapshot_id"),
+                "current_snapshot_id": decision.snapshot_id,
+                "validation": "blocker_condition_no_longer_present",
+            }
+            decision.non_blocking_issues.append(resolved)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = Path(str(path) + ".tmp")
+        temp.write_text(json.dumps(as_dict(decision), indent=2), encoding="utf-8")
+        temp.replace(path)
     return decision
 
 

@@ -7,7 +7,7 @@
 //   * file rows have clear open/delete actions
 //   * uploads can target any batch row, not only the active batch
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { api, getFriendlyErrorMessage } from "../api";
@@ -23,7 +23,7 @@ import {
   type UploadFileProgress,
 } from "../types";
 
-type Props = {
+export type BatchExplorerProps = {
   batchList: BatchListEntry[];
   activeBatchId: string | null;
   onSwitchBatch: (batchId: string) => Promise<boolean | void> | boolean | void;
@@ -37,6 +37,7 @@ type Props = {
   onRefreshBatchList: () => void;
 
   files: FileEntry[];
+  fileAttachmentGroups?: Record<string, Record<string, string[]>>;
   selectedFile: string | null;
   activeDocumentPage?: {
     batchId: string;
@@ -78,6 +79,13 @@ type Props = {
   // uses it to mark which PDF is being read right now and how far the
   // run has advanced through the file list.
   progress?: BatchProgress | null;
+  showPages?: boolean;
+  virtualWindow?: {
+    start: number;
+    end: number;
+    beforeHeight: number;
+    afterHeight: number;
+  };
 };
 
 const ACCEPT_TYPES = ".csv,.xlsx,.xls,.pdf,.png,.jpg,.jpeg,.gif,.bmp,.webp,.docx,.doc,.txt";
@@ -85,7 +93,7 @@ const SCREENSHOT_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp
 const FILE_LOAD_TIMEOUT_MS = 12_000;
 const BATCH_NAME_MAX = 80;
 
-export function BatchExplorer({
+function BatchExplorerImpl({
   batchList,
   activeBatchId,
   onSwitchBatch,
@@ -95,6 +103,7 @@ export function BatchExplorer({
   onDeleteBatch,
   onRefreshBatchList,
   files,
+  fileAttachmentGroups = {},
   selectedFile,
   activeDocumentPage,
   onSelectFile,
@@ -110,7 +119,9 @@ export function BatchExplorer({
   isSwitchingBatch,
   queueStatus,
   progress,
-}: Props) {
+  showPages = true,
+  virtualWindow,
+}: BatchExplorerProps) {
   const [openIds, setOpenIds] = useState<Set<string>>(() => new Set());
   const listRef = useRef<HTMLDivElement | null>(null);
 
@@ -139,6 +150,16 @@ export function BatchExplorer({
     });
   }, [runningId]);
 
+  useEffect(() => {
+    if (!activeBatchId) return;
+    setOpenIds((prev) => {
+      if (prev.has(activeBatchId)) return prev;
+      const next = new Set(prev);
+      next.add(activeBatchId);
+      return next;
+    });
+  }, [activeBatchId]);
+
   // Phase 2D — derive per-batch queue state for the chip on each row.
   const batchState = useCallback(
     (id: string): "idle" | "queued" | "running" | "completed" | "failed" => {
@@ -161,10 +182,10 @@ export function BatchExplorer({
   const uploadToBatch = useCallback(
     async (targetBatchId: string, dropped: File[]) => {
       if (dropped.length === 0) return;
-      if (onUploadFilesToBatch) {
+      if (targetBatchId === activeBatchId) {
+        await Promise.resolve(onUploadFiles(dropped));
+      } else if (onUploadFilesToBatch) {
         await onUploadFilesToBatch(targetBatchId, dropped);
-      } else if (targetBatchId === activeBatchId) {
-        onUploadFiles(dropped);
       } else {
         await Promise.resolve(onSwitchBatch(targetBatchId));
       }
@@ -337,16 +358,28 @@ export function BatchExplorer({
     });
     try {
       await uploadToBatch(batchId, dropped);
-      setFilesByBatchId((prev) => {
-        const next = { ...prev };
-        delete next[batchId];
-        return next;
-      });
-      void loadBatchFiles(batchId, true);
+      try {
+        const refreshed = await api.listFiles(batchId);
+        setFilesByBatchId((prev) => ({
+          ...prev,
+          [batchId]: refreshed.files,
+        }));
+      } catch {
+        setFilesByBatchId((prev) => {
+          const next = { ...prev };
+          delete next[batchId];
+          return next;
+        });
+        void loadBatchFiles(batchId, true);
+      }
     } finally {
       setDragOverBatchId(null);
     }
   };
+
+  const renderedBatchList = virtualWindow
+    ? batchList.slice(virtualWindow.start, virtualWindow.end)
+    : batchList;
 
   return (
     <div className="batch-explorer" data-testid="batch-explorer">
@@ -356,19 +389,72 @@ export function BatchExplorer({
           onCreate={onCreateBatch}
           onUploadCreatedFiles={(batchId, pasted) => uploadToBatch(batchId, pasted)}
         />
+        {virtualWindow && virtualWindow.beforeHeight > 0 && (
+          <div
+            className="batch-virtual-spacer"
+            style={{ height: virtualWindow.beforeHeight }}
+            aria-hidden
+          />
+        )}
         {batchList.length === 0 && (
           <div className="batch-explorer-empty">
             No batches yet. Create a batch to start collecting bills.
           </div>
         )}
-        {batchList.map((b) => {
+        {renderedBatchList.map((b) => {
           const isActive = b.batch_id === activeBatchId;
           const isOpen = openIds.has(b.batch_id);
           const isThisProcessing = processingBatchId === b.batch_id;
-          const filesForBatch = isActive ? files : filesByBatchId[b.batch_id] ?? [];
-          const uploadsForBatch = uploadItems.filter(
-            (item) => item.batchId === b.batch_id,
-          );
+          const cachedFiles = filesByBatchId[b.batch_id];
+          const filesForBatch = isOpen
+            ? cachedFiles ?? (isActive ? files : [])
+            : [];
+          const uploadsForBatch = isOpen
+            ? uploadItems.filter((item) => item.batchId === b.batch_id)
+            : [];
+          const children = isOpen ? (
+            <BatchChildren
+              batchId={b.batch_id}
+              files={filesForBatch}
+              fileAttachmentGroups={fileAttachmentGroups[b.batch_id] || {}}
+              uploadItems={uploadsForBatch}
+              isLoading={
+                !isActive &&
+                loadingBatches.has(b.batch_id) &&
+                filesByBatchId[b.batch_id] === undefined
+              }
+              errorMessage={fileLoadErrors[b.batch_id]}
+              selectedFile={isActive ? selectedFile : null}
+              activeDocumentPage={activeDocumentPage}
+              openFileKeys={openFileKeys}
+              onToggleFileOpen={(filename) => toggleFileOpen(b.batch_id, filename)}
+              onRetry={() => void loadBatchFiles(b.batch_id, true)}
+              onSelectFile={(filename) => void onSelectFile(b.batch_id, filename)}
+              onSelectPage={(filename, pageNumber) =>
+                void onSelectPage(b.batch_id, filename, pageNumber)
+              }
+              onDeleteFile={async (filename) => {
+                const updated = await onDeleteFile(b.batch_id, filename);
+                if (updated) {
+                  setFilesByBatchId((prev) => ({
+                    ...prev,
+                    [b.batch_id]: updated,
+                  }));
+                }
+              }}
+              onProcessFile={
+                onProcessFile
+                  ? (filename, mode) => void onProcessFile(b.batch_id, filename, mode)
+                  : undefined
+              }
+              onUploadFiles={(dropped) => void uploadToBatch(b.batch_id, dropped)}
+              isProcessing={isProcessing}
+              isSwitchingBatch={isActive ? isSwitchingBatch : false}
+              expectedFileCount={b.files_count ?? 0}
+              progress={isThisProcessing ? progress ?? null : null}
+              showPages={showPages}
+            />
+          ) : null;
           return (
             <BatchRow
               key={b.batch_id}
@@ -393,52 +479,23 @@ export function BatchExplorer({
               onDragLeave={(e) => handleBatchDragLeave(b.batch_id, e)}
               onDrop={(e) => void handleBatchDrop(b.batch_id, e)}
             >
-              <BatchChildren
-                batchId={b.batch_id}
-                files={filesForBatch}
-                uploadItems={uploadsForBatch}
-                isLoading={
-                  !isActive &&
-                  loadingBatches.has(b.batch_id) &&
-                  filesByBatchId[b.batch_id] === undefined
-                }
-                errorMessage={fileLoadErrors[b.batch_id]}
-                selectedFile={isActive ? selectedFile : null}
-                activeDocumentPage={activeDocumentPage}
-                openFileKeys={openFileKeys}
-                onToggleFileOpen={(filename) => toggleFileOpen(b.batch_id, filename)}
-                onRetry={() => void loadBatchFiles(b.batch_id, true)}
-                onSelectFile={(filename) => void onSelectFile(b.batch_id, filename)}
-                onSelectPage={(filename, pageNumber) =>
-                  void onSelectPage(b.batch_id, filename, pageNumber)
-                }
-                onDeleteFile={async (filename) => {
-                  const updated = await onDeleteFile(b.batch_id, filename);
-                  if (updated) {
-                    setFilesByBatchId((prev) => ({
-                      ...prev,
-                      [b.batch_id]: updated,
-                    }));
-                  }
-                }}
-                onProcessFile={
-                  onProcessFile
-                    ? (filename, mode) => void onProcessFile(b.batch_id, filename, mode)
-                    : undefined
-                }
-                onUploadFiles={(dropped) => void uploadToBatch(b.batch_id, dropped)}
-                isProcessing={isProcessing}
-                isSwitchingBatch={isActive ? isSwitchingBatch : false}
-                expectedFileCount={b.files_count ?? 0}
-                progress={isThisProcessing ? progress ?? null : null}
-              />
+              {children}
             </BatchRow>
           );
         })}
+        {virtualWindow && virtualWindow.afterHeight > 0 && (
+          <div
+            className="batch-virtual-spacer"
+            style={{ height: virtualWindow.afterHeight }}
+            aria-hidden
+          />
+        )}
       </div>
     </div>
   );
 }
+
+export const BatchExplorer = memo(BatchExplorerImpl);
 
 function CreateBatchRow({
   requestToken,
@@ -970,6 +1027,7 @@ function numberOrNull(v: unknown): number | null {
 function BatchChildren({
   batchId,
   files,
+  fileAttachmentGroups = {},
   uploadItems = [],
   isLoading,
   errorMessage,
@@ -987,9 +1045,11 @@ function BatchChildren({
   isSwitchingBatch,
   expectedFileCount,
   progress,
+  showPages = true,
 }: {
   batchId: string;
   files: FileEntry[];
+  fileAttachmentGroups?: Record<string, string[]>;
   uploadItems?: UploadFileProgress[];
   isLoading: boolean;
   errorMessage?: string;
@@ -1011,8 +1071,20 @@ function BatchChildren({
   isSwitchingBatch?: boolean;
   expectedFileCount: number;
   progress?: BatchProgress | null;
+  showPages?: boolean;
 }) {
+  const filesByName = new Map(files.map((file) => [file.filename, file]));
   const actualFileNames = new Set(files.map((file) => file.filename));
+  const attachedFileNames = new Set<string>();
+  for (const [parentName, childNames] of Object.entries(fileAttachmentGroups)) {
+    if (!actualFileNames.has(parentName)) continue;
+    childNames.forEach((childName) => {
+      if (childName !== parentName && actualFileNames.has(childName)) {
+        attachedFileNames.add(childName);
+      }
+    });
+  }
+  const topLevelFiles = files.filter((file) => !attachedFileNames.has(file.filename));
   const visibleUploads = uploadItems.filter(
     (item) => item.status !== "done" || !actualFileNames.has(item.filename),
   );
@@ -1061,7 +1133,11 @@ function BatchChildren({
               !!progress &&
               (progress.status === "processing" ||
                 progress.status === "cancelling");
-            return files.map((f, idx) => {
+            const fileIndexByName = new Map(
+              files.map((file, index) => [file.filename, index]),
+            );
+            const phaseForFile = (filename: string) => {
+              const idx = fileIndexByName.get(filename) ?? -1;
               let phase: "idle" | "done" | "active" | "pending" = "idle";
               if (isRunning) {
                 if (currentIndex >= 0) {
@@ -1076,11 +1152,20 @@ function BatchChildren({
               }
               const filePct =
                 phase === "active" ? clamp01(progress?.percent ?? 0) : null;
+              return { phase, filePct };
+            };
+            const renderFile = (
+              f: FileEntry,
+              nestedContent: ReactNode = null,
+              isAttachment = false,
+            ) => {
+              const { phase, filePct } = phaseForFile(f.filename);
               return (
                 <FileChild
                   key={f.filename}
                   batchId={batchId}
                   file={f}
+                  isAttachment={isAttachment}
                   isSelected={selectedFile === f.filename}
                   activePage={
                     activeDocumentPage?.batchId === batchId &&
@@ -1102,8 +1187,27 @@ function BatchChildren({
                   }
                   processingPhase={phase}
                   filePercent={filePct}
+                  nestedContent={nestedContent}
+                  showPages={showPages}
                 />
               );
+            };
+            return topLevelFiles.map((f) => {
+              const attachmentFiles = (fileAttachmentGroups[f.filename] || [])
+                .map((filename) => filesByName.get(filename))
+                .filter((file): file is FileEntry => Boolean(file));
+              const nestedContent =
+                attachmentFiles.length > 0 ? (
+                  <ul
+                    className="file-attachment-list"
+                    aria-label={`Attached documents for ${f.filename}`}
+                  >
+                    {attachmentFiles.map((attachment) =>
+                      renderFile(attachment, null, true),
+                    )}
+                  </ul>
+                ) : null;
+              return renderFile(f, nestedContent);
             });
           })()}
           {visibleUploads.map((item) => (
@@ -1124,11 +1228,20 @@ function UploadFileChild({ item }: { item: UploadFileProgress }) {
   const pct = clamp01(item.percent);
   const isFailed = item.status === "failed";
   const isUploading = item.status === "uploading";
+  const isSaving = item.status === "saving";
   const isDone = item.status === "done";
-  const phase = isFailed ? "failed" : isUploading ? "active" : isDone ? "done" : "pending";
+  const phase = isFailed
+    ? "failed"
+    : isUploading || isSaving
+      ? "active"
+      : isDone
+        ? "done"
+        : "pending";
   const statusLabel = isFailed
     ? "Upload failed"
-    : isUploading
+    : isSaving
+      ? "Saving file"
+      : isUploading
         ? `Uploading ${Math.round(pct)}%`
         : isDone
           ? "Uploaded"
@@ -1181,6 +1294,7 @@ function UploadFileChild({ item }: { item: UploadFileProgress }) {
 function FileChild({
   batchId,
   file,
+  isAttachment = false,
   isSelected,
   activePage,
   isPageListOpen,
@@ -1191,9 +1305,12 @@ function FileChild({
   onProcess,
   processingPhase = "idle",
   filePercent = null,
+  nestedContent = null,
+  showPages = true,
 }: {
   batchId: string;
   file: FileEntry;
+  isAttachment?: boolean;
   isSelected: boolean;
   activePage: number | null;
   isPageListOpen: boolean;
@@ -1204,15 +1321,17 @@ function FileChild({
   onProcess?: (mode?: "replace" | "merge") => void;
   processingPhase?: "idle" | "done" | "active" | "pending";
   filePercent?: number | null;
+  nestedContent?: ReactNode;
+  showPages?: boolean;
 }) {
   const ext = (file.extension || "").replace(/^\./, "").toLowerCase();
   const vendor = vendorLabel(file);
   const support = fileSupportLabel(file);
   const pageCount = ext === "pdf" ? Math.max(1, Number(file.page_count || 1)) : 0;
-  const showPages = pageCount > 0;
+  const canShowPages = showPages && pageCount > 0;
   return (
     <li
-      className={`file-tree-node ${isSelected ? "selected" : ""} ${
+      className={`file-tree-node ${isAttachment ? "file-attachment-node" : ""} ${isSelected ? "selected" : ""} ${
         isPageListOpen ? "pages-open" : ""
       } phase-${processingPhase}`}
       data-batch-id={batchId}
@@ -1222,7 +1341,7 @@ function FileChild({
       <div
         className={`file-row ${isSelected ? "selected" : ""} phase-${processingPhase}`}
       >
-        {showPages ? (
+        {canShowPages ? (
           <button
             type="button"
             className="file-row-page-toggle"
@@ -1350,7 +1469,7 @@ function FileChild({
           />
         </span>
       </div>
-      {showPages && isPageListOpen && (
+      {canShowPages && isPageListOpen && (
         <ul className="file-page-list" aria-label={`Pages in ${file.filename}`}>
           {Array.from({ length: pageCount }, (_, i) => i + 1).map((pageNumber) => (
             <li key={pageNumber}>
@@ -1371,6 +1490,7 @@ function FileChild({
           ))}
         </ul>
       )}
+      {nestedContent}
     </li>
   );
 }

@@ -15,6 +15,7 @@ import { createPortal } from "react-dom";
 
 import { api, getFriendlyErrorMessage, isApiError } from "../../api";
 import { DocumentPreviewPanel } from "../../components/DocumentPreviewPanel";
+import { HumanAdjudicationPanel } from "../../components/TemplateWorkspace";
 import {
   ResManTemplatePreview,
   type CellEdits,
@@ -23,6 +24,9 @@ import type {
   BatchListEntry,
   BatchProgress,
   FileEntry,
+  HumanAdjudicationContext,
+  HumanAdjudicationOptions,
+  OperatorActivityEvent,
   PreviewResponse,
   PreviewRow,
   UploadFileProgress,
@@ -67,17 +71,42 @@ export function BillingV2() {
   const preparedPreviewRef = useRef<string>("");
   const [detachedRoot, setDetachedRoot] = useState<HTMLElement | null>(null);
   const detachedWindowRef = useRef<Window | null>(null);
+  const [adjudicationOpen, setAdjudicationOpen] = useState(false);
+  const [adjudicationSaving, setAdjudicationSaving] = useState(false);
+  const [adjudicationContext, setAdjudicationContext] =
+    useState<HumanAdjudicationContext | null>(null);
+  const [adjudicationContextError, setAdjudicationContextError] = useState("");
+  const [activityRefreshKey, setActivityRefreshKey] = useState(0);
 
   useEffect(() => {
     if (!state.activeBatchId || !state.preview || Object.keys(state.edits).length === 0) return;
     const timer = window.setTimeout(() => {
       const rows = mergeEditedRows(state.preview!.rows, state.edits);
       void api.accountingReadiness(state.activeBatchId!, rows).then((accounting_readiness) => {
-        dispatch({ type: "setPreview", preview: { ...state.preview!, accounting_readiness } });
+        dispatch({ type: "setAccountingReadiness", accountingReadiness: accounting_readiness });
       }).catch((error) => dispatch({ type: "setError", error: getFriendlyErrorMessage(error, "Validate readiness") }));
     }, 250);
     return () => window.clearTimeout(timer);
   }, [state.activeBatchId, state.edits]);
+
+  useEffect(() => {
+    if (!adjudicationOpen) return;
+    let cancelled = false;
+    setAdjudicationContextError("");
+    void api.humanAdjudicationContext().then((context) => {
+      if (!cancelled) setAdjudicationContext(context);
+    }).catch((error) => {
+      if (!cancelled) {
+        setAdjudicationContext(null);
+        setAdjudicationContextError(
+          getFriendlyErrorMessage(error, "Authorize human adjudication"),
+        );
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [adjudicationOpen]);
 
   const refreshBatchList = useCallback(async () => {
     dispatch({ type: "batchListLoading", loading: true });
@@ -557,6 +586,42 @@ export function BillingV2() {
     state.preview,
   ]);
 
+  const saveHumanAdjudication = useCallback(async (
+    options: HumanAdjudicationOptions,
+  ) => {
+    if (!state.activeBatchId || !state.preview || Object.keys(state.edits).length === 0) {
+      return;
+    }
+    setAdjudicationSaving(true);
+    dispatch({ type: "setError", error: "" });
+    try {
+      const saved = await api.saveEdits(state.activeBatchId, state.edits, options);
+      const refreshed = await api.preview(state.activeBatchId);
+      dispatch({ type: "setPreview", preview: refreshed });
+      setActivityRefreshKey((value) => value + 1);
+      setAdjudicationOpen(false);
+      const report = saved.adjudication;
+      const optionalScopes = [
+        report?.benchmark_submissions ? "benchmark submitted" : "",
+        report?.learning_approvals ? "learning approved" : "",
+        report?.rule_proposals ? "rule proposal created" : "",
+      ].filter(Boolean);
+      dispatch({
+        type: "setNotice",
+        notice: `Saved ${saved.applied} human correction${saved.applied === 1 ? "" : "s"}${
+          optionalScopes.length ? `; ${optionalScopes.join(", ")}` : ""
+        }.`,
+      });
+    } catch (error) {
+      dispatch({
+        type: "setError",
+        error: getFriendlyErrorMessage(error, "Save human adjudication"),
+      });
+    } finally {
+      setAdjudicationSaving(false);
+    }
+  }, [state.activeBatchId, state.edits, state.preview]);
+
   const selectRow = useCallback(
     (rowIndex: number | null) => {
       const row = rowIndex == null ? null : state.preview?.rows[rowIndex] ?? null;
@@ -752,6 +817,21 @@ export function BillingV2() {
         >
           {state.exporting ? "Exporting" : "Export"}
         </button>
+        {editedCellCount > 0 && (
+          <button
+            type="button"
+            className="btn btn-compact btn-accent"
+            onClick={() => setAdjudicationOpen(true)}
+            disabled={adjudicationSaving || state.processing}
+            data-testid="template-save-button"
+          >
+            Save ({editedCellCount})
+          </button>
+        )}
+        <BillingV2ActivityButton
+          batchId={state.activeBatchId}
+          refreshKey={activityRefreshKey}
+        />
 
         <span className="billing-v2-toolbar-divider" />
 
@@ -949,8 +1029,130 @@ export function BillingV2() {
         </div>
       )}
       {detachedViewer}
+      {adjudicationOpen && state.activeBatchId && state.preview && (
+        <HumanAdjudicationPanel
+          batchId={state.activeBatchId}
+          preview={state.preview}
+          edits={state.edits}
+          context={adjudicationContext}
+          contextError={adjudicationContextError}
+          saving={adjudicationSaving}
+          onCancel={() => setAdjudicationOpen(false)}
+          onConfirm={saveHumanAdjudication}
+        />
+      )}
     </section>
   );
+}
+
+function BillingV2ActivityButton({
+  batchId,
+  refreshKey,
+}: {
+  batchId: string | null;
+  refreshKey: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const [items, setItems] = useState<OperatorActivityEvent[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [position, setPosition] = useState<{ top: number; right: number } | null>(null);
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!open || !batchId) return;
+    let cancelled = false;
+    setLoading(true);
+    void api.listBatchActivity(batchId).then((response) => {
+      if (!cancelled) setItems(response.items);
+    }).catch(() => {
+      if (!cancelled) setItems([]);
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [batchId, open, refreshKey]);
+
+  useEffect(() => {
+    if (!open) {
+      setPosition(null);
+      return;
+    }
+    const update = () => {
+      const rect = buttonRef.current?.getBoundingClientRect();
+      if (rect) setPosition({ top: rect.bottom + 6, right: Math.max(8, window.innerWidth - rect.right) });
+    };
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, [open]);
+
+  return (
+    <div className="billing-v2-activity">
+      <button
+        ref={buttonRef}
+        type="button"
+        className="btn btn-compact"
+        disabled={!batchId}
+        onClick={() => setOpen((value) => !value)}
+        aria-label="Activity history"
+        aria-expanded={open}
+        data-testid="template-revisions-btn"
+        title="Manual, AI, benchmark, learning and rule history"
+      >
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
+          <path d="M3 12a9 9 0 1 0 3-6.71" />
+          <polyline points="3 4 3 9 8 9" />
+          <polyline points="12 7 12 12 15.5 13.8" />
+        </svg>
+      </button>
+      {open && position && (
+        <section
+          className="billing-v2-activity-popover"
+          style={{ top: position.top, right: position.right }}
+          aria-label="Batch activity history"
+        >
+          <header>
+            <strong>Change history</strong>
+            <button type="button" className="btn btn-mini" onClick={() => setOpen(false)}>Close</button>
+          </header>
+          {loading ? (
+            <p>Loading activity...</p>
+          ) : items.length ? (
+            <div className="template-activity-list">
+              {items.slice(0, 40).map((event) => (
+                <article key={event.event_id} className={`template-activity-item is-${event.source}`}>
+                  <div><strong>{event.summary}</strong><span>{activityKind(event)}</span></div>
+                  {activityFieldSummary(event).map((line) => <small key={line}>{line}</small>)}
+                  <small>{event.actor}</small>
+                  <time>{new Date(event.created_at).toLocaleString()}</time>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p>No manual, AI, benchmark, learning or rule events yet.</p>
+          )}
+        </section>
+      )}
+    </div>
+  );
+}
+
+function activityKind(event: OperatorActivityEvent): string {
+  if (event.event_type.includes("benchmark")) return "benchmark";
+  if (event.event_type.includes("learning")) return "learning";
+  if (event.event_type.includes("rule")) return "rule";
+  return event.source;
+}
+
+function activityFieldSummary(event: OperatorActivityEvent): string[] {
+  const changes = Array.isArray(event.details?.changes) ? event.details.changes : [];
+  return changes.slice(0, 6).map((item) => {
+    const change = item && typeof item === "object" ? item as Record<string, unknown> : {};
+    const row = Number(change.row_index ?? 0) + 1;
+    return `Row ${row} · ${String(change.field ?? "field")} · ${String(change.before ?? change.old_value ?? "(blank)")} → ${String(change.after ?? change.new_value ?? "(blank)")}`;
+  });
 }
 
 function renderViewer({
@@ -989,6 +1191,8 @@ function renderViewer({
       targetPage={documentTarget}
       onActivePageChange={onActivePageChange}
       aiProgress={progress}
+      onProcessBatch={onProcessBatch}
+      isProcessing={processing}
       onPopout={isDetached ? undefined : onDetach}
     />
   );

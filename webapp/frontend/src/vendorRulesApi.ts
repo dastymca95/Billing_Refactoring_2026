@@ -11,6 +11,8 @@ export type VendorListEntry = {
   category: string;
   status: string;
   last_updated?: string | null;
+  editable?: boolean;
+  implementation_kind?: "hybrid" | "code_managed";
 };
 
 export type RuleField = {

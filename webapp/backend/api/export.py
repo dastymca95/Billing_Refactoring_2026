@@ -128,7 +128,10 @@ def download_endpoint(batch_id: str, filename: str | None = None):
     # operator wants to download an older export; the *display* filename
     # the browser saves under always comes from batch_metadata.export_name
     # (Phase 2D — see _resolve_display_filename above).
-    files = sorted(export_dir.glob("*resman_import*.xlsx"))
+    files = sorted(
+        export_dir.glob("*resman_import*.xlsx"),
+        key=lambda p: (p.stat().st_mtime, p.name),
+    )
     if filename:
         safe_name = Path(filename).name
         if not safe_name or safe_name in (".", "..") or safe_name != filename:

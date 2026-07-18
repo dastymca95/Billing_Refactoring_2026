@@ -1,0 +1,7 @@
+contract_version: tenant-document-policy/1.0
+tenants:
+  local-default:
+    date_policy:
+      policy_id: local-default-date-policy/1.0
+      invoice_date_from_service_date: true
+      due_date_from_upon_receipt: true

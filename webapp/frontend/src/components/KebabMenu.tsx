@@ -51,6 +51,7 @@ export function KebabMenu({ items, ariaLabel, testId, className }: Props) {
   // Close on outside click + Escape.
   useEffect(() => {
     if (!open) return;
+    const ownerDocument = triggerRef.current?.ownerDocument ?? document;
     const onDoc = (e: MouseEvent) => {
       const t = e.target as Node | null;
       if (
@@ -66,11 +67,11 @@ export function KebabMenu({ items, ariaLabel, testId, className }: Props) {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
     };
-    document.addEventListener("mousedown", onDoc);
-    document.addEventListener("keydown", onKey);
+    ownerDocument.addEventListener("mousedown", onDoc);
+    ownerDocument.addEventListener("keydown", onKey);
     return () => {
-      document.removeEventListener("mousedown", onDoc);
-      document.removeEventListener("keydown", onKey);
+      ownerDocument.removeEventListener("mousedown", onDoc);
+      ownerDocument.removeEventListener("keydown", onKey);
     };
   }, [open]);
 
@@ -81,8 +82,9 @@ export function KebabMenu({ items, ariaLabel, testId, className }: Props) {
     const POP_W = 224;
     const POP_H_MAX = 280;
     const margin = 4;
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
+    const ownerWindow = triggerRef.current.ownerDocument.defaultView ?? window;
+    const vw = ownerWindow.innerWidth;
+    const vh = ownerWindow.innerHeight;
     let left = rect.right - POP_W;
     if (left < margin) left = margin;
     if (left + POP_W + margin > vw) left = vw - POP_W - margin;
@@ -188,7 +190,7 @@ export function KebabMenu({ items, ariaLabel, testId, className }: Props) {
               </button>
             ))}
           </div>,
-          document.body,
+          triggerRef.current?.ownerDocument.body ?? document.body,
         )}
     </>
   );

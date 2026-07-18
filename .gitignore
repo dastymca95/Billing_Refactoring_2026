@@ -3,12 +3,17 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
 
 # Node / frontend
 webapp/frontend/node_modules/
 webapp/frontend/dist/
 node_modules/
 dist/
+build/
+coverage/
+playwright-report/
 
 # Runtime/generated app data
 webapp_data/
@@ -26,9 +31,16 @@ Training Bills_Invoices/
 Gl Codes/
 GL Codes/
 Properties/
-Vendors/
+/Vendors/
+/Reports for APP/
 Output/
 Old Scripts/
+Punctual Process/
+API Documentation/
+config/vendors/
+docs/reports/vendors/
+docs/reports/phases/screenshots/
+*.pdf
 
 # Scratch artifacts
 _gl_analysis/
@@ -43,6 +55,10 @@ _category_listing.md
 # OS
 .DS_Store
 Thumbs.db
+venv/
+*.log
+*.sqlite
+*.db
 
 webapp/_phase1d_*
 *.tsbuildinfo
@@ -55,6 +71,7 @@ webapp/frontend/test-results/
 webapp/frontend/playwright-report/
 /tmp_*.png
 /.private/
+/tmp/
 
 # Phase PERF-1 — runtime artefacts.
 # webapp_data/cache/ is already covered by webapp_data/ above; this

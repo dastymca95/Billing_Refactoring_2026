@@ -79,6 +79,7 @@ TAX_KEYWORDS = (
     "franchise tax",
 )
 CONNECTION_FEE_KEYWORDS = (
+    "account establishment charge",
     "connect fee",
     "connection fee",
     "reconnection fee",
@@ -160,9 +161,25 @@ ELECTRIC_KEYWORDS = (
     "power",
     "demand",
 )
+ELECTRIC_COMMON_KEYWORDS = (
+    "area light",
+    "common light",
+    "led light",
+    "rental light",
+    "rental lights",
+    "outdoor light",
+    "outdoor lights",
+    "parking lot light",
+    "pole charge",
+    "security light",
+    "site light",
+    "street light",
+    "yard light",
+)
 
 DEFAULT_UTILITY_GL: dict[str, str] = {
     "electric": "6915",
+    "electric_common": "6915",
     "electric_vacant": "6920",
     "gas": "6930",
     "gas_vacant": "6935",
@@ -319,6 +336,15 @@ def classify_utility_line_detail(description: str) -> UtilityLineClassification:
             ("gl_mapping_required_fire_service",),
         ),
         (
+            "electric_common_service",
+            ELECTRIC_COMMON_KEYWORDS,
+            "Matched outdoor/common-area electric lighting keyword.",
+            "electric_common_gl_6915",
+            True,
+            True,
+            (),
+        ),
+        (
             "trash_service",
             TRASH_SERVICE_KEYWORDS,
             "Matched trash/sanitation service keyword.",
@@ -431,6 +457,8 @@ def service_family(description: str, *, vendor_key: str = "") -> str:
     classification = classify_utility_line(description)
     if classification == "connection_fee":
         return "connection_fee"
+    if classification == "electric_common_service":
+        return "electric_common"
     if classification == "fire_protection_service":
         return "fire_protection"
     if classification == "trash_service":
@@ -470,6 +498,8 @@ def default_gl_for_line(
     line_type = classify_utility_line(description)
     if line_type == "connection_fee":
         return "6956"
+    if line_type == "electric_common_service":
+        return "6915"
     if line_type == "fire_protection_service":
         fire_cfg = (
             (cfg.get("utility_processing") or {}).get("fire_service_rules")
@@ -485,7 +515,9 @@ def default_gl_for_line(
         )
         return str(trash_cfg.get("gl_account") or trash_cfg.get("gl_code") or "").strip() or "6940"
     if line_type == "late_fee":
-        return str(((cfg.get("accounting_mapping") or {}).get("default_gl_code") or "")).strip()
+        late_cfg = (cfg.get("special_charges") or {}).get("late_fee") or {}
+        late_gl = str(late_cfg.get("gl_account") or late_cfg.get("gl_code") or "").strip()
+        return late_gl or str(((cfg.get("accounting_mapping") or {}).get("default_gl_code") or "")).strip()
     if line_type in {"tax", "payment", "previous_balance"}:
         return ""
 
@@ -736,6 +768,10 @@ def validate_utility_template_rows(
             blocking.append(f"row_{idx}:fire_service_mapped_as_water")
         if classification == "trash_service" and gl != DEFAULT_UTILITY_GL.get("trash"):
             blocking.append(f"row_{idx}:trash_service_wrong_gl")
+        if classification == "stormwater_service" and gl != DEFAULT_UTILITY_GL.get("stormwater"):
+            blocking.append(f"row_{idx}:stormwater_service_wrong_gl")
+        if source_classification == "stormwater_service" and gl != DEFAULT_UTILITY_GL.get("stormwater"):
+            blocking.append(f"row_{idx}:stormwater_service_wrong_gl")
         service_address = normalize_service_address_for_row(
             meta.get("service_address") or meta.get("ai_service_address") or ""
         )
@@ -801,6 +837,7 @@ __all__ = [
     "is_non_expense_line",
     "load_chart_of_accounts",
     "load_vendor_config",
+    "looks_like_raw_address",
     "money",
     "service_family",
     "service_period_range",

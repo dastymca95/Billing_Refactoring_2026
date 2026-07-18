@@ -118,10 +118,17 @@ export function GlAccountExplanation({ row, glAccount, glName }: {
 }
 
 function backendExplanation(raw: unknown, glCode: string, explicitName?: string): Explanation | null {
-  if (!raw || typeof raw !== "object") return null;
+  if (!raw || typeof raw !== "object") {
+    return {
+      accountName: explicitName || "Unverified GL",
+      reason: "This displayed GL has no backend AccountingDecision attached. It is not an explained engine selection and must be reviewed before export.",
+      evidence: ["No accounting-decision provenance is available for this row."], alternatives: [],
+      confidence: "Not supplied", review: "Required - missing accounting decision",
+      source: "Missing backend provenance", versions: "Not supplied", scoreComponents: [],
+    };
+  }
   const decision = raw as Record<string, unknown>;
   const selected = normalizeGlCode(decision.selected_gl_code);
-  if (!selected || selected !== glCode) return null;
   const ranked = arrayValue(decision.candidates_ranked);
   const evidence = arrayValue(decision.evidence).map((item) => {
     if (!item || typeof item !== "object") return "";
@@ -135,13 +142,27 @@ function backendExplanation(raw: unknown, glCode: string, explicitName?: string)
       const value = item as Record<string, unknown>;
       const code = normalizeGlCode(value.gl_code);
       if (!code || code === selected) return null;
-      return { code, name: stringValue(value.gl_name), whyNot: stringValue(value.reason) || "Lower backend score." };
+      return { code, name: stringValue(value.gl_name), whyNot: stringValue(value.reason) || "Not selected because its current-line support was weaker than the selected GL." };
     }).filter((item): item is Alternative => item !== null);
   const top = ranked[0] && typeof ranked[0] === "object" ? ranked[0] as Record<string, unknown> : {};
   const components = top.score_components && typeof top.score_components === "object"
     ? Object.entries(top.score_components as Record<string, unknown>).map(([key, value]) => `${key}: ${Number(value).toFixed(2)}`)
     : [];
   const confidence = typeof decision.confidence === "number" ? `${Math.round(decision.confidence * 100)}%` : "Not supplied";
+  if (!selected || selected !== glCode) {
+    const selectedName = stringValue(decision.selected_gl_name);
+    const selectedSummary = selected ? `${selected}${selectedName ? ` - ${selectedName}` : ""}` : "no safe GL";
+    return {
+      accountName: explicitName || "Provisional GL",
+      reason: `This displayed GL was not selected by AccountingDecisionEngine. The backend selected ${selectedSummary}; this value is provisional, legacy, or locally edited and is not an authorized explained selection.`,
+      evidence: evidence.length ? evidence : ["The displayed value does not match selected_gl_code in the backend decision."],
+      alternatives: selected ? [{ code: selected, name: selectedName, whyNot: "Backend-selected GL for this line; refresh or review the local value." }] : [],
+      confidence, review: "Required - displayed GL differs from backend decision",
+      source: stringValue(decision.decision_source) || "AccountingDecisionEngine",
+      versions: [decision.decision_version, decision.semantic_version, decision.catalog_version].filter(Boolean).join(" · "),
+      scoreComponents: [],
+    };
+  }
   return {
     accountName: stringValue(decision.selected_gl_name) || explicitName || "",
     reason: stringValue(decision.why_selected), evidence, alternatives: dedupe(alternatives), confidence,

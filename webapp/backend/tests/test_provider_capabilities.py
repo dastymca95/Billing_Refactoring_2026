@@ -6,11 +6,15 @@ from webapp.backend.services.provider_capabilities import (
 )
 
 
-def test_environment_profiles_require_explicit_configuration(monkeypatch):
+def _clear_provider_environment(monkeypatch):
+    prefixes = ("AI_", "GEMINI_", "DEEPSEEK_", "ANTHROPIC_")
     for key in list(__import__("os").environ):
-        if not key.startswith("AI_"):
-            continue
-        monkeypatch.delenv(key, raising=False)
+        if key.startswith(prefixes):
+            monkeypatch.delenv(key, raising=False)
+
+
+def test_environment_profiles_require_explicit_configuration(monkeypatch):
+    _clear_provider_environment(monkeypatch)
     assert ProfileLoader._environment_profiles() == []
 
 
@@ -129,9 +133,7 @@ def test_partial_verification_does_not_enable_autonomous_gateway():
 
 
 def test_environment_topology_has_four_isolated_profiles_with_safe_fallback(monkeypatch):
-    for key in list(__import__("os").environ):
-        if key.startswith("AI_"):
-            monkeypatch.delenv(key, raising=False)
+    _clear_provider_environment(monkeypatch)
     values = {
         "AI_PROVIDER": "openai_compatible",
         "AI_MODEL": "text-model",
@@ -157,9 +159,7 @@ def test_environment_topology_has_four_isolated_profiles_with_safe_fallback(monk
 
 
 def test_profile_specific_credentials_and_endpoints_override_base(monkeypatch):
-    for key in list(__import__("os").environ):
-        if key.startswith("AI_"):
-            monkeypatch.delenv(key, raising=False)
+    _clear_provider_environment(monkeypatch)
     for key, value in {
         "AI_PROVIDER": "openai_compatible", "AI_MODEL": "text", "AI_API_KEY": "base",
         "AI_BASE_URL": "https://base.invalid/v1", "AI_VERIFICATION_MODEL": "verify",

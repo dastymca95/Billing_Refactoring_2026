@@ -43,6 +43,20 @@ def _save_result(batch_id: str, path: Path, result: dict[str, Any]) -> None:
             pass
 
 
+def _record_ai_review(batch_id: str, kind: str, applied: int, details: dict[str, Any]) -> None:
+    if applied <= 0:
+        return
+    from ..services import operator_activity_log
+    operator_activity_log.record(
+        batch_id=batch_id,
+        event_type=f"ai_review_{kind}_applied",
+        source="ai",
+        actor="local_operator",
+        summary=f"Applied AI-assisted {kind.replace('_', ' ')} to {applied} row{'s' if applied != 1 else ''}.",
+        details={**details, "applied_rows": applied, "human_confirmed": True},
+    )
+
+
 def _iter_rows(result: dict[str, Any]):
     flat = 0
     for inv in result.get("all_invoices") or []:
@@ -309,6 +323,9 @@ def apply_vendor_mapping_endpoint(batch_id: str, body: ApplyVendorMappingBody) -
         source_file=target_source_file,
     )
     _save_result(batch_id, path, result)
+    _record_ai_review(batch_id, "vendor_mapping", applied, {
+        "selected_vendor_name": selected["vendor_name"], "scope": body.apply_scope,
+    })
     return {
         "batch_id": batch_id,
         "applied_rows": applied,
@@ -382,6 +399,11 @@ def apply_property_location_endpoint(
         source_file=target_source_file if body.apply_scope == "current_invoice" else None,
     )
     _save_result(batch_id, path, result)
+    _record_ai_review(batch_id, "property_location", applied, {
+        "property_abbreviation": selected["property_abbreviation"],
+        "location": "" if body.leave_location_blank else selected.get("location", ""),
+        "scope": body.apply_scope,
+    })
     return {
         "batch_id": batch_id,
         "applied_rows": applied,
@@ -462,6 +484,9 @@ def apply_gl_mapping_endpoint(batch_id: str, body: ApplyGlMappingBody) -> dict:
         source_file=source_file,
     )
     _save_result(batch_id, path, result)
+    _record_ai_review(batch_id, "gl_mapping", applied, {
+        "gl_account": account["gl_code"], "apply_to_similar": body.apply_to_similar,
+    })
     return {
         "batch_id": batch_id,
         "applied_rows": applied,
@@ -510,4 +535,5 @@ def apply_tax_policy_endpoint(batch_id: str, body: ApplyTaxPolicyBody) -> dict:
             source_file=target_source_file,
         )
     _save_result(batch_id, path, result)
+    _record_ai_review(batch_id, "tax_policy", applied, {"policy": body.policy})
     return {"batch_id": batch_id, "applied_rows": applied, "policy": body.policy}

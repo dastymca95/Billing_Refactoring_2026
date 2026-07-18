@@ -4,7 +4,7 @@ category_expected: other_infrequent
 invoice_number_expected: "7000080162"
 account_number_expected: "8039646-229260"
 invoice_date_expected: 08/27/2025
-due_date_expected: 08/27/2025
+due_date_expected: 09/26/2025
 service_period_expected:
   start: ""
   end: ""
@@ -12,7 +12,7 @@ service_period_expected:
 property_abbreviation_expected: HP-Hogs
 location_expected: ""
 location_policy_expected: valid_unit_if_present
-invoice_description_expected: 08/27/25 - TK Elevator Corporation - Governor Switch Tripped Adjusted Governor - Labor
+invoice_description_expected: Governor Switch Tripped Adjusted Governor - Labor; Trip Charge
 line_items_expected:
   - line_item_number: 1
     gl_account: "6530"

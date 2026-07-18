@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 from fastapi.testclient import TestClient  # noqa: E402
 
 from webapp.backend.main import app  # noqa: E402
-from webapp.backend.services import ai_mapping_review, batch_store  # noqa: E402
+from webapp.backend.services import ai_invoice_processor, ai_mapping_review, batch_store  # noqa: E402
 from webapp.backend.services.ai_invoice_processor import (  # noqa: E402
     ai_result_to_invoice,
     validate_ai_extraction,
@@ -216,6 +216,90 @@ def main() -> int:
         assert any(c["gl_code"] == "6651" for c in gl["candidates"]), gl
         print("GL candidate generation: OK")
 
+        lowes_layout_text = """
+        6910 Brasada Drive
+        Houston, TX 77085
+        RETURN SERVICE REQUESTED
+        BILL TO:
+        INVOICE
+        Bill To #
+        Order #
+        Invoice Date
+        Due Date
+        PO #
+        Reference
+        202617
+        20954736-00
+        06/05/26
+        07/05/26
+        9811
+        Remit To:
+        P.O. Box 301451
+        Dallas, TX 75303-1451
+        SHIP TO:
+        The Villas of Pine Valley
+        1200 Pine Valley Dr
+        Elizabethtown, KY 42701-8671
+        Ship Point LPS-Indianapolis-4506 Via LINE HAUL LU0/2 / Ship Date 06/05/26 Terms Net 30
+        Ln# Bin Loc. Product
+        Description
+        Quantity Ordered Qty. U/M Quantity Shipped Unit Price (Net) Extended Amount
+        6 / A/ 04/4 427375 6 Pack 6 10.00 60.00
+        LED 60W A19 CL FIL 5K
+        CLEAR FILAMENT
+        GL CODE:Light Bulbs
+        8 / B/ 14/3 821270 5 Pack 5 6.00 30.00
+        PRO EDGE MICROFIBER 3/8"
+        X 4" ROLLER COVER 2/PK
+        GL CODE:Paint
+        7 / F/ 21/3 670857 4 Each 4 15.00 60.00
+        GRAZ TOWEL RING
+        BRUSHED NICKEL
+        Customer Copy Page 1 of 2
+        Lines Total Qty Shipped Total 15 Total 150.00
+        Taxes 9.00
+        Invoice Total 159.00
+        Description Total Merchandise
+        Hardware 60.00
+        Light Bulbs 60.00
+        Paint 30.00
+        """
+        lowes_raw = ai_invoice_processor._repair_ai_payload_from_ocr(
+            {
+                "vendor_name": "",
+                "invoice_number": "",
+                "invoice_date": "",
+                "due_date": "",
+                "bill_or_credit": "Bill",
+                "line_items": [],
+                "total_amount": 0,
+                "warnings": [],
+            },
+            lowes_layout_text,
+            source_file="lowes_layout_without_logo_text.pdf",
+        )
+        lowes_normalized = validate_ai_extraction(lowes_raw)
+        lowes_invoice = ai_result_to_invoice(
+            lowes_normalized,
+            batch_id="batch_20990101_000000_000",
+            source_file="lowes_layout_without_logo_text.pdf",
+            vendor_key="lowes",
+            support_document_url="https://dropbox.example/lowes-layout.pdf",
+        )
+        lowes_rows = lowes_invoice["rows"]
+        assert lowes_normalized["vendor_name"] == "Lowes Pro Supply", lowes_normalized
+        assert lowes_normalized["category"] == "other_infrequent", lowes_normalized
+        assert lowes_normalized["invoice_number"] == "20954736-00", lowes_normalized
+        assert lowes_normalized["due_date"] == "07/05/2026", lowes_normalized
+        assert lowes_normalized["blocking_required_fields"] == [], lowes_normalized
+        assert [row["GL Account"] for row in lowes_rows] == ["6660", "6770", "6651"], lowes_rows
+        assert round(sum(float(row["Amount"]) for row in lowes_rows), 2) == 159.00, lowes_rows
+        assert "Lowes" not in lowes_rows[0]["Invoice Description"], lowes_rows[0]
+        assert "06/05" not in lowes_rows[0]["Invoice Description"], lowes_rows[0]
+        assert lowes_rows[1]["GL Account"] != "6139", lowes_rows[1]
+        assert lowes_rows[2]["Line Item Description"] == "Graz Towel Ring Brushed Nickel", lowes_rows[2]
+        print("Lowe's Pro Supply image-only vendor layout repair: OK")
+
         learned_gl = ai_mapping_review.save_gl_mapping(
             vendor_name="Lowes Pro Supply",
             pattern="bar pull",
@@ -331,6 +415,101 @@ def main() -> int:
         assert len(hardened_inv["rows"]) == 1, hardened_inv
         assert row["Invoice Description"] != "Hardware and miscellaneous items", row
         print("AI variable invoice validation hardening: OK")
+
+        landscape_payload = {
+            "vendor_name": "Landscape Services, Inc.",
+            "invoice_number": "205843",
+            "invoice_date": "05/01/2026",
+            "due_date": "",
+            "service_address": "300 Greenwood Drive\nClarksville, TN 37040",
+            "property_candidate": "Penn Warren Apartments",
+            "invoice_description": "300 Greenwood Dr Clarksville",
+            "line_items": [
+                {
+                    "description": "Storm Damage Limb Removal and Disposal- 4/29",
+                    "amount": 260.0,
+                    "gl_account_candidate": "1300",
+                    "confidence": 0.95,
+                }
+            ],
+            "total_amount": 260.0,
+            "confidence": 0.95,
+            "warnings": ["image_ocr_cache_hit"],
+        }
+        landscape = validate_ai_extraction(landscape_payload)
+        landscape_invoice = ai_result_to_invoice(
+            landscape,
+            batch_id="batch_20990101_000000_001",
+            source_file="landscape.png",
+            vendor_key="ai_assisted",
+        )
+        landscape_row = landscape_invoice["rows"][0]
+        assert landscape["line_items"][0]["gl_account_candidate"] == "6810", landscape
+        assert landscape["due_date"] == "05/31/2026", landscape
+        assert landscape["service_period_start"] == "04/29/2026", landscape
+        assert "required_due_date" not in landscape["manual_review_codes"], landscape
+        assert "ai_warning_image_ocr_cache_hit" not in landscape["manual_review_codes"], landscape
+        assert landscape_row["GL Account"] == "6810", landscape_row
+        assert landscape_row["Invoice Description"].startswith("May-26 - "), landscape_row
+        assert landscape_row["Line Item Description"].startswith("May-26 - "), landscape_row
+        print("Landscape screenshot GL/date/period guard: OK")
+
+        bels_ocr_text = """
+To: Invoice # 1327
+admiral place (charles) Invoice Date 05/05/2026
+301 Ligon Drive, Shelbyville, Tennessee 37160
+Payment Term Net 30
+Shelbyville, TN 37160
+Amount Due $1,150.00
+Item Quantity Price Tax1 Tax2 Line Total
+Mowing admiral place may 1.0 $1,150.00 $1,150.00
+Subtotal: $1,150.00
+Tax: $0.00
+Past Due Amount: $0.00
+Amount Due: $1,150.00
+Notes
+Thank You For Your Business!
+"""
+        bels_bad_ai_payload = {
+            "vendor_name": "Nex-Gen Management LLC dba Magnolia Village Apartments",
+            "invoice_number": "1328",
+            "invoice_date": "05/05/2026",
+            "due_date": "",
+            "line_items": [
+                {
+                    "description": "Magnolia village apartments may",
+                    "amount": 1150.0,
+                    "gl_account_candidate": "6335",
+                    "confidence": 0.75,
+                }
+            ],
+            "subtotal": 1150.0,
+            "tax_amount": 0.0,
+            "total_amount": 1150.0,
+            "confidence": 0.75,
+            "warnings": [],
+        }
+        bels_repaired = ai_invoice_processor._repair_ai_payload_from_ocr(
+            bels_bad_ai_payload,
+            bels_ocr_text,
+            source_file="bels_screenshot.pdf",
+        )
+        bels = validate_ai_extraction(bels_repaired)
+        bels_invoice = ai_result_to_invoice(
+            bels,
+            batch_id="batch_20990101_000000_002",
+            source_file="bels_screenshot.pdf",
+            vendor_key="ai_assisted",
+        )
+        bels_row = bels_invoice["rows"][0]
+        assert bels["vendor_name"] == "Bel's Landscaping", bels
+        assert bels["invoice_number"] == "1327", bels
+        assert bels["due_date"] == "06/04/2026", bels
+        assert bels["property_abbreviation"] == "APA", bels
+        assert bels_row["GL Account"] == "6810", bels_row
+        assert bels_row["Invoice Description"].startswith("May-26 - "), bels_row
+        assert bels_row["Line Item Description"].startswith("May-26 - "), bels_row
+        print("Bel's Landscaping screenshot customer/vendor guard: OK")
 
         created = client.post(
             "/api/batches",

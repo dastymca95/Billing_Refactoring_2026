@@ -1,8 +1,25 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  lazy,
+  Suspense,
+  type CSSProperties,
+} from "react";
+import { createPortal } from "react-dom";
 
-import { api, getFriendlyErrorMessage, isApiError } from "./api";
+import {
+  api,
+  getFriendlyErrorMessage,
+  isApiError,
+  type UploadFileResponse,
+} from "./api";
 import { AiFallbackStatusBadge } from "./components/AiFallbackStatusBadge";
 import { BatchExplorer } from "./components/BatchExplorer";
+import { BatchSelectorDropdown } from "./components/BatchSelectorDropdown";
+import { BillingV2 } from "./features/billing-v2/BillingV2";
 import {
   ConfirmDialog,
   type ConfirmDialogOptions,
@@ -25,12 +42,14 @@ import {
 import { Toasts, type Toast } from "./components/Toasts";
 import { WorkflowSteps } from "./components/WorkflowSteps";
 import { useResizablePanel } from "./hooks/useResizablePanel";
+import { perfStart } from "./perf";
 import type { CellEdits } from "./components/ResManTemplatePreview";
 import type {
   BatchListEntry,
   BatchProgress,
   DocumentMode,
   FileEntry,
+  HumanAdjudicationOptions,
   ManualReviewItem,
   PreviewResponse,
   PreviewRow,
@@ -40,6 +59,8 @@ import type {
 // localStorage key used to remember the active batch across page refreshes.
 const ACTIVE_BATCH_LS_KEY = "billing_refactoring_active_batch_id";
 const NAV_COLLAPSED_LS_KEY = "billing_refactoring_nav_collapsed";
+const DOCUMENT_ATTACHMENT_GROUPS_LS_KEY =
+  "billing_refactoring_document_attachment_groups_v1";
 const BATCH_NAME_MAX = 80;
 
 // How often the frontend polls /progress while processing. Phase 1O —
@@ -48,10 +69,51 @@ const BATCH_NAME_MAX = 80;
 // feel live, slow enough that a long batch doesn't hammer the API.
 const PROGRESS_POLL_MS = 500;
 const UPLOAD_PARALLEL_LIMIT = 4;
+const MASS_UPLOAD_THRESHOLD = 100;
+const MASS_UPLOAD_PARALLEL_LIMIT = 3;
+const UPLOAD_STATE_FLUSH_MS = 90;
+const UPLOADED_FILE_FLUSH_MS = 220;
+const UPLOAD_RESULT_LINGER_MS = 2600;
+const APPENDABLE_OPEN_DOCUMENT_EXTENSIONS = new Set([
+  "pdf",
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "bmp",
+  "webp",
+]);
 
 // Maximum total time we'll wait for a background processing run before
 // showing a "still working" message. The poll never auto-aborts.
 const MAX_PROCESSING_WAIT_MS = 15 * 60 * 1000;
+const PREVIEW_READY_RETRY_ATTEMPTS = 10;
+const PREVIEW_READY_RETRY_BASE_MS = 250;
+const DOCUMENT_NAVIGATION_LOCK_MS = 5000;
+const DOCUMENT_NAVIGATION_SETTLE_LOCK_MS = 1200;
+const DOCUMENT_POPOUT_FEATURES =
+  "popup=yes,width=1180,height=900,resizable=yes,scrollbars=no";
+
+const FloatingAccountingAssistant = lazy(() =>
+  import("./components/AccountingAssistantWorkspace").then((module) => ({
+    default: module.FloatingAccountingAssistant,
+  })),
+);
+const AccountingRulesWorkspace = lazy(() =>
+  import("./components/AccountingRulesWorkspace").then((module) => ({
+    default: module.AccountingRulesWorkspace,
+  })),
+);
+const ResManContextWorkspace = lazy(() =>
+  import("./components/ResManContextWorkspace").then((module) => ({
+    default: module.ResManContextWorkspace,
+  })),
+);
+const ContextIntelligenceWorkspace = lazy(() =>
+  import("./components/ContextIntelligenceWorkspace").then((module) => ({
+    default: module.ContextIntelligenceWorkspace,
+  })),
+);
 
 type DocumentNavTarget = {
   batchId: string;
@@ -67,6 +129,66 @@ type ActiveDocumentPage = {
 };
 
 type PanelKey = "batches" | "document" | "template";
+type DocumentAttachmentGroups = Record<string, Record<string, string[]>>;
+type DocumentNavigationLock = ActiveDocumentPage & { expiresAt: number };
+type RowNavigationGuard = { rowIndex: number; expiresAt: number };
+
+function prepareDetachedDocumentWindow(win: Window): HTMLElement {
+  const targetDoc = win.document;
+  targetDoc.open();
+  targetDoc.write("<!doctype html><html><head></head><body></body></html>");
+  targetDoc.close();
+  targetDoc.title = "Document viewer";
+  targetDoc.body.className = "detached-document-window";
+
+  const base = targetDoc.createElement("base");
+  base.href = window.location.href.split("#")[0];
+  targetDoc.head.appendChild(base);
+
+  for (const node of Array.from(document.head.children)) {
+    const tag = node.tagName.toLowerCase();
+    const rel =
+      tag === "link"
+        ? (node as HTMLLinkElement).rel?.toLowerCase()
+        : "";
+    if (tag === "style" || (tag === "link" && rel.includes("stylesheet"))) {
+      targetDoc.head.appendChild(node.cloneNode(true));
+    }
+  }
+
+  const runtimeStyle = targetDoc.createElement("style");
+  runtimeStyle.textContent = `
+    html,
+    body,
+    #detached-document-root {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #dcecff;
+    }
+    body.detached-document-window {
+      min-width: 720px;
+    }
+    body.detached-document-window .doc-preview-card {
+      width: 100vw;
+      height: 100vh;
+      border-radius: 0;
+      border: 0;
+      box-shadow: none;
+    }
+    body.detached-document-window .doc-preview-body {
+      min-height: 0;
+      height: calc(100vh - 36px);
+    }
+  `;
+  targetDoc.head.appendChild(runtimeStyle);
+
+  const root = targetDoc.createElement("div");
+  root.id = "detached-document-root";
+  targetDoc.body.appendChild(root);
+  return root;
+}
 
 // Phase 2C — derive a friendly vendor label for the breadcrumb header.
 // Prefers the per-batch detection summary when one vendor dominates;
@@ -116,13 +238,155 @@ function rowDocumentRef(row: PreviewRow | null | undefined): {
   return { filename, pageNumber };
 }
 
+function findRowIndexForDocumentPage(
+  rows: PreviewRow[] | undefined,
+  page: ActiveDocumentPage | null,
+): number {
+  if (!rows || !page?.filename) return -1;
+  const targetFile = page.filename.trim();
+  const targetPage = Math.max(1, Math.floor(page.pageNumber || 1));
+  if (!targetFile) return -1;
+
+  const rowFile = (row: PreviewRow) =>
+    typeof row._meta?.source_file === "string" ? row._meta.source_file.trim() : "";
+  const rowPage = (row: PreviewRow) => {
+    const raw = row._meta?.source_page;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+  };
+
+  const exactIndex = rows.findIndex(
+    (row) => rowFile(row) === targetFile && rowPage(row) === targetPage,
+  );
+  if (exactIndex >= 0) return exactIndex;
+
+  return rows.findIndex((row) => rowFile(row) === targetFile);
+}
+
+function sameDocumentPage(a: ActiveDocumentPage, b: ActiveDocumentPage): boolean {
+  return (
+    a.batchId === b.batchId &&
+    a.filename === b.filename &&
+    Math.max(1, Math.floor(a.pageNumber || 1)) ===
+      Math.max(1, Math.floor(b.pageNumber || 1))
+  );
+}
+
 function extensionFromUploadName(name: string): string {
   const match = /\.([A-Za-z0-9]+)$/.exec(name || "");
   return match ? match[1].toLowerCase() : "";
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, Math.max(0, ms)));
+const VIEWER_IMAGE_UPLOAD_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "webp",
+  "gif",
+  "bmp",
+]);
+
+function shouldUploadAsViewerPdf(file: File): boolean {
+  const extension = extensionFromUploadName(file.name);
+  if (VIEWER_IMAGE_UPLOAD_EXTENSIONS.has(extension)) return true;
+  return Boolean(file.type && file.type.toLowerCase().startsWith("image/"));
+}
+
+function ModuleLoading({ label }: { label: string }) {
+  return <main className="assistant-module-shell" aria-busy="true">
+    <div className="assistant-module-header"><strong>{label}…</strong></div>
+  </main>;
+}
+
+function uploadItemPercent(progressPercent: number): number {
+  if (!Number.isFinite(progressPercent)) return 0;
+  return Math.max(1, Math.min(95, Math.round(progressPercent)));
+}
+
+function apiErrorDetailText(error: unknown): string {
+  if (!isApiError(error)) return "";
+  if (typeof error.detail === "string") return error.detail;
+  if (
+    error.detail &&
+    typeof error.detail === "object" &&
+    "message" in error.detail &&
+    typeof (error.detail as { message?: unknown }).message === "string"
+  ) {
+    return String((error.detail as { message: string }).message);
+  }
+  return error.message || "";
+}
+
+function isPreviewStillPreparingError(error: unknown): boolean {
+  if (!isApiError(error) || error.status !== 404) return false;
+  const detail = apiErrorDetailText(error);
+  if (/batch not found/i.test(detail)) return false;
+  return /no preview|manual-review data|run process/i.test(detail);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function uploadWorkerLimit(fileCount: number): number {
+  if (fileCount >= MASS_UPLOAD_THRESHOLD) return MASS_UPLOAD_PARALLEL_LIMIT;
+  return UPLOAD_PARALLEL_LIMIT;
+}
+
+function isTransientUploadError(error: unknown): boolean {
+  if (isApiError(error)) return error.status >= 500 || error.status === 0;
+  return error instanceof TypeError;
+}
+
+async function uploadFileWithRetry(
+  batchId: string,
+  file: File,
+  onProgress: (progress: { loaded: number; total: number; percent: number }) => void,
+  opts: { asPdf?: boolean } = {},
+): Promise<UploadFileResponse> {
+  const attempts = file.size > 8 * 1024 * 1024 ? 2 : 3;
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await api.uploadFile(batchId, file, onProgress, opts);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts || !isTransientUploadError(error)) break;
+      await delay(350 * attempt + Math.min(900, file.size / 1024 / 1024) * 60);
+    }
+  }
+  throw lastError;
+}
+
+function optimisticFileEntry(uploaded: UploadFileResponse, fallback: File): FileEntry {
+  const filename = uploaded.filename || fallback.name || "uploaded";
+  const extension =
+    uploaded.extension ||
+    (extensionFromUploadName(filename)
+      ? `.${extensionFromUploadName(filename)}`
+      : "");
+  return {
+    filename,
+    size_bytes: uploaded.size_bytes ?? fallback.size,
+    extension,
+    page_count: uploaded.page_count ?? null,
+    vendor_key: "unknown",
+    vendor_confidence: 0,
+    vendor_detection_reason: "Detection pending after upload.",
+    supported_in_phase_1: false,
+    source_type: "uploaded",
+    file_support_status: "pending",
+    file_support_label: "Pending detection",
+    file_support_reason: "The file is uploaded; metadata is still refreshing.",
+  };
+}
+
+function upsertFileEntry(previous: FileEntry[], entry: FileEntry): FileEntry[] {
+  const index = previous.findIndex((file) => file.filename === entry.filename);
+  if (index < 0) return [...previous, entry];
+  const next = previous.slice();
+  next[index] = { ...previous[index], ...entry };
+  return next;
 }
 
 function mergeFilesPreserveAppend(previous: FileEntry[], incoming: FileEntry[]): FileEntry[] {
@@ -146,10 +410,81 @@ function mergeFilesPreserveAppend(previous: FileEntry[], incoming: FileEntry[]):
   return ordered;
 }
 
+function normalizeDocumentAttachmentGroups(value: unknown): DocumentAttachmentGroups {
+  if (!value || typeof value !== "object") return {};
+  const normalized: DocumentAttachmentGroups = {};
+  for (const [batchId, rawGroup] of Object.entries(value as Record<string, unknown>)) {
+    if (!batchId || !rawGroup || typeof rawGroup !== "object") continue;
+    const group: Record<string, string[]> = {};
+    for (const [parentName, rawChildren] of Object.entries(
+      rawGroup as Record<string, unknown>,
+    )) {
+      if (!parentName || !Array.isArray(rawChildren)) continue;
+      const children = Array.from(
+        new Set(
+          rawChildren.filter(
+            (child): child is string => typeof child === "string" && child !== parentName,
+          ),
+        ),
+      );
+      if (children.length > 0) group[parentName] = children;
+    }
+    if (Object.keys(group).length > 0) normalized[batchId] = group;
+  }
+  return normalized;
+}
+
+function loadDocumentAttachmentGroups(): DocumentAttachmentGroups {
+  try {
+    return normalizeDocumentAttachmentGroups(
+      JSON.parse(localStorage.getItem(DOCUMENT_ATTACHMENT_GROUPS_LS_KEY) || "{}"),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function resolveDocumentGroupParent(
+  groups: DocumentAttachmentGroups,
+  batchId: string | null,
+  selectedFilename: string | null,
+): string | null {
+  if (!batchId || !selectedFilename) return null;
+  const group = groups[batchId] || {};
+  if (group[selectedFilename]) return selectedFilename;
+  const owner = Object.entries(group).find(([, children]) =>
+    children.includes(selectedFilename),
+  );
+  return owner?.[0] || selectedFilename;
+}
+
+function fileExtensionForEntryOrName(
+  files: FileEntry[],
+  filename: string | null | undefined,
+): string {
+  if (!filename) return "";
+  const entry = files.find((file) => file.filename === filename);
+  const raw = entry?.extension || extensionFromUploadName(filename);
+  return raw.replace(/^\./, "").toLowerCase();
+}
+
+function isSupplementalDocumentCandidate(file: FileEntry): boolean {
+  const ext = (file.extension || "").replace(/^\./, "").toLowerCase();
+  if (["png", "jpg", "jpeg", "webp", "gif", "bmp"].includes(ext)) return true;
+  const filename = file.filename.toLowerCase();
+  if (/(screenshot|screen shot|paystub|pay stub|receipt|support|attachment)/.test(filename)) {
+    return true;
+  }
+  const label = (file.file_support_label || "").toLowerCase();
+  const status = (file.file_support_status || "").toLowerCase();
+  if (label.includes("screenshot")) return true;
+  return status === "needs_review" || status === "needs review";
+}
+
 export default function App() {
   // Top-level workspace stays focused on batches. Rules, fallback behavior,
   // and output text rules now live in Settings.
-  const [activeModule, setActiveModule] = useState<AppModule>("batches");
+  const [activeModule, setActiveModule] = useState<AppModule>("billing-v2");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [navCollapsed, setNavCollapsed] = useState(() => {
     try {
@@ -162,21 +497,87 @@ export default function App() {
   const [files, setFiles] = useState<FileEntry[]>([]);
   const filesRef = useRef<FileEntry[]>([]);
   const [uploadItems, setUploadItems] = useState<UploadFileProgress[]>([]);
-  const uploadItemsRef = useRef<UploadFileProgress[]>([]);
+  const uploadItemPatchQueueRef = useRef<Map<string, Partial<UploadFileProgress>>>(
+    new Map(),
+  );
+  const uploadItemPatchTimerRef = useRef<number | null>(null);
+  const uploadedFileQueueRef = useRef<FileEntry[]>([]);
+  const uploadedFileFlushTimerRef = useRef<number | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [documentRefreshToken, setDocumentRefreshToken] = useState(0);
+  const [documentAttachmentGroups, setDocumentAttachmentGroups] =
+    useState<DocumentAttachmentGroups>(() => loadDocumentAttachmentGroups());
   const [documentTarget, setDocumentTarget] =
     useState<DocumentNavTarget | null>(null);
   const [activeDocumentPage, setActiveDocumentPage] =
     useState<ActiveDocumentPage | null>(null);
   const navNonceRef = useRef(0);
-
-  useEffect(() => {
-    uploadItemsRef.current = uploadItems;
-  }, [uploadItems]);
+  const documentNavigationLockRef = useRef<DocumentNavigationLock | null>(null);
+  const rowNavigationGuardRef = useRef<RowNavigationGuard | null>(null);
 
   useEffect(() => {
     filesRef.current = files;
   }, [files]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        DOCUMENT_ATTACHMENT_GROUPS_LS_KEY,
+        JSON.stringify(documentAttachmentGroups),
+      );
+    } catch {
+      /* localStorage unavailable; grouping remains in session state */
+    }
+  }, [documentAttachmentGroups]);
+
+  useEffect(() => {
+    if (!batchId) return;
+    const existingNames = new Set(files.map((file) => file.filename));
+    setDocumentAttachmentGroups((prev) => {
+      const group = prev[batchId];
+      if (!group) return prev;
+      let changed = false;
+      const nextGroup: Record<string, string[]> = {};
+      for (const [parentName, children] of Object.entries(group)) {
+        if (!existingNames.has(parentName)) {
+          changed = true;
+          continue;
+        }
+        const nextChildren = children.filter(
+          (childName) =>
+            childName !== parentName && existingNames.has(childName),
+        );
+        if (nextChildren.length !== children.length) changed = true;
+        if (nextChildren.length > 0) nextGroup[parentName] = nextChildren;
+      }
+      if (!changed) return prev;
+      return {
+        ...prev,
+        [batchId]: nextGroup,
+      };
+    });
+  }, [batchId, files]);
+
+  const explorerAttachmentGroups = useMemo<DocumentAttachmentGroups>(() => {
+    const normalized = normalizeDocumentAttachmentGroups(documentAttachmentGroups);
+    const parentName = resolveDocumentGroupParent(normalized, batchId, selected);
+    if (!batchId || !parentName || files.length <= 1) return normalized;
+
+    const inferredChildren = files
+      .filter((file) => file.filename !== parentName)
+      .filter(isSupplementalDocumentCandidate)
+      .map((file) => file.filename);
+    if (inferredChildren.length === 0) return normalized;
+
+    const batchGroup = { ...(normalized[batchId] || {}) };
+    batchGroup[parentName] = Array.from(
+      new Set([...(batchGroup[parentName] || []), ...inferredChildren]),
+    ).filter((filename) => filename !== parentName);
+    return {
+      ...normalized,
+      [batchId]: batchGroup,
+    };
+  }, [batchId, documentAttachmentGroups, files, selected]);
 
   useEffect(() => {
     try {
@@ -198,6 +599,10 @@ export default function App() {
   }, []);
 
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStartedAtMs, setProcessingStartedAtMs] = useState<number | null>(
+    null,
+  );
+  const [processingElapsedMs, setProcessingElapsedMs] = useState(0);
   const [isCancelling, setIsCancelling] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isSavingEdits, setIsSavingEdits] = useState(false);
@@ -221,6 +626,10 @@ export default function App() {
   // so the Document panel can fill the freed horizontal space.
   const [templateDetached, setTemplateDetached] = useState(false);
   const templatePopoutRef = useRef<Window | null>(null);
+  const [documentDetached, setDocumentDetached] = useState(false);
+  const [documentPopoutRoot, setDocumentPopoutRoot] =
+    useState<HTMLElement | null>(null);
+  const documentPopoutRef = useRef<Window | null>(null);
   const [exportName, setExportName] = useState<string>("");
   const [vendorLabel, setVendorLabel] = useState<string>("");
   // Phase 2D — template revision history + cross-batch queue.
@@ -234,9 +643,11 @@ export default function App() {
   // older than the current token are dropped so a stale fast-arriving
   // response can never overwrite a newer slow-arriving one.
   const switchTokenRef = useRef(0);
+  const switchAbortRef = useRef<AbortController | null>(null);
 
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [review, setReview] = useState<ManualReviewItem[]>([]);
+  const previewAutoloadRef = useRef<string | null>(null);
   const [edits, setEdits] = useState<CellEdits>({});
   const [error, setError] = useState<string | null>(null);
 
@@ -279,6 +690,13 @@ export default function App() {
   // right column), so we no longer track an `inspectorCollapsed` state
   // on the main shell.
   const [selectedRowIndex, setSelectedRowIndex] = useState<number | null>(null);
+  const assistantInvoiceGroupId = useMemo(() => {
+    const rows = preview?.rows || [];
+    const row = selectedRowIndex != null ? rows[selectedRowIndex] : rows[0];
+    return String(
+      row?._meta?.invoice_group_id || row?.["Invoice Number"] || "",
+    ) || null;
+  }, [preview, selectedRowIndex]);
   const [inspectorTab, setInspectorTab] = useState<"issues" | "row">("issues");
   const [issuesOpen, setIssuesOpen] = useState<boolean>(false);
   // Phase 2F — desktop window model. Minimize sends panels to the
@@ -342,7 +760,7 @@ export default function App() {
   const minimizeAllPanels = useCallback(() => {
     setActiveModule("batches");
     setClosedPanels(new Set());
-    setMinimizedPanels(new Set<PanelKey>(["batches", "document", "template"]));
+    setMinimizedPanels(new Set<PanelKey>(["document", "template"]));
     setMaximizedPanel(null);
   }, []);
 
@@ -361,6 +779,25 @@ export default function App() {
   // Phase 1F: per-batch progress + polling.
   const [progress, setProgress] = useState<BatchProgress | null>(null);
   const pollingTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!isProcessing || processingStartedAtMs == null) return;
+    const updateElapsed = () => {
+      setProcessingElapsedMs(Math.max(0, Date.now() - processingStartedAtMs));
+    };
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 500);
+    return () => window.clearInterval(timer);
+  }, [isProcessing, processingStartedAtMs]);
+
+  useEffect(() => {
+    if (!isProcessing || processingStartedAtMs != null) return;
+    const startedAt = progress?.started_at ? Date.parse(progress.started_at) : NaN;
+    if (Number.isFinite(startedAt)) {
+      setProcessingStartedAtMs(startedAt);
+      setProcessingElapsedMs(Math.max(0, Date.now() - startedAt));
+    }
+  }, [isProcessing, processingStartedAtMs, progress?.started_at]);
 
   // Phase 1G: batch management
   const [batchName, setBatchName] = useState<string>("");
@@ -393,6 +830,7 @@ export default function App() {
     min: 320,
     max: 720,
     direction: "horizontal",
+    inverted: true,
   });
   // Phase 1L — fixed inspector pane removed. Issues live in a drawer
   // overlay now; the template grid gets the freed width.
@@ -550,7 +988,14 @@ export default function App() {
   const [selectedColumnKey, setSelectedColumnKey] = useState<string | null>(null);
   // Cell context menu + explain modal + remap-mode state.
   const [cellMenu, setCellMenu] = useState<
-    | { rowIndex: number; column: string; x: number; y: number }
+    | {
+        rowIndex: number;
+        column: string;
+        x: number;
+        y: number;
+        selectedRowIndexes?: number[];
+        selectedColumns?: string[];
+      }
     | null
   >(null);
   const [cellExplain, setCellExplain] = useState<
@@ -628,7 +1073,14 @@ export default function App() {
   );
 
   const handleCellContextMenu = useCallback(
-    (params: { rowIndex: number; column: string; x: number; y: number }) => {
+    (params: {
+      rowIndex: number;
+      column: string;
+      x: number;
+      y: number;
+      selectedRowIndexes?: number[];
+      selectedColumns?: string[];
+    }) => {
       setCellMenu(params);
     },
     [],
@@ -744,7 +1196,7 @@ export default function App() {
     ((rowIndex: number, columnKey: string, newValue: unknown) => void) | null
   >(null);
 
-  const handleSaveEdits = useCallback(async () => {
+  const handleSaveEdits = useCallback(async (adjudication: HumanAdjudicationOptions) => {
     if (!batchId) return;
     // Snapshot edits at call time so a concurrent edit doesn't get
     // wiped without being persisted.
@@ -762,7 +1214,7 @@ export default function App() {
     }
     setIsSavingEdits(true);
     try {
-      await api.saveEdits(batchId, payload);
+      const saved = await api.saveEdits(batchId, payload, adjudication);
       // Edits are now baked into the cache + the current snapshot.
       // Clear them locally and refresh preview so the displayed values
       // come from the cache (single source of truth) instead of a stale
@@ -778,7 +1230,18 @@ export default function App() {
       void refreshRevisions(batchId);
       pushToast({
         tone: "success",
-        message: `Saved ${count} edit${count === 1 ? "" : "s"}.`,
+        message: [
+          `Saved ${count} adjudicated edit${count === 1 ? "" : "s"}.`,
+          saved.adjudication?.benchmark_submissions
+            ? `${saved.adjudication.benchmark_submissions} benchmark submission${saved.adjudication.benchmark_submissions === 1 ? "" : "s"}.`
+            : "",
+          saved.adjudication?.learning_approvals
+            ? `${saved.adjudication.learning_approvals} learning example${saved.adjudication.learning_approvals === 1 ? "" : "s"} approved.`
+            : "",
+          saved.adjudication?.rule_proposals
+            ? `${saved.adjudication.rule_proposals} reusable rule proposal${saved.adjudication.rule_proposals === 1 ? "" : "s"} created.`
+            : "",
+        ].filter(Boolean).join(" "),
         ttl: 2500,
       });
     } catch (e) {
@@ -794,6 +1257,7 @@ export default function App() {
   const setDocumentPageTarget = useCallback(
     (bid: string | null, filename: string | null, pageNumber = 1) => {
       if (!bid || !filename) {
+        documentNavigationLockRef.current = null;
         setActiveDocumentPage(null);
         setDocumentTarget(null);
         return;
@@ -802,6 +1266,10 @@ export default function App() {
         batchId: bid,
         filename,
         pageNumber: Math.max(1, Math.floor(pageNumber || 1)),
+      };
+      documentNavigationLockRef.current = {
+        ...next,
+        expiresAt: Date.now() + DOCUMENT_NAVIGATION_LOCK_MS,
       };
       setActiveDocumentPage(next);
       setDocumentTarget({ ...next, nonce: ++navNonceRef.current });
@@ -816,6 +1284,36 @@ export default function App() {
 
   const ensureBatch = useCallback(async () => {
     if (batchId) return batchId;
+    let cached: string | null = null;
+    try {
+      cached = localStorage.getItem(ACTIVE_BATCH_LS_KEY);
+    } catch {
+      cached = null;
+    }
+    if (cached) {
+      try {
+        const status = await api.getBatch(cached);
+        const nextSelected = status.files[0]?.filename ?? null;
+        setBatchId(status.batch_id);
+        setBatchName(status.batch_name || "Untitled batch");
+        setFiles(status.files);
+        setSelected(nextSelected);
+        setDocumentPageTarget(status.batch_id, nextSelected, 1);
+        setHasExport(status.export_available);
+        void refreshRevisions(status.batch_id);
+        return status.batch_id;
+      } catch (e) {
+        if (isApiError(e) && (e.status === 404 || e.status === 400)) {
+          try {
+            localStorage.removeItem(ACTIVE_BATCH_LS_KEY);
+          } catch {
+            /* non-fatal */
+          }
+        } else {
+          throw e;
+        }
+      }
+    }
     const res = await api.createBatch(batchName.trim() || undefined);
     setBatchId(res.batch_id);
     setBatchName(res.batch_name);
@@ -826,7 +1324,7 @@ export default function App() {
     }
     void refreshBatchList();
     return res.batch_id;
-  }, [batchId, batchName, refreshBatchList]);
+  }, [batchId, batchName, refreshBatchList, refreshRevisions, setDocumentPageTarget]);
 
   // Switch to an existing batch (loads files / preview / manual review).
   // Phase 1U — atomic batch switch. The previous batch's UI stays
@@ -841,8 +1339,18 @@ export default function App() {
         return true;
       }
       const token = ++switchTokenRef.current;
-      const t0 =
-        typeof performance !== "undefined" ? performance.now() : Date.now();
+      switchAbortRef.current?.abort();
+      const controller = new AbortController();
+      switchAbortRef.current = controller;
+      let switchPerfDone = false;
+      const finishSwitchPerfRaw = perfStart("batch.switch", {
+        batchId: newId,
+      });
+      const finishSwitchPerf = (meta?: Record<string, unknown>) => {
+        if (switchPerfDone) return;
+        switchPerfDone = true;
+        finishSwitchPerfRaw(meta);
+      };
       const isStale = () => token !== switchTokenRef.current;
 
       setIsSwitchingBatch(true);
@@ -854,12 +1362,18 @@ export default function App() {
       setShowBatchPicker(false);
 
       try {
-        const status = await api.getBatch(newId);
-        if (isStale()) return false;
-        if (import.meta.env.DEV) {
-          console.debug(
-            `[switch] getBatch ${(((typeof performance !== "undefined" ? performance.now() : Date.now()) - t0)).toFixed(0)}ms`,
-          );
+        const finishGetBatchPerf = perfStart("batch.switch.get_batch", {
+          batchId: newId,
+        });
+        const status = await api.getBatch(newId, { signal: controller.signal });
+        finishGetBatchPerf({
+          status: "ok",
+          preview_available: status.preview_available,
+          files: status.files?.length ?? 0,
+        });
+        if (isStale()) {
+          finishSwitchPerf({ status: "stale_after_get_batch" });
+          return false;
         }
         if (status.batch_name) {
           setLoadingBatchName(status.batch_name);
@@ -870,16 +1384,27 @@ export default function App() {
         // other — the operator can still get the preview even if the
         // manual-review fetch hits a transient hiccup.
         const previewPromise = status.preview_available
-          ? api.preview(newId)
+          ? api.preview(newId, { signal: controller.signal })
           : Promise.resolve(null);
         const reviewPromise = status.preview_available
-          ? api.manualReview(newId)
+          ? api.manualReview(newId, { signal: controller.signal })
           : Promise.resolve(null);
+        const finishPayloadPerf = perfStart("batch.switch.payload", {
+          batchId: newId,
+          preview_available: status.preview_available,
+        });
         const [previewSettled, reviewSettled] = await Promise.allSettled([
           previewPromise,
           reviewPromise,
         ]);
-        if (isStale()) return false;
+        finishPayloadPerf({
+          preview: previewSettled.status,
+          review: reviewSettled.status,
+        });
+        if (isStale()) {
+          finishSwitchPerf({ status: "stale_after_payload" });
+          return false;
+        }
 
         // Atomic state swap — every panel updates in the same React
         // commit so the operator never sees a half-loaded transition.
@@ -930,14 +1455,10 @@ export default function App() {
           /* non-fatal */
         }
 
-        if (import.meta.env.DEV) {
-          const ms =
-            (typeof performance !== "undefined"
-              ? performance.now()
-              : Date.now()) - t0;
-          // eslint-disable-next-line no-console
-          console.debug(`[switch] total ${ms.toFixed(0)}ms`);
-        }
+        finishSwitchPerf({
+          status: "ok",
+          preview_available: status.preview_available,
+        });
 
         pushToast({
           id: "switch_batch",
@@ -948,7 +1469,15 @@ export default function App() {
         });
         return true;
       } catch (e) {
-        if (isStale()) return false;
+        if ((e as Error)?.name === "AbortError") {
+          finishSwitchPerf({ status: "aborted" });
+          return false;
+        }
+        if (isStale()) {
+          finishSwitchPerf({ status: "stale_after_error" });
+          return false;
+        }
+        finishSwitchPerf({ status: "error" });
         // Don't clobber the previous batch's UI on a soft failure.
         pushToast({
           tone: "error",
@@ -959,6 +1488,9 @@ export default function App() {
         console.warn("switch batch failed:", e);
         return false;
       } finally {
+        if (switchAbortRef.current === controller) {
+          switchAbortRef.current = null;
+        }
         if (!isStale()) {
           setIsSwitchingBatch(false);
           setLoadingBatchName(null);
@@ -992,7 +1524,7 @@ export default function App() {
 
   const handleCreateNewBatch = useCallback(() => {
     setCreateBatchRequestToken((n) => n + 1);
-    setShowBatchPicker(false);
+    setShowBatchPicker(true);
   }, []);
 
   const handleSubmitCreateBatch = useCallback(async (params: {
@@ -1083,51 +1615,69 @@ export default function App() {
     return items;
   }, []);
 
+  const flushUploadItemPatches = useCallback(() => {
+    uploadItemPatchTimerRef.current = null;
+    if (uploadItemPatchQueueRef.current.size === 0) return;
+    const patches = new Map(uploadItemPatchQueueRef.current);
+    uploadItemPatchQueueRef.current.clear();
+    setUploadItems((prev) =>
+      prev.map((item) => {
+        const patch = patches.get(item.id);
+        return patch ? { ...item, ...patch } : item;
+      }),
+    );
+  }, []);
+
   const updateUploadItem = useCallback(
     (id: string, patch: Partial<UploadFileProgress>) => {
-      setUploadItems((prev) =>
-        prev.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+      const current = uploadItemPatchQueueRef.current.get(id) || {};
+      uploadItemPatchQueueRef.current.set(id, { ...current, ...patch });
+      if (uploadItemPatchTimerRef.current != null) return;
+      uploadItemPatchTimerRef.current = window.setTimeout(
+        flushUploadItemPatches,
+        UPLOAD_STATE_FLUSH_MS,
       );
     },
-    [],
+    [flushUploadItemPatches],
   );
 
-  const startUploadAnimation = useCallback(
-    (id: string, getTargetPercent: () => number) => {
-      let frame = 0;
-      const startedAt = performance.now();
-      const visualMinMs = 1350;
-      const tick = () => {
-        setUploadItems((prev) =>
-          prev.map((item) => {
-            if (item.id !== id || item.status !== "uploading") return item;
-            const rawTarget = Math.max(0, Math.min(100, getTargetPercent()));
-            const elapsed = performance.now() - startedAt;
-            const timedCeiling =
-              rawTarget >= 100
-                ? Math.min(100, (elapsed / visualMinMs) * 100)
-                : Math.min(92, (elapsed / visualMinMs) * 92);
-            const target = Math.min(rawTarget, timedCeiling);
-            const delta = target - item.percent;
-            if (delta <= 0.05) return item;
-            const next = item.percent + Math.max(delta * 0.22, 0.35);
-            return { ...item, percent: Math.min(target, next) };
-          }),
-        );
-        frame = window.requestAnimationFrame(tick);
-      };
-      frame = window.requestAnimationFrame(tick);
-      return () => window.cancelAnimationFrame(frame);
+  const flushUploadedFileQueue = useCallback(() => {
+    uploadedFileFlushTimerRef.current = null;
+    if (uploadedFileQueueRef.current.length === 0) return;
+    const entries = uploadedFileQueueRef.current;
+    uploadedFileQueueRef.current = [];
+    setFiles((prev) => entries.reduce(upsertFileEntry, prev));
+  }, []);
+
+  const queueUploadedFileEntry = useCallback(
+    (entry: FileEntry, immediate = false) => {
+      uploadedFileQueueRef.current.push(entry);
+      if (immediate) {
+        if (uploadedFileFlushTimerRef.current != null) {
+          window.clearTimeout(uploadedFileFlushTimerRef.current);
+          uploadedFileFlushTimerRef.current = null;
+        }
+        flushUploadedFileQueue();
+        return;
+      }
+      if (uploadedFileFlushTimerRef.current != null) return;
+      uploadedFileFlushTimerRef.current = window.setTimeout(
+        flushUploadedFileQueue,
+        UPLOADED_FILE_FLUSH_MS,
+      );
     },
-    [],
+    [flushUploadedFileQueue],
   );
 
-  const waitForUploadAnimation = useCallback(async (id: string, target = 98) => {
-    for (let i = 0; i < 140; i += 1) {
-      const current = uploadItemsRef.current.find((item) => item.id === id);
-      if (!current || current.percent >= target) return;
-      await sleep(16);
-    }
+  useEffect(() => {
+    return () => {
+      if (uploadItemPatchTimerRef.current != null) {
+        window.clearTimeout(uploadItemPatchTimerRef.current);
+      }
+      if (uploadedFileFlushTimerRef.current != null) {
+        window.clearTimeout(uploadedFileFlushTimerRef.current);
+      }
+    };
   }, []);
 
   const clearUploadItem = useCallback((id: string, delayMs = 0) => {
@@ -1143,6 +1693,9 @@ export default function App() {
   const failUploadQueue = useCallback(
     (queue: UploadFileProgress[], message: string) => {
       const ids = new Set(queue.map((item) => item.id));
+      for (const id of ids) {
+        uploadItemPatchQueueRef.current.delete(id);
+      }
       setUploadItems((prev) =>
         prev.map((item) =>
           ids.has(item.id) && item.status !== "done"
@@ -1174,33 +1727,30 @@ export default function App() {
         }
         let done = 0;
         let cursor = 0;
+        let pickedInitialDocument = Boolean(selected || filesRef.current.length > 0);
         let firstUploadError: unknown = null;
         const uploadOne = async (index: number) => {
           const f = newFiles[index];
           const upload = queue[index];
-          updateUploadItem(upload.id, { status: "uploading", percent: 0 });
-          const startedAt = performance.now();
-          let targetPercent = 8;
-          const stopAnimation = startUploadAnimation(upload.id, () => targetPercent);
+          updateUploadItem(upload.id, { status: "uploading", percent: 1 });
           try {
-            await api.uploadFile(bid, f, (progress) => {
-              targetPercent = Math.max(
-                targetPercent,
-                Math.min(92, progress.percent * 0.92),
-              );
-            });
-            targetPercent = 100;
-            const elapsed = performance.now() - startedAt;
-            if (elapsed < 800) {
-              await sleep(800 - elapsed);
+            const uploaded = await uploadFileWithRetry(bid, f, (progress) => {
+              updateUploadItem(upload.id, {
+                status: progress.percent >= 100 ? "saving" : "uploading",
+                percent: progress.percent >= 100 ? 96 : uploadItemPercent(progress.percent),
+              });
+            }, { asPdf: shouldUploadAsViewerPdf(f) });
+            const entry = optimisticFileEntry(uploaded, f);
+            const shouldPickDocument = !pickedInitialDocument;
+            queueUploadedFileEntry(entry, shouldPickDocument);
+            if (shouldPickDocument) {
+              pickedInitialDocument = true;
+              setSelected(entry.filename);
+              setDocumentPageTarget(bid, entry.filename, 1);
             }
-            await waitForUploadAnimation(upload.id, 96);
-            // Refresh before hiding the temporary upload row so the
-            // real file row replaces it without a visual gap.
-            await refreshFiles(bid);
             updateUploadItem(upload.id, { status: "done", percent: 100 });
             done += 1;
-            clearUploadItem(upload.id, 900);
+            clearUploadItem(upload.id, UPLOAD_RESULT_LINGER_MS);
             if (showProgress) {
               pushToast({
                 id: progressId,
@@ -1217,11 +1767,9 @@ export default function App() {
               percent: upload.percent || 0,
             });
             if (!firstUploadError) firstUploadError = error;
-          } finally {
-            stopAnimation();
           }
         };
-        const workerCount = Math.min(UPLOAD_PARALLEL_LIMIT, newFiles.length);
+        const workerCount = Math.min(uploadWorkerLimit(newFiles.length), newFiles.length);
         await Promise.all(
           Array.from({ length: workerCount }, async () => {
             while (cursor < newFiles.length) {
@@ -1231,7 +1779,8 @@ export default function App() {
             }
           }),
         );
-        await refreshFiles(bid);
+        flushUploadedFileQueue();
+        void refreshFiles(bid);
         if (firstUploadError) {
           throw firstUploadError;
         }
@@ -1261,12 +1810,304 @@ export default function App() {
       enqueueUploadItems,
       ensureBatch,
       failUploadQueue,
+      flushUploadedFileQueue,
       refreshFiles,
+      queueUploadedFileEntry,
       pushToast,
       dismissToast,
-      startUploadAnimation,
+      selected,
       updateUploadItem,
-      waitForUploadAnimation,
+      setDocumentPageTarget,
+    ],
+  );
+
+  const handleAddDocumentsToCurrentSet = useCallback(
+    async (newFiles: File[]) => {
+      if (newFiles.length === 0) return;
+      if (!batchId || !selected) {
+        await handleFiles(newFiles);
+        return;
+      }
+
+      const parentFilename =
+        resolveDocumentGroupParent(documentAttachmentGroups, batchId, selected) ||
+        selected;
+      const parentExtension = fileExtensionForEntryOrName(filesRef.current, parentFilename);
+      const queue = enqueueUploadItems(batchId, newFiles);
+      const total = newFiles.length;
+      const showProgress = total > 1;
+      const progressId = "upload-progress";
+      const appendIntoOpenDocument = false;
+
+      try {
+        setError(null);
+        if (!appendIntoOpenDocument || !APPENDABLE_OPEN_DOCUMENT_EXTENSIONS.has(parentExtension)) {
+          if (showProgress) {
+            pushToast({
+              id: progressId,
+              tone: "info",
+              message: `Adding 0 of ${total} to this batch...`,
+              ttl: 0,
+            });
+          }
+
+          let done = 0;
+          let cursor = 0;
+          let firstUploadError: unknown = null;
+          const uploadedNames: string[] = [];
+          const uploadOne = async (index: number) => {
+            const file = newFiles[index];
+            const upload = queue[index];
+            updateUploadItem(upload.id, { status: "uploading", percent: 1 });
+            try {
+              const uploaded = await uploadFileWithRetry(batchId, file, (progress) => {
+                updateUploadItem(upload.id, {
+                  status: progress.percent >= 100 ? "saving" : "uploading",
+                  percent: progress.percent >= 100 ? 96 : uploadItemPercent(progress.percent),
+                });
+              }, { asPdf: shouldUploadAsViewerPdf(file) });
+              const entry = optimisticFileEntry(uploaded, file);
+              uploadedNames.push(entry.filename);
+              queueUploadedFileEntry(entry, !selected && uploadedNames.length === 1);
+              if (!selected) {
+                setSelected(entry.filename);
+                setDocumentPageTarget(batchId, entry.filename, 1);
+              }
+              updateUploadItem(upload.id, { status: "done", percent: 100 });
+              done += 1;
+              clearUploadItem(upload.id, UPLOAD_RESULT_LINGER_MS);
+              if (showProgress) {
+                pushToast({
+                  id: progressId,
+                  tone: "info",
+                  message: `Adding ${done} of ${total} to this batch...`,
+                  ttl: 0,
+                });
+              }
+            } catch (error) {
+              const message = getFriendlyErrorMessage(error, "Add documents");
+              updateUploadItem(upload.id, {
+                status: "failed",
+                error: message,
+                percent: upload.percent || 0,
+              });
+              if (!firstUploadError) firstUploadError = error;
+            }
+          };
+
+          const workerCount = Math.min(uploadWorkerLimit(newFiles.length), newFiles.length);
+          await Promise.all(
+            Array.from({ length: workerCount }, async () => {
+              while (cursor < newFiles.length) {
+                const index = cursor;
+                cursor += 1;
+                await uploadOne(index);
+              }
+            }),
+          );
+          flushUploadedFileQueue();
+          await refreshFiles(batchId);
+          if (parentFilename && uploadedNames.length > 0) {
+            setDocumentAttachmentGroups((prev) => {
+              const batchGroup = { ...(prev[batchId] || {}) };
+              batchGroup[parentFilename] = Array.from(
+                new Set([
+                  ...(batchGroup[parentFilename] || []),
+                  ...uploadedNames.filter((name) => name !== parentFilename),
+                ]),
+              );
+              return {
+                ...prev,
+                [batchId]: batchGroup,
+              };
+            });
+          }
+          const lastUploadedName = uploadedNames[uploadedNames.length - 1];
+          if (lastUploadedName) {
+            setSelected(lastUploadedName);
+            setDocumentPageTarget(batchId, lastUploadedName, 1);
+            setDocumentRefreshToken((token) => token + 1);
+          }
+          if (firstUploadError) {
+            throw firstUploadError;
+          }
+          if (showProgress) {
+            pushToast({
+              id: progressId,
+              tone: "success",
+              message: `Added ${total} file${total === 1 ? "" : "s"} to this batch.`,
+              ttl: 3000,
+            });
+          }
+          void refreshBatchList();
+          return;
+        }
+
+        if (showProgress) {
+          pushToast({
+            id: progressId,
+            tone: "info",
+            message: `Adding 0 of ${total} to the open document...`,
+            ttl: 0,
+          });
+        }
+
+        let done = 0;
+        let cursor = 0;
+        let firstUploadError: unknown = null;
+        let appendTargetFilename = parentFilename;
+        let finalPageNumber = 1;
+        const uploadOne = async (index: number) => {
+          const file = newFiles[index];
+          const upload = queue[index];
+          updateUploadItem(upload.id, { status: "uploading", percent: 1 });
+          try {
+            const previousTarget = appendTargetFilename;
+            const appended = await api.appendFileToDocument(
+              batchId,
+              appendTargetFilename,
+              file,
+              (progress) => {
+                updateUploadItem(upload.id, {
+                  status: progress.percent >= 100 ? "saving" : "uploading",
+                  percent:
+                    progress.percent >= 100
+                      ? 96
+                      : uploadItemPercent(progress.percent),
+                });
+              },
+            );
+            appendTargetFilename = appended.filename;
+            finalPageNumber = appended.page_count || finalPageNumber;
+            setFiles((prev) => {
+              const existing = prev.find((entry) => entry.filename === previousTarget);
+              const base =
+                previousTarget !== appended.filename
+                  ? prev.filter((entry) => entry.filename !== previousTarget)
+                  : prev;
+              return upsertFileEntry(base, {
+                filename: appended.filename,
+                size_bytes: appended.size_bytes,
+                extension: appended.extension || ".pdf",
+                page_count: appended.page_count,
+                vendor_key: existing?.vendor_key || "unknown",
+                vendor_confidence: existing?.vendor_confidence ?? 0,
+                vendor_detection_reason:
+                  existing?.vendor_detection_reason ||
+                  "Detection pending after document update.",
+                supported_in_phase_1: existing?.supported_in_phase_1 ?? false,
+                source_type: existing?.source_type || "uploaded",
+                file_support_status: existing?.file_support_status || "pending",
+                file_support_label: existing?.file_support_label || "Pending detection",
+                file_support_reason:
+                  existing?.file_support_reason ||
+                  "The file changed; metadata is still refreshing.",
+              });
+            });
+            if (previousTarget !== appended.filename) {
+              setDocumentAttachmentGroups((prev) => {
+                const batchGroup = { ...(prev[batchId] || {}) };
+                const children = batchGroup[previousTarget] || [];
+                delete batchGroup[previousTarget];
+                const nextChildren = children.filter(
+                  (child) => child !== previousTarget && child !== appended.filename,
+                );
+                if (nextChildren.length > 0) {
+                  batchGroup[appended.filename] = Array.from(
+                    new Set([...(batchGroup[appended.filename] || []), ...nextChildren]),
+                  );
+                }
+                if (Object.keys(batchGroup).length === 0) {
+                  const next = { ...prev };
+                  delete next[batchId];
+                  return next;
+                }
+                return { ...prev, [batchId]: batchGroup };
+              });
+            }
+            setSelected(appended.filename);
+            setDocumentPageTarget(batchId, appended.filename, finalPageNumber);
+            setDocumentRefreshToken((token) => token + 1);
+            updateUploadItem(upload.id, { status: "done", percent: 100 });
+            done += 1;
+            clearUploadItem(upload.id, UPLOAD_RESULT_LINGER_MS);
+            void refreshFiles(batchId);
+            if (showProgress) {
+              pushToast({
+                id: progressId,
+                tone: "info",
+                message: `Adding ${done} of ${total} to the open document...`,
+                ttl: 0,
+              });
+            }
+          } catch (error) {
+            const message = getFriendlyErrorMessage(error, "Add documents");
+            updateUploadItem(upload.id, {
+              status: "failed",
+              error: message,
+              percent: upload.percent || 0,
+            });
+            if (!firstUploadError) firstUploadError = error;
+          }
+        };
+
+        // Appending mutates the open PDF, so these must run in order.
+        // Parallel appends can race and overwrite each other's pages.
+        const workerCount = 1;
+        await Promise.all(
+          Array.from({ length: workerCount }, async () => {
+            while (cursor < newFiles.length) {
+              const index = cursor;
+              cursor += 1;
+              await uploadOne(index);
+            }
+          }),
+        );
+        await refreshFiles(batchId);
+        setSelected(appendTargetFilename);
+        setDocumentPageTarget(batchId, appendTargetFilename, finalPageNumber);
+        if (firstUploadError) {
+          throw firstUploadError;
+        }
+        if (showProgress) {
+          pushToast({
+            id: progressId,
+            tone: "success",
+            message: `Added ${total} page set${total === 1 ? "" : "s"} to the open document.`,
+            ttl: 3000,
+          });
+        }
+        void refreshBatchList();
+      } catch (e) {
+        failUploadQueue(queue, getFriendlyErrorMessage(e, "Add documents"));
+        dismissToast(progressId);
+        setError(getFriendlyErrorMessage(e, "Add documents"));
+        pushToast({
+          tone: "error",
+          message: getFriendlyErrorMessage(e, "Add documents"),
+          ttl: 5000,
+        });
+        // eslint-disable-next-line no-console
+        console.warn("document-set upload failed:", e);
+        throw e;
+      }
+    },
+    [
+      batchId,
+      clearUploadItem,
+      documentAttachmentGroups,
+      dismissToast,
+      enqueueUploadItems,
+      failUploadQueue,
+      flushUploadedFileQueue,
+      handleFiles,
+      queueUploadedFileEntry,
+      pushToast,
+      refreshBatchList,
+      refreshFiles,
+      selected,
+      setDocumentPageTarget,
+      updateUploadItem,
     ],
   );
 
@@ -1295,42 +2136,31 @@ export default function App() {
           });
         }
         let done = 0;
-        let nextSelected: string | null = null;
+        let pickedInitialDocument = false;
         let cursor = 0;
         let firstUploadError: unknown = null;
         const uploadOne = async (index: number) => {
           const f = newFiles[index];
           const upload = queue[index];
-          updateUploadItem(upload.id, { status: "uploading", percent: 0 });
-          const startedAt = performance.now();
-          let targetPercent = 8;
-          const stopAnimation = startUploadAnimation(upload.id, () => targetPercent);
+          updateUploadItem(upload.id, { status: "uploading", percent: 1 });
           try {
-            await api.uploadFile(targetBatchId, f, (progress) => {
-              targetPercent = Math.max(
-                targetPercent,
-                Math.min(92, progress.percent * 0.92),
-              );
-            });
-            targetPercent = 100;
-            const elapsed = performance.now() - startedAt;
-            if (elapsed < 800) {
-              await sleep(800 - elapsed);
-            }
-            await waitForUploadAnimation(upload.id, 96);
-            // Refresh before hiding the temporary upload row so the
-            // real file row replaces it without a visual gap.
-            const res = await api.listFiles(targetBatchId);
-            const orderedFiles = mergeFilesPreserveAppend(filesRef.current, res.files);
-            setFiles(orderedFiles);
-            if (nextSelected === null && orderedFiles[0]) {
-              nextSelected = orderedFiles[0].filename;
-              setSelected(nextSelected);
-              setDocumentPageTarget(targetBatchId, nextSelected, 1);
+            const uploaded = await uploadFileWithRetry(targetBatchId, f, (progress) => {
+              updateUploadItem(upload.id, {
+                status: progress.percent >= 100 ? "saving" : "uploading",
+                percent: progress.percent >= 100 ? 96 : uploadItemPercent(progress.percent),
+              });
+            }, { asPdf: shouldUploadAsViewerPdf(f) });
+            const entry = optimisticFileEntry(uploaded, f);
+            const shouldPickDocument = !pickedInitialDocument;
+            queueUploadedFileEntry(entry, shouldPickDocument);
+            if (shouldPickDocument) {
+              pickedInitialDocument = true;
+              setSelected(entry.filename);
+              setDocumentPageTarget(targetBatchId, entry.filename, 1);
             }
             updateUploadItem(upload.id, { status: "done", percent: 100 });
             done += 1;
-            clearUploadItem(upload.id, 900);
+            clearUploadItem(upload.id, UPLOAD_RESULT_LINGER_MS);
             if (showProgress) {
               pushToast({
                 id: progressId,
@@ -1347,11 +2177,9 @@ export default function App() {
               percent: upload.percent || 0,
             });
             if (!firstUploadError) firstUploadError = error;
-          } finally {
-            stopAnimation();
           }
         };
-        const workerCount = Math.min(UPLOAD_PARALLEL_LIMIT, newFiles.length);
+        const workerCount = Math.min(uploadWorkerLimit(newFiles.length), newFiles.length);
         await Promise.all(
           Array.from({ length: workerCount }, async () => {
             while (cursor < newFiles.length) {
@@ -1361,8 +2189,8 @@ export default function App() {
             }
           }),
         );
-        const finalFiles = await api.listFiles(targetBatchId);
-        setFiles(mergeFilesPreserveAppend(filesRef.current, finalFiles.files));
+        flushUploadedFileQueue();
+        void refreshFiles(targetBatchId);
         if (firstUploadError) {
           throw firstUploadError;
         }
@@ -1397,14 +2225,15 @@ export default function App() {
       clearUploadItem,
       enqueueUploadItems,
       failUploadQueue,
+      flushUploadedFileQueue,
       handleSwitchBatch,
+      queueUploadedFileEntry,
       pushToast,
       dismissToast,
       refreshBatchList,
+      refreshFiles,
       setDocumentPageTarget,
-      startUploadAnimation,
       updateUploadItem,
-      waitForUploadAnimation,
     ],
   );
 
@@ -1466,6 +2295,39 @@ export default function App() {
     [],
   );
 
+  const loadProcessedWorkspace = useCallback(async (targetBatchId: string) => {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < PREVIEW_READY_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        const [prev, rev] = await Promise.all([
+          api.preview(targetBatchId),
+          api.manualReview(targetBatchId),
+        ]);
+        return { prev, rev };
+      } catch (e) {
+        lastError = e;
+        if (
+          !isPreviewStillPreparingError(e) ||
+          attempt === PREVIEW_READY_RETRY_ATTEMPTS - 1
+        ) {
+          throw e;
+        }
+        setProgress((current) =>
+          current?.batch_id === targetBatchId
+            ? {
+                ...current,
+                status: "processing",
+                percent: Math.min(current.percent ?? 99, 99),
+                current_step: "Finalizing preview...",
+              }
+            : current,
+        );
+        await delay(PREVIEW_READY_RETRY_BASE_MS + attempt * 150);
+      }
+    }
+    throw lastError;
+  }, []);
+
   const runProcessBatch = useCallback(async (targetBatchId: string, confirmEdits: boolean) => {
     if (confirmEdits && editedCellCount > 0) {
       const ok = await requestConfirm({
@@ -1476,10 +2338,15 @@ export default function App() {
       });
       if (!ok) return;
     }
+    const processingStartMs = Date.now();
+    const processingStartedAt = new Date(processingStartMs).toISOString();
+    setProcessingStartedAtMs(processingStartMs);
+    setProcessingElapsedMs(0);
     setIsProcessing(true);
     setError(null);
     setProgress({
       batch_id: targetBatchId,
+      started_at: processingStartedAt,
       status: "processing",
       percent: 0,
       current_step: "Starting…",
@@ -1531,8 +2398,7 @@ export default function App() {
         void refreshBatchList();
         return;
       }
-      const prev = await api.preview(targetBatchId);
-      const rev = await api.manualReview(targetBatchId);
+      const { prev, rev } = await loadProcessedWorkspace(targetBatchId);
       setPreview(prev);
       setReview(rev.items);
       setReviewedKeys(new Set());
@@ -1559,11 +2425,13 @@ export default function App() {
           : null,
       );
     } finally {
+      setProcessingElapsedMs(Math.max(0, Date.now() - processingStartMs));
+      setProcessingStartedAtMs(null);
       setIsProcessing(false);
       setIsCancelling(false);
       window.setTimeout(stopPolling, PROGRESS_POLL_MS + 50);
     }
-  }, [editedCellCount, pushToast, refreshBatchList, requestConfirm, startPolling, stopPolling, waitForProcessingDone]);
+  }, [editedCellCount, loadProcessedWorkspace, pushToast, refreshBatchList, requestConfirm, startPolling, stopPolling, waitForProcessingDone]);
 
   const handleProcess = useCallback(async () => {
     if (!batchId) return;
@@ -1592,11 +2460,16 @@ export default function App() {
       targetBatchId: string,
       filename: string,
       mode: "replace" | "merge" = "replace",
+      pageNumber?: number,
     ) => {
       const isMerge = mode === "merge";
+      const isPageRun = Number.isFinite(pageNumber) && Number(pageNumber) > 0;
+      const toastId = isPageRun
+        ? `single-process-${filename}-page-${pageNumber}`
+        : `single-process-${filename}`;
       if (isProcessing) {
         pushToast({
-          id: `single-process-${filename}`,
+          id: toastId,
           tone: "info",
           message: "Another process is already running. Wait for it to finish.",
           ttl: 4000,
@@ -1606,11 +2479,21 @@ export default function App() {
 
       if (editedCellCount > 0) {
         const ok = await requestConfirm({
-          title: isMerge
-            ? "Discard edits and add this file?"
-            : "Discard edits and create a file template?",
-          message: `${isMerge ? "Adding this file" : "Creating a new file template"} will refresh the preview and discard ${editedCellCount} unsaved edit${editedCellCount === 1 ? "" : "s"}.`,
-          confirmLabel: isMerge ? "Add file" : "Create template",
+          title: isPageRun
+            ? isMerge
+              ? "Discard edits and process this page?"
+              : "Discard edits and create a page template?"
+            : isMerge
+              ? "Discard edits and add this file?"
+              : "Discard edits and create a file template?",
+          message: `${isPageRun ? "Processing this page" : isMerge ? "Adding this file" : "Creating a new file template"} will refresh the preview and discard ${editedCellCount} unsaved edit${editedCellCount === 1 ? "" : "s"}.`,
+          confirmLabel: isPageRun
+            ? isMerge
+              ? "Process page"
+              : "Create page template"
+            : isMerge
+              ? "Add file"
+              : "Create template",
           tone: "warning",
         });
         if (!ok) return;
@@ -1622,7 +2505,7 @@ export default function App() {
         const switched = await handleSwitchBatch(targetBatchId);
         if (switched === false) {
           pushToast({
-            id: `single-process-${filename}`,
+            id: toastId,
             tone: "warning",
             message: "Switch cancelled. File was not processed.",
             ttl: 4000,
@@ -1631,27 +2514,40 @@ export default function App() {
         }
       }
 
+      const processingStartMs = Date.now();
+      const processingStartedAt = new Date(processingStartMs).toISOString();
+      setProcessingStartedAtMs(processingStartMs);
+      setProcessingElapsedMs(0);
       setIsProcessing(true);
       setIsCancelling(false);
       setError(null);
       setProgress({
         batch_id: targetBatchId,
+        started_at: processingStartedAt,
         status: "processing",
         percent: 0,
         files_total: 1,
         files_done: 0,
         current_file: filename,
-        current_step: isMerge
-          ? `Adding ${filename} to template...`
-          : `Creating template from ${filename}...`,
+        current_step: isPageRun
+          ? isMerge
+            ? `Processing page ${pageNumber}...`
+            : `Creating template from page ${pageNumber}...`
+          : isMerge
+            ? `Adding ${filename} to template...`
+            : `Creating template from ${filename}...`,
       });
       startPolling(targetBatchId);
       pushToast({
-        id: `single-process-${filename}`,
+        id: toastId,
         tone: "info",
-        message: isMerge
-          ? `Adding ${filename} to current template...`
-          : `Creating template from ${filename}...`,
+        message: isPageRun
+          ? isMerge
+            ? `Processing page ${pageNumber} and adding it to the current template...`
+            : `Creating template from page ${pageNumber}...`
+          : isMerge
+            ? `Adding ${filename} to current template...`
+            : `Creating template from ${filename}...`,
         ttl: 0,
       });
 
@@ -1660,6 +2556,7 @@ export default function App() {
           sync: true,
           file: filename,
           fileMode: mode,
+          page: isPageRun ? pageNumber : undefined,
         });
         stopPolling();
         setProgress((prev) =>
@@ -1674,8 +2571,7 @@ export default function App() {
             : prev,
         );
         setIsProcessing(false);
-        const prev = await api.preview(targetBatchId);
-        const rev = await api.manualReview(targetBatchId);
+        const { prev, rev } = await loadProcessedWorkspace(targetBatchId);
         setPreview(prev);
         setReview(rev.items);
         setReviewedKeys(new Set());
@@ -1686,15 +2582,19 @@ export default function App() {
         void refreshRevisions(targetBatchId);
         const invoices = prev.summary?.invoices_total ?? prev.invoice_count;
         pushToast({
-          id: `single-process-${filename}`,
+          id: toastId,
           tone: "success",
-          message: isMerge
-            ? `Added "${filename}" to current template. Template now has ${invoices} invoice${invoices === 1 ? "" : "s"}.`
-            : `Created a new template from "${filename}" with ${invoices} invoice${invoices === 1 ? "" : "s"}.`,
+          message: isPageRun
+            ? isMerge
+              ? `Processed page ${pageNumber} from "${filename}". Template now has ${invoices} invoice${invoices === 1 ? "" : "s"}.`
+              : `Created a new template from page ${pageNumber} of "${filename}" with ${invoices} invoice${invoices === 1 ? "" : "s"}.`
+            : isMerge
+              ? `Added "${filename}" to current template. Template now has ${invoices} invoice${invoices === 1 ? "" : "s"}.`
+              : `Created a new template from "${filename}" with ${invoices} invoice${invoices === 1 ? "" : "s"}.`,
           ttl: 4000,
         });
       } catch (e) {
-        const message = getFriendlyErrorMessage(e, "Process file");
+        const message = getFriendlyErrorMessage(e, isPageRun ? "Process page" : "Process file");
         setError(message);
         setProgress((prev) =>
           prev
@@ -1704,12 +2604,14 @@ export default function App() {
         // eslint-disable-next-line no-console
         console.warn("file process failed:", e);
         pushToast({
-          id: `single-process-${filename}`,
+          id: toastId,
           tone: "error",
           message,
           ttl: 5000,
         });
       } finally {
+        setProcessingElapsedMs(Math.max(0, Date.now() - processingStartMs));
+        setProcessingStartedAtMs(null);
         setIsProcessing(false);
         setIsCancelling(false);
         stopPolling();
@@ -1720,6 +2622,7 @@ export default function App() {
       editedCellCount,
       handleSwitchBatch,
       isProcessing,
+      loadProcessedWorkspace,
       pushToast,
       refreshBatchList,
       refreshRevisions,
@@ -1787,6 +2690,10 @@ export default function App() {
 
   const handleCellEdit = useCallback(
     (rowIndex: number, columnKey: string, newValue: unknown) => {
+      const finishEditPerf = perfStart("template.cell_edit.commit", {
+        rowIndex,
+        columnKey,
+      });
       setEdits((prev) => {
         const next = { ...prev };
         const rowEdits = { ...(next[rowIndex] ?? {}) };
@@ -1803,6 +2710,7 @@ export default function App() {
         }
         return next;
       });
+      finishEditPerf();
       broadcastChannelRef.current?.postMessage({
         type: "cell-edit",
         rowIndex,
@@ -1860,6 +2768,117 @@ export default function App() {
       }
     },
     [],
+  );
+
+  const handleDeletePreviewRows = useCallback(
+    (rowIndexes: number[], source: "main" | "popout" = "main") => {
+      if (!preview) return;
+      const remove = new Set(
+        rowIndexes
+          .map((value) => Math.floor(Number(value)))
+          .filter((value) => Number.isFinite(value) && value >= 0 && value < preview.rows.length),
+      );
+      if (remove.size === 0) return;
+      const sortedRemoved = [...remove].sort((a, b) => a - b);
+      const nextRows = preview.rows.filter((_, index) => !remove.has(index));
+      const invoiceNumbers = new Set(
+        nextRows
+          .map((row) => String((row as any)?.["Invoice Number"] ?? "").trim())
+          .filter(Boolean),
+      );
+      setPreview((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          rows: prev.rows.filter((_, index) => !remove.has(index)),
+          row_count: nextRows.length,
+          invoice_count: invoiceNumbers.size || nextRows.length,
+          summary: {
+            ...prev.summary,
+            invoices_total: invoiceNumbers.size || nextRows.length,
+          },
+        };
+      });
+      setEdits((prev) => {
+        const next: CellEdits = {};
+        for (const [rawIndex, rowEdits] of Object.entries(prev)) {
+          const oldIndex = Number(rawIndex);
+          if (!Number.isFinite(oldIndex) || remove.has(oldIndex)) continue;
+          const shift = sortedRemoved.filter((removed) => removed < oldIndex).length;
+          next[oldIndex - shift] = rowEdits;
+        }
+        return next;
+      });
+      setSelectedRowIndex((current) => {
+        if (current == null) return current;
+        if (remove.has(current)) return null;
+        const shift = sortedRemoved.filter((removed) => removed < current).length;
+        return current - shift;
+      });
+      setCellMenu(null);
+      pushToast({
+        tone: "success",
+        message: `Removed ${remove.size} row${remove.size === 1 ? "" : "s"} from the preview.`,
+        ttl: 3000,
+      });
+      if (source === "main") {
+        broadcastChannelRef.current?.postMessage({
+          type: "row-delete",
+          rowIndexes: [...remove],
+          source: "main",
+        });
+      }
+    },
+    [preview, pushToast],
+  );
+
+  const handleDeletePreviewColumns = useCallback(
+    (columns: string[], source: "main" | "popout" = "main") => {
+      if (!preview) return;
+      const remove = new Set(columns.filter((column) => preview.columns.includes(column)));
+      if (remove.size === 0) return;
+      setPreview((prev) => {
+        if (!prev) return prev;
+        const prune = (items: string[]) => items.filter((column) => !remove.has(column));
+        const rows = prev.rows.map((row) => {
+          const next: PreviewRow = { ...(row as any) };
+          for (const column of remove) delete (next as any)[column];
+          return next;
+        });
+        return {
+          ...prev,
+          columns: prune(prev.columns),
+          required_columns: prune(prev.required_columns),
+          recommended_columns: prune(prev.recommended_columns),
+          optional_columns: prune(prev.optional_columns),
+          rows,
+        };
+      });
+      setEdits((prev) => {
+        const next: CellEdits = {};
+        for (const [rowIndex, rowEdits] of Object.entries(prev)) {
+          const pruned = { ...rowEdits };
+          for (const column of remove) delete pruned[column];
+          if (Object.keys(pruned).length > 0) next[Number(rowIndex)] = pruned;
+        }
+        return next;
+      });
+      setSelectedColumnKey((current) => (current && remove.has(current) ? null : current));
+      setCellMenu(null);
+      pushToast({
+        tone: "success",
+        message: `Removed ${remove.size} column${remove.size === 1 ? "" : "s"} from the preview.`,
+        ttl: 3000,
+      });
+      if (source === "main") {
+        broadcastChannelRef.current?.postMessage({
+          type: "column-delete",
+          columns: [...remove],
+          source: "main",
+        });
+      }
+    },
+    [preview, pushToast],
   );
 
   const handleResetEdits = useCallback(() => {
@@ -2049,6 +3068,8 @@ export default function App() {
         | { type: "row-select"; rowIndex: number | null; source: string }
         | { type: "cell-edit"; rowIndex: number; columnKey: string; value: unknown; source: string }
         | { type: "row-add"; row: PreviewRow; source: string }
+        | { type: "row-delete"; rowIndexes: number[]; source: string }
+        | { type: "column-delete"; columns: string[]; source: string }
         | undefined;
       if (!data || data.source === "main") return;
       if (data.type === "cell-edit") {
@@ -2059,6 +3080,14 @@ export default function App() {
         handleAddPreviewRow(data.row, undefined, "popout");
         return;
       }
+      if (data.type === "row-delete") {
+        handleDeletePreviewRows(data.rowIndexes, "popout");
+        return;
+      }
+      if (data.type === "column-delete") {
+        handleDeletePreviewColumns(data.columns, "popout");
+        return;
+      }
       if (data.type !== "row-select") return;
       lastBroadcastRowRef.current = data.rowIndex; // suppress echo
       handleSelectRowRef.current?.(data.rowIndex);
@@ -2067,7 +3096,7 @@ export default function App() {
       ch.close();
       if (broadcastChannelRef.current === ch) broadcastChannelRef.current = null;
     };
-  }, [batchId, templateDetached]);
+  }, [batchId, templateDetached, handleDeletePreviewColumns, handleDeletePreviewRows]);
 
   // Mirror our own row selection out to the popout so its table
   // highlights the same row the operator picked here.
@@ -2090,13 +3119,105 @@ export default function App() {
   // and any other code paths that still call `handlePopoutTemplate`
   // continue to work).
   const handlePopoutTemplate = handleDetachTemplate;
-  const handlePopoutDocument = useCallback(() => {
-    if (!selected) {
-      pushToast({ tone: "info", message: "Pick a file first to pop out the document viewer." });
+
+  const handleReattachDocument = useCallback(() => {
+    const w = documentPopoutRef.current;
+    if (w && !w.closed) {
+      try {
+        w.close();
+      } catch {
+        /* ignore; the user may have already closed it */
+      }
+    }
+    documentPopoutRef.current = null;
+    setDocumentPopoutRoot(null);
+    setDocumentDetached(false);
+  }, []);
+
+  const handleDetachDocument = useCallback(() => {
+    const existing = documentPopoutRef.current;
+    if (existing && !existing.closed && documentPopoutRoot) {
+      try {
+        existing.focus();
+      } catch {
+        /* focus is best-effort */
+      }
+      setDocumentDetached(true);
       return;
     }
-    openPopout("document", { file: selected });
-  }, [openPopout, pushToast, selected]);
+
+    const name = `bill-live-document-${batchId || "workspace"}`;
+    const w = window.open("", name, DOCUMENT_POPOUT_FEATURES);
+    if (!w) {
+      pushToast({
+        tone: "error",
+        message: "Could not detach the document viewer. Check the browser pop-up blocker.",
+      });
+      return;
+    }
+
+    const root = prepareDetachedDocumentWindow(w);
+    documentPopoutRef.current = w;
+    setDocumentPopoutRoot(root);
+    setDocumentDetached(true);
+    try {
+      w.focus();
+    } catch {
+      /* focus is best-effort */
+    }
+  }, [batchId, documentPopoutRoot, pushToast]);
+
+  const handlePopoutDocument = handleDetachDocument;
+
+  useEffect(() => {
+    if (!documentDetached) return;
+    const w = documentPopoutRef.current;
+    if (!w || w.closed) {
+      documentPopoutRef.current = null;
+      setDocumentPopoutRoot(null);
+      setDocumentDetached(false);
+      return;
+    }
+    const onBeforeUnload = () => {
+      documentPopoutRef.current = null;
+      setDocumentPopoutRoot(null);
+      setDocumentDetached(false);
+    };
+    w.addEventListener("beforeunload", onBeforeUnload);
+    const id = window.setInterval(() => {
+      const current = documentPopoutRef.current;
+      if (!current || current.closed) {
+        documentPopoutRef.current = null;
+        setDocumentPopoutRoot(null);
+        setDocumentDetached(false);
+      }
+    }, 600);
+    return () => {
+      w.removeEventListener("beforeunload", onBeforeUnload);
+      window.clearInterval(id);
+    };
+  }, [documentDetached]);
+
+  useEffect(() => {
+    const w = documentPopoutRef.current;
+    if (!w || w.closed) return;
+    w.document.title = selected
+      ? `Document viewer - ${selected}`
+      : "Document viewer";
+  }, [selected]);
+
+  useEffect(() => {
+    return () => {
+      const w = documentPopoutRef.current;
+      if (w && !w.closed) {
+        try {
+          w.close();
+        } catch {
+          /* ignore cleanup failures */
+        }
+      }
+    };
+  }, []);
 
   // Phase 2C — focus mode for the template. Escape exits.
   const toggleFocusMode = useCallback(() => {
@@ -2159,12 +3280,16 @@ export default function App() {
           : null
       : null;
 
-  const handleExport = useCallback(async () => {
+  const handleExport = useCallback(async (rowIndexes?: number[]) => {
     if (!batchId) return;
+    const exportRowIndexSet =
+      rowIndexes && rowIndexes.length > 0 ? new Set(rowIndexes) : null;
     if (review.length > 0) {
       pushToast({
         tone: "warning",
-        message: `Exporting with ${review.length} unresolved issue${review.length === 1 ? "" : "s"}.`,
+        message: exportRowIndexSet
+          ? "Exporting this invoice with current review state."
+          : `Exporting with ${review.length} unresolved issue${review.length === 1 ? "" : "s"}.`,
         ttl: 6000,
       });
     }
@@ -2173,10 +3298,13 @@ export default function App() {
     try {
       let editedRows: Record<string, unknown>[] | undefined;
       const fullColumns = preview?.columns ?? [];
-      if (editedCellCount > 0 && preview && fullColumns.length > 0) {
-        editedRows = preview.rows.map((row, i) => {
+      if (preview && preview.rows.length > 0 && fullColumns.length > 0) {
+        const rowsForExport = preview.rows
+          .map((row, i) => ({ row, i }))
+          .filter(({ i }) => !exportRowIndexSet || exportRowIndexSet.has(i));
+        editedRows = rowsForExport.map(({ row, i }) => {
           const overrides = edits[i] ?? {};
-          const merged: Record<string, unknown> = {};
+          const merged: Record<string, unknown> = { ...(row as any) };
           for (const col of fullColumns) {
             merged[col] =
               col in overrides ? overrides[col] : (row as any)[col];
@@ -2187,17 +3315,71 @@ export default function App() {
       const res = await api.exportBatch(batchId, editedRows);
       const exported = res.exported ?? [];
       setHasExport(exported.length > 0);
+      const urlUpdates = res.document_url_updates;
+      if (
+        urlUpdates &&
+        ((urlUpdates.by_source_file && Object.keys(urlUpdates.by_source_file).length > 0) ||
+          (urlUpdates.by_invoice_number && Object.keys(urlUpdates.by_invoice_number).length > 0))
+      ) {
+        setPreview((prev) => {
+          if (!prev) return prev;
+          let changed = false;
+          const rows = prev.rows.map((row) => {
+            const sourceFile =
+              typeof (row as any)?._meta?.source_file === "string"
+                ? (row as any)._meta.source_file
+                : "";
+            const invoiceNumber = String((row as any)?.["Invoice Number"] ?? "").trim();
+            const url =
+              (sourceFile && urlUpdates.by_source_file?.[sourceFile]) ||
+              (invoiceNumber && urlUpdates.by_invoice_number?.[invoiceNumber]) ||
+              "";
+            if (!url || (row as any)?.["Document Url"] === url) return row;
+            changed = true;
+            return {
+              ...(row as any),
+              "Document Url": url,
+              _meta: {
+                ...(((row as any)?._meta ?? {}) as Record<string, unknown>),
+                support_document_status: "dropbox_uploaded",
+              },
+            };
+          });
+          return changed ? { ...prev, rows } : prev;
+        });
+      }
+      if (exported.length === 0) {
+        const reason = typeof (res as any).reason === "string" ? (res as any).reason : "no_export_file";
+        pushToast({
+          tone: "error",
+          message: `No export file was generated (${reason}). Please review the batch and try again.`,
+          ttl: 7000,
+        });
+        return;
+      }
       const editedLabel = res.export_used_edited_rows
-        ? ` (with ${res.edited_rows_count ?? 0} edited rows, ${editedCellCount} cells)`
+        ? editedCellCount > 0
+          ? ` (from preview, ${editedCellCount} edited cell${editedCellCount === 1 ? "" : "s"})`
+          : " (from preview)"
         : "";
+      const documentUrlWarnings = Array.isArray(res.document_url_warnings)
+        ? res.document_url_warnings.filter(Boolean)
+        : [];
+      if (documentUrlWarnings.length > 0) {
+        pushToast({
+          tone: "warning",
+          message: documentUrlWarnings[0],
+          ttl: 9000,
+        });
+      }
       pushToast({
         tone: "success",
-        message: `Exported ${exported.length} file${exported.length === 1 ? "" : "s"}${editedLabel}. Download starting…`,
+        message: exportRowIndexSet
+          ? `Exported this invoice${editedLabel}. Download starting...`
+          : `Exported ${exported.length} file${exported.length === 1 ? "" : "s"}${editedLabel}. Download starting...`,
       });
-      if (exported.length > 0) {
-        const filename = exported[exported.length - 1]?.filename;
-        setTimeout(() => triggerDownload(filename), 50);
-      }
+      const filename = exported[exported.length - 1]?.filename;
+      setTimeout(() => triggerDownload(filename), 50);
     } catch (e) {
       setError(getFriendlyErrorMessage(e, "Export batch"));
       // eslint-disable-next-line no-console
@@ -2435,21 +3617,29 @@ export default function App() {
         }
         setHasExport(status.export_available);
         if (status.preview_available) {
-          try {
-            const prev = await api.preview(status.batch_id);
-            const rev = await api.manualReview(status.batch_id);
-            if (cancelled) return;
-            setPreview(prev);
-            setReview(rev.items);
+          const [previewSettled, reviewSettled] = await Promise.allSettled([
+            api.preview(status.batch_id),
+            api.manualReview(status.batch_id),
+          ]);
+          if (cancelled) return;
+          if (previewSettled.status === "fulfilled") {
+            setPreview(previewSettled.value);
             setReviewedKeys(new Set());
-          } catch (e) {
-            if (!cancelled) {
-              setError(getFriendlyErrorMessage(e, "Restore preview"));
-              // eslint-disable-next-line no-console
-              console.warn("restore preview failed:", e);
-            }
+          } else {
+            setPreview(null);
+            setError(getFriendlyErrorMessage(previewSettled.reason, "Restore preview"));
+            // eslint-disable-next-line no-console
+            console.warn("restore preview failed:", previewSettled.reason);
+          }
+          if (reviewSettled.status === "fulfilled") {
+            setReview(reviewSettled.value.items);
+          } else {
+            setReview([]);
+            // eslint-disable-next-line no-console
+            console.warn("restore manual review failed:", reviewSettled.reason);
           }
         }
+        if (false) {
         const summaryParts: string[] = [
           `Restored "${status.batch_name || "Untitled batch"}"`,
         ];
@@ -2460,6 +3650,7 @@ export default function App() {
           tone: "info",
           message: summaryParts.join(" · ") + ".",
         });
+        }
       } catch (e) {
         try {
           localStorage.removeItem(ACTIVE_BATCH_LS_KEY);
@@ -2484,6 +3675,32 @@ export default function App() {
       cancelled = true;
     };
   }, [pushToast, setDocumentPageTarget, refreshRevisions]);
+
+  useEffect(() => {
+    if (!batchId || preview || isProcessing) return;
+    const listed = batchList.find((batch) => batch.batch_id === batchId);
+    if (!listed || (listed.rows_count ?? 0) <= 0) return;
+    if (previewAutoloadRef.current === batchId) return;
+    previewAutoloadRef.current = batchId;
+    let cancelled = false;
+    (async () => {
+      const [previewSettled, reviewSettled] = await Promise.allSettled([
+        api.preview(batchId),
+        api.manualReview(batchId),
+      ]);
+      if (cancelled) return;
+      if (previewSettled.status === "fulfilled") {
+        setPreview(previewSettled.value);
+        setReviewedKeys(new Set());
+        setReview(reviewSettled.status === "fulfilled" ? reviewSettled.value.items : []);
+      } else {
+        previewAutoloadRef.current = null;
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [batchId, batchList, isProcessing, preview]);
 
   // ---- Global drag/drop guard --------------------------------------------
   useEffect(() => {
@@ -2544,13 +3761,51 @@ export default function App() {
 
   const handleDocumentActivePageChange = useCallback(
     (page: ActiveDocumentPage) => {
+      const lock = documentNavigationLockRef.current;
+      if (lock) {
+        if (Date.now() > lock.expiresAt) {
+          documentNavigationLockRef.current = null;
+        } else if (!sameDocumentPage(lock, page)) {
+          return;
+        } else {
+          lock.expiresAt = Math.min(
+            lock.expiresAt,
+            Date.now() + DOCUMENT_NAVIGATION_SETTLE_LOCK_MS,
+          );
+        }
+      }
       setActiveDocumentPage(page);
+      if (page.batchId !== batchId) return;
+      const rowIndex = findRowIndexForDocumentPage(preview?.rows, page);
+      if (rowIndex < 0) return;
+      const rowGuard = rowNavigationGuardRef.current;
+      if (rowGuard) {
+        const now = Date.now();
+        if (now > rowGuard.expiresAt) {
+          rowNavigationGuardRef.current = null;
+        } else if (rowGuard.rowIndex !== rowIndex) {
+          return;
+        } else {
+          rowGuard.expiresAt = Math.min(
+            rowGuard.expiresAt,
+            now + DOCUMENT_NAVIGATION_SETTLE_LOCK_MS,
+          );
+        }
+      }
+      setSelectedRowIndex((current) => (current === rowIndex ? current : rowIndex));
     },
-    [],
+    [batchId, preview?.rows],
   );
 
   const handleSelectRow = useCallback(
     (rowIndex: number | null) => {
+      rowNavigationGuardRef.current =
+        rowIndex == null
+          ? null
+          : {
+              rowIndex,
+              expiresAt: Date.now() + DOCUMENT_NAVIGATION_LOCK_MS,
+            };
       setSelectedRowIndex(rowIndex);
       if (rowIndex != null) {
         setInspectorTab("row");
@@ -2567,13 +3822,10 @@ export default function App() {
   // up to date (it's referenced from a useEffect declared earlier).
   handleSelectRowRef.current = handleSelectRow;
 
-  const batchesVisible =
-    activeModule === "batches" &&
-    !closedPanels.has("batches") &&
-    !minimizedPanels.has("batches") &&
-    (!maximizedPanel || maximizedPanel === "batches");
+  const batchesVisible = false;
   const documentVisible =
     activeModule === "batches" &&
+    !documentDetached &&
     !closedPanels.has("document") &&
     !minimizedPanels.has("document") &&
     (!maximizedPanel || maximizedPanel === "document");
@@ -2583,6 +3835,129 @@ export default function App() {
     !minimizedPanels.has("template") &&
     (!maximizedPanel || maximizedPanel === "template");
   const anyWorkspacePanelVisible = batchesVisible || documentVisible || templateVisible;
+  const handleRefreshBatchList = useCallback(() => {
+    void refreshBatchList();
+  }, [refreshBatchList]);
+  const batchListForSelector = useMemo(() => {
+    if (!batchId || batchList.some((batch) => batch.batch_id === batchId)) {
+      return batchList;
+    }
+    const activeEntry: BatchListEntry = {
+      batch_id: batchId,
+      batch_name: batchName || "Untitled batch",
+      created_at: "",
+      updated_at: undefined,
+      status: isProcessing ? "processing" : "idle",
+      files_count: files.length,
+      invoices_count: preview?.invoice_count ?? 0,
+      rows_count: preview?.rows?.length ?? 0,
+      manual_review_count: review.length,
+      export_available: hasExport,
+      last_export_file: null,
+      supported_vendor_summary: {},
+    };
+    return [activeEntry, ...batchList];
+  }, [batchId, batchList, batchName, files.length, hasExport, isProcessing, preview, review.length]);
+  const batchSelector = useMemo(
+    () => (
+      <BatchSelectorDropdown
+        compact
+        variant="breadcrumb"
+        open={showBatchPicker}
+        onOpenChange={setShowBatchPicker}
+        batchList={batchListForSelector}
+        activeBatchId={batchId}
+        onSwitchBatch={handleSwitchBatch}
+        onCreateBatch={handleSubmitCreateBatch}
+        createRequestToken={createBatchRequestToken}
+        onRenameBatch={handleInlineRenameBatch}
+        onDeleteBatch={handleDeleteBatchById}
+        onRefreshBatchList={handleRefreshBatchList}
+        files={files}
+        fileAttachmentGroups={explorerAttachmentGroups}
+        selectedFile={selected}
+        activeDocumentPage={activeDocumentPage}
+        onSelectFile={handleSelectExplorerFile}
+        onSelectPage={handleSelectExplorerPage}
+        onDeleteFile={handleDeleteFile}
+        onUploadFiles={handleAddDocumentsToCurrentSet}
+        onUploadFilesToBatch={handleFilesForBatch}
+        uploadItems={uploadItems}
+        onProcessBatch={handleProcessBatch}
+        onProcessFile={handleProcessFile}
+        processingBatchId={isProcessing ? progress?.batch_id ?? batchId : null}
+        isProcessing={isProcessing}
+        isSwitchingBatch={isSwitchingBatch}
+        queueStatus={queueStatus}
+        progress={progress}
+      />
+    ),
+    [
+      activeDocumentPage,
+      batchId,
+      batchListForSelector,
+      createBatchRequestToken,
+      explorerAttachmentGroups,
+      files,
+      handleAddDocumentsToCurrentSet,
+      handleDeleteBatchById,
+      handleDeleteFile,
+      handleFilesForBatch,
+      handleInlineRenameBatch,
+      handleProcessBatch,
+      handleProcessFile,
+      handleRefreshBatchList,
+      handleSelectExplorerFile,
+      handleSelectExplorerPage,
+      handleSubmitCreateBatch,
+      handleSwitchBatch,
+      isProcessing,
+      isSwitchingBatch,
+      progress,
+      queueStatus,
+      selected,
+      showBatchPicker,
+      uploadItems,
+    ],
+  );
+  const renderDocumentPreview = (detachedWindow = false) => (
+    <DocumentPreviewPanel
+      batchId={batchId}
+      filename={selected}
+      reloadToken={documentRefreshToken}
+      files={files}
+      fileAttachmentGroups={batchId ? explorerAttachmentGroups[batchId] || {} : {}}
+      uploadItems={uploadItems}
+      targetPage={
+        documentTarget &&
+        documentTarget.batchId === batchId &&
+        documentTarget.filename === selected
+          ? documentTarget
+          : null
+      }
+      onActivePageChange={handleDocumentActivePageChange}
+      onPopout={detachedWindow ? undefined : handlePopoutDocument}
+      onReattach={detachedWindow ? handleReattachDocument : undefined}
+      isDetachedWindow={detachedWindow}
+      highlightedTraceIds={selectedRowTraceIds}
+      onTraceClick={handleTraceClick}
+      remapActive={remapTarget != null && remapDraft == null}
+      onRemapDrawn={handleRemapDrawn}
+      aiProgress={progress}
+      batchSelector={batchSelector}
+      onAddDocuments={handleAddDocumentsToCurrentSet}
+      onProcessBatch={() => {
+        if (batchId) void handleProcessBatch(batchId);
+      }}
+      onProcessPage={(pageNumber, mode, filename) => {
+        const targetFilename = filename || selected;
+        if (batchId && targetFilename) {
+          void handleProcessFile(batchId, targetFilename, mode ?? "merge", pageNumber);
+        }
+      }}
+      isProcessing={isProcessing}
+    />
+  );
 
   return (
     <div className="app">
@@ -2654,7 +4029,12 @@ export default function App() {
             label="View"
             items={[
               {
-                label: "Batch Workspace",
+                label: "Billing V2",
+                checked: activeModule === "billing-v2",
+                onSelect: () => setActiveModule("billing-v2"),
+              },
+              {
+                label: "Legacy Billing",
                 checked: activeModule === "batches",
                 onSelect: () => setActiveModule("batches"),
               },
@@ -2713,7 +4093,9 @@ export default function App() {
       </div>
 
       <div
-        className={`layout ${isSwitchingBatch ? "switching-batch" : ""} module-${activeModule} ${
+        className={`layout ui-layout-template-centered ${
+          isSwitchingBatch ? "switching-batch" : ""
+        } module-${activeModule} ${
           focusModeTemplate && activeModule === "batches" ? "focus-mode-template" : ""
         } ${maximizedPanel ? `module-max-${maximizedPanel}` : ""} ${
           closedPanels.has("batches") ? "panel-closed-batches" : ""
@@ -2727,13 +4109,26 @@ export default function App() {
           minimizedPanels.has("document") ? "panel-minimized-document" : ""
         } ${
           minimizedPanels.has("template") ? "panel-minimized-template" : ""
-        } ${templateDetached ? "template-detached" : ""}`}
+        } ${templateDetached ? "template-detached" : ""} ${
+          documentDetached ? "document-detached" : ""
+        }`}
       >
         <NavRail
           active={activeModule}
           onSelect={setActiveModule}
           collapsed={navCollapsed}
         />
+        {activeModule === "billing-v2" && <BillingV2 />}
+        {activeModule === "accounting-rules" && <Suspense fallback={<ModuleLoading label="Loading Accounting Rules" />}><AccountingRulesWorkspace /></Suspense>}
+        {activeModule === "context-intelligence" && <Suspense fallback={<ModuleLoading label="Loading Context Matrix" />}><ContextIntelligenceWorkspace /></Suspense>}
+        {activeModule === "resman-vendors" && <Suspense fallback={<ModuleLoading label="Loading Vendors" />}><ResManContextWorkspace dataset="vendors" /></Suspense>}
+        {activeModule === "resman-properties" && <Suspense fallback={<ModuleLoading label="Loading Properties & Units" />}><ResManContextWorkspace dataset="properties_units" /></Suspense>}
+        {activeModule === "resman-gl" && <Suspense fallback={<ModuleLoading label="Loading Chart of Accounts" />}><ResManContextWorkspace dataset="gl_accounts" /></Suspense>}
+        {activeModule === "resman-invoices" && <Suspense fallback={<ModuleLoading label="Loading Invoice History" />}><ResManContextWorkspace dataset="invoice_history" /></Suspense>}
+        {activeModule === "resman-ledger" && <Suspense fallback={<ModuleLoading label="Loading General Ledger" />}><ResManContextWorkspace dataset="general_ledger" /></Suspense>}
+        {activeModule === "batches" && <Suspense fallback={null}>
+          <FloatingAccountingAssistant batchId={batchId} invoiceGroupId={assistantInvoiceGroupId} />
+        </Suspense>}
         {/* The original batch workspace JSX below is hidden via CSS when
             activeModule is not "batches"; this avoids reshuffling thousands of
             lines and keeps batch-related effects/state intact for instant
@@ -2782,12 +4177,13 @@ export default function App() {
                 onDeleteBatch={handleDeleteBatchById}
                 onRefreshBatchList={() => void refreshBatchList()}
                 files={files}
+                fileAttachmentGroups={explorerAttachmentGroups}
                 selectedFile={selected}
                 activeDocumentPage={activeDocumentPage}
                 onSelectFile={handleSelectExplorerFile}
                 onSelectPage={handleSelectExplorerPage}
                 onDeleteFile={handleDeleteFile}
-                onUploadFiles={handleFiles}
+                onUploadFiles={handleAddDocumentsToCurrentSet}
                 onUploadFilesToBatch={handleFilesForBatch}
                 uploadItems={uploadItems}
                 onProcessBatch={handleProcessBatch}
@@ -2811,32 +4207,16 @@ export default function App() {
         {documentVisible && (
           <section
             className="document-pane"
-            style={{ width: documentPanel.size }}
+            style={
+              {
+                width: documentPanel.size,
+                "--document-pane-width": `${documentPanel.size}px`,
+              } as CSSProperties & Record<"--document-pane-width", string>
+            }
             aria-label="Document workspace"
             data-testid="panel-document"
           >
-            <DocumentPreviewPanel
-              batchId={batchId}
-              filename={selected}
-              targetPage={
-                documentTarget &&
-                documentTarget.batchId === batchId &&
-                documentTarget.filename === selected
-                  ? documentTarget
-                  : null
-              }
-              onActivePageChange={handleDocumentActivePageChange}
-              // Window controls removed from the Document panel per UX
-              // directive. We still pass `onPopout` so any internal
-              // shortcuts that need it can call out, but no button is
-              // rendered for it in the header.
-              onPopout={handlePopoutDocument}
-              highlightedTraceIds={selectedRowTraceIds}
-              onTraceClick={handleTraceClick}
-              remapActive={remapTarget != null && remapDraft == null}
-              onRemapDrawn={handleRemapDrawn}
-              aiProgress={progress}
-            />
+            {renderDocumentPreview(false)}
           </section>
         )}
         {documentVisible && templateVisible && !templateDetached && (
@@ -2859,6 +4239,8 @@ export default function App() {
               edits={edits}
               onCellEdit={handleCellEdit}
               onAddPreviewRow={handleAddPreviewRow}
+              onDeletePreviewRows={handleDeletePreviewRows}
+              onDeletePreviewColumns={handleDeletePreviewColumns}
               batchId={batchId}
               onAiMappingApplied={handleAiMappingApplied}
               fileCount={files.length}
@@ -2874,6 +4256,7 @@ export default function App() {
               isProcessing={isProcessing}
               isCancelling={isCancelling}
               progress={progress}
+              processingElapsedMs={processingElapsedMs}
               onCancel={handleCancel}
               batchName={batchName}
               vendorLabel={vendorLabel}
@@ -2928,6 +4311,10 @@ export default function App() {
             non-blocking toast already announces the switch. */}
       </div>
 
+      {documentDetached &&
+        documentPopoutRoot &&
+        createPortal(renderDocumentPreview(true), documentPopoutRoot)}
+
       {/* Phase 1L — Issues drawer (replaces the fixed inspector pane) */}
       <IssuesDrawer
         open={issuesOpen}
@@ -2979,6 +4366,26 @@ export default function App() {
         <CellContextMenu
           x={cellMenu.x}
           y={cellMenu.y}
+          deleteRowsLabel={
+            (cellMenu.selectedRowIndexes?.length ?? 0) > 1
+              ? `Delete ${cellMenu.selectedRowIndexes?.length} rows`
+              : "Delete row"
+          }
+          deleteColumnsLabel={
+            (cellMenu.selectedColumns?.length ?? 0) > 1
+              ? `Delete ${cellMenu.selectedColumns?.length} columns`
+              : "Delete column"
+          }
+          onDeleteRows={
+            cellMenu.selectedRowIndexes?.length
+              ? () => handleDeletePreviewRows(cellMenu.selectedRowIndexes ?? [])
+              : undefined
+          }
+          onDeleteColumns={
+            cellMenu.selectedColumns?.length
+              ? () => handleDeletePreviewColumns(cellMenu.selectedColumns ?? [])
+              : undefined
+          }
           onExplain={() =>
             void openExplainForCell(cellMenu.rowIndex, cellMenu.column)
           }

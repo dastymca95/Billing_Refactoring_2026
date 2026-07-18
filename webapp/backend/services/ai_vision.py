@@ -16,6 +16,7 @@ from typing import Any
 
 from .. import settings
 from . import batch_store
+from .local_processing_guard import serialized_local_document_operation
 
 
 class VisionRenderingUnavailable(RuntimeError):
@@ -25,11 +26,14 @@ class VisionRenderingUnavailable(RuntimeError):
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 
+@serialized_local_document_operation
 def render_pdf_pages_as_data_urls(
     *,
     batch_id: str,
     filename: str,
     page_numbers: list[int] | None = None,
+    include_detail_crop: bool = False,
+    include_table_bands: bool = False,
 ) -> list[str]:
     """Render selected PDF pages into capped PNG data URLs.
 
@@ -93,8 +97,76 @@ def render_pdf_pages_as_data_urls(
                     pil_image = page.render(scale=scale).to_pil()
                     pil_image.save(str(out_path), format="PNG")
                 temp_files.append(out_path)
-                b64 = base64.b64encode(out_path.read_bytes()).decode("ascii")
-                data_urls.append(f"data:image/png;base64,{b64}")
+                data_urls.append(_provider_safe_page_data_url(out_path))
+                if include_detail_crop:
+                    try:
+                        from PIL import Image, ImageEnhance, ImageOps  # type: ignore
+
+                        with Image.open(out_path) as image:
+                            image = image.convert("RGB")
+                            crop = _table_detail_crop(image, max_width=max_width)
+                            buffer = io.BytesIO()
+                            crop.save(buffer, format="JPEG", quality=94, optimize=True)
+                            data_urls.append(
+                                "data:image/jpeg;base64,"
+                                + base64.b64encode(buffer.getvalue()).decode("ascii")
+                            )
+                    except Exception:
+                        # Detail crops improve small handwriting but are never
+                        # a prerequisite for the normal full-page visual path.
+                        pass
+                if include_table_bands:
+                    try:
+                        from PIL import Image  # type: ignore
+
+                        with Image.open(out_path) as image:
+                            image = image.convert("RGB")
+                            for band in _table_detail_bands(image, max_width=max_width):
+                                buffer = io.BytesIO()
+                                band.save(buffer, format="JPEG", quality=94, optimize=True)
+                                data_urls.append(
+                                    "data:image/jpeg;base64,"
+                                    + base64.b64encode(buffer.getvalue()).decode("ascii")
+                                )
+                    except Exception:
+                        # Bands are a bounded escalation for dense matrices;
+                        # the full-page evidence remains available on failure.
+                        pass
+            if include_detail_crop and len(cleaned_pages) == 1:
+                # Also retain the historical header/detail crop for a
+                # single-page document, after the table crop above.
+                try:
+                    from PIL import Image, ImageEnhance, ImageOps  # type: ignore
+
+                    with Image.open(temp_files[0]) as image:
+                        image = image.convert("RGB")
+                        width, height = image.size
+                        # Focused header-facts band: sold-to/job-site and the
+                        # date/terms row.  The former crop extended deep into
+                        # the financial table, shrinking faint handwriting in
+                        # the provider view and causing digit substitutions.
+                        crop = image.crop((
+                            int(width * 0.04),
+                            int(height * 0.225),
+                            int(width * 0.96),
+                            int(height * 0.425),
+                        ))
+                        crop = ImageOps.autocontrast(crop)
+                        crop = ImageEnhance.Contrast(crop).enhance(1.35)
+                        crop = ImageEnhance.Sharpness(crop).enhance(2.0)
+                        if crop.width < max_width:
+                            ratio = max_width / float(crop.width)
+                            crop = crop.resize((max_width, max(1, int(crop.height * ratio))))
+                        buffer = io.BytesIO()
+                        crop.save(buffer, format="JPEG", quality=96, optimize=True)
+                        data_urls.append(
+                            "data:image/jpeg;base64,"
+                            + base64.b64encode(buffer.getvalue()).decode("ascii")
+                        )
+                except Exception:
+                    # Detail crops improve small handwriting but are never a
+                    # prerequisite for the normal full-page visual path.
+                    pass
         finally:
             close = getattr(doc, "close", None)
             if callable(close):
@@ -106,6 +178,172 @@ def render_pdf_pages_as_data_urls(
             except OSError:
                 pass
     return data_urls
+
+
+@serialized_local_document_operation
+def render_pdf_apt_column_crop(
+    *,
+    batch_id: str,
+    filename: str,
+    page_number: int = 1,
+    render_dpi: int = 600,
+) -> tuple[str, dict[str, int]]:
+    """Render only the left-hand Apt./Unit column of a matrix invoice.
+
+    This is a bounded fallback for handwritten allocation tables. It does not
+    mutate the source and deliberately excludes financial/accounting columns.
+    Returned coordinates are pixels on the full page at ``render_dpi``.
+    """
+
+    input_dir = batch_store.get_input_dir(batch_id).resolve()
+    safe_name = Path(filename or "").name
+    pdf_path = (input_dir / safe_name).resolve()
+    if input_dir not in pdf_path.parents or not pdf_path.is_file():
+        raise FileNotFoundError("File not found.")
+    if pdf_path.suffix.lower() != ".pdf":
+        raise VisionRenderingUnavailable("Apt. column verification supports PDF files only.")
+    try:
+        from PIL import Image, ImageEnhance, ImageOps  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional runtime dependencies
+        raise VisionRenderingUnavailable("Apt. column rendering unavailable.") from exc
+    try:
+        import fitz  # type: ignore
+        renderer = "fitz"
+        doc = fitz.open(str(pdf_path))
+    except Exception:
+        try:
+            import pypdfium2 as pdfium  # type: ignore
+            renderer = "pdfium"
+            doc = pdfium.PdfDocument(str(pdf_path))
+        except Exception as exc:  # pragma: no cover - optional runtime dependencies
+            raise VisionRenderingUnavailable("Apt. column rendering unavailable.") from exc
+    try:
+        if not 1 <= int(page_number) <= len(doc):
+            raise VisionRenderingUnavailable("Requested PDF page is unavailable.")
+        page = doc[int(page_number) - 1]
+        page_width = (
+            float(page.rect.width or 612)
+            if renderer == "fitz" else float(page.get_width() or 612)
+        )
+        page_height = (
+            float(page.rect.height or 792)
+            if renderer == "fitz" else float(page.get_height() or 792)
+        )
+        # Matrix forms place the row identifier in the left-most table column.
+        # Keep a margin around the header and all visible rows; a downstream
+        # verifier must still report ambiguity rather than infer from catalogs.
+        normalized = (0.055, 0.355, 0.190, 0.690)
+        scale = max(1.0, float(render_dpi) / 72.0)
+        if renderer == "fitz":
+            clip = fitz.Rect(
+                page_width * normalized[0],
+                page_height * normalized[1],
+                page_width * normalized[2],
+                page_height * normalized[3],
+            )
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
+            image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+        else:
+            full = page.render(scale=scale).to_pil().convert("RGB")
+            image = full.crop((
+                int(full.width * normalized[0]),
+                int(full.height * normalized[1]),
+                int(full.width * normalized[2]),
+                int(full.height * normalized[3]),
+            ))
+        image = ImageOps.autocontrast(image)
+        image = ImageEnhance.Contrast(image).enhance(1.35)
+        image = ImageEnhance.Sharpness(image).enhance(2.0)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=96, optimize=True)
+        coordinates = {
+            "page": int(page_number),
+            "x": int(round(page_width * scale * normalized[0])),
+            "y": int(round(page_height * scale * normalized[1])),
+            "width": int(round(page_width * scale * (normalized[2] - normalized[0]))),
+            "height": int(round(page_height * scale * (normalized[3] - normalized[1]))),
+            "render_dpi": int(render_dpi),
+            "source_page_width": int(round(page_width * scale)),
+            "source_page_height": int(round(page_height * scale)),
+        }
+        return (
+            "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii"),
+            coordinates,
+        )
+    finally:
+        doc.close()
+
+
+def _provider_safe_page_data_url(path: Path) -> str:
+    """Encode a rendered page compactly without changing the source file.
+
+    Full-page PNG scans can exceed multimodal gateway request limits even when
+    their visible information is modest.  A high-quality JPEG preserves the
+    receipt text while substantially reducing the request envelope.  PNG is a
+    dependency-safe fallback only.
+    """
+    try:
+        from PIL import Image, ImageOps  # type: ignore
+
+        with Image.open(path) as image:
+            image = ImageOps.autocontrast(image.convert("RGB"))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=92, optimize=True)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+    except Exception:
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+
+
+def _table_detail_crop(image: Any, *, max_width: int) -> Any:
+    """Return a sharpened central invoice-table crop without source mutation."""
+    from PIL import ImageEnhance, ImageOps  # type: ignore
+
+    width, height = image.size
+    crop = image.crop((
+        int(width * 0.035),
+        int(height * 0.30),
+        int(width * 0.965),
+        int(height * 0.76),
+    ))
+    crop = ImageOps.autocontrast(crop)
+    crop = ImageEnhance.Contrast(crop).enhance(1.25)
+    crop = ImageEnhance.Sharpness(crop).enhance(1.8)
+    if crop.width < max_width:
+        ratio = max_width / float(crop.width)
+        crop = crop.resize((max_width, max(1, int(crop.height * ratio))))
+    return crop
+
+
+def _table_detail_bands(image: Any, *, max_width: int) -> list[Any]:
+    """Return three overlapping high-resolution bands of the central charge table."""
+    from PIL import ImageEnhance, ImageOps  # type: ignore
+
+    width, height = image.size
+    left = int(width * 0.025)
+    right = int(width * 0.975)
+    table_top = int(height * 0.27)
+    table_bottom = int(height * 0.82)
+    table_height = max(1, table_bottom - table_top)
+    band_height = max(1, int(table_height * 0.42))
+    starts = (
+        table_top,
+        table_top + int(table_height * 0.29),
+        max(table_top, table_bottom - band_height),
+    )
+    bands: list[Any] = []
+    for start in starts:
+        bottom = min(table_bottom, start + band_height)
+        band = image.crop((left, start, right, bottom))
+        band = ImageOps.autocontrast(band)
+        band = ImageEnhance.Contrast(band).enhance(1.35)
+        band = ImageEnhance.Sharpness(band).enhance(2.0)
+        if band.width < max_width:
+            ratio = max_width / float(band.width)
+            band = band.resize((max_width, max(1, int(band.height * ratio))))
+        bands.append(band)
+    return bands
 
 
 def image_path_as_data_url(path: Path) -> str:
@@ -156,6 +394,10 @@ def save_vision_trace_regions(
         except (OSError, ValueError):
             items = []
 
+    # Vision traces are observations from the current provider call. Reusing
+    # old regions makes the overlay lie after reprocessing, so replace them
+    # while preserving any deterministic/OCR trace entries in the same file.
+    items = [item for item in items if str(item.get("source_type") or "") != "ai_vision"]
     existing_ids = {str(item.get("trace_id") or "") for item in items}
     added: list[dict[str, Any]] = []
     for idx, candidate in enumerate(candidates, start=1):
@@ -235,5 +477,6 @@ __all__ = [
     "IMAGE_EXTENSIONS",
     "image_path_as_data_url",
     "render_pdf_pages_as_data_urls",
+    "render_pdf_apt_column_crop",
     "save_vision_trace_regions",
 ]

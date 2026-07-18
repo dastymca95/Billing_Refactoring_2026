@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -18,6 +18,65 @@ class EvidenceReference(BaseModel):
     source_type: str
     extraction_method: str
     confidence: float | None = None
+
+
+class CropCoordinates(BaseModel):
+    """Pixel coordinates on one immutable rendered source page."""
+
+    page: int
+    x: int
+    y: int
+    width: int
+    height: int
+    render_dpi: int
+    source_page_width: int | None = None
+    source_page_height: int | None = None
+
+
+class RowIdentityAlternative(BaseModel):
+    value: str
+    confidence: float
+
+
+class HandwrittenRowIdentityEvidence(BaseModel):
+    """Observed handwriting, kept separate from catalog validation."""
+
+    raw_value: str | None = None
+    alternatives: list[RowIdentityAlternative] = Field(default_factory=list)
+    confidence: float
+    crop_coordinates: CropCoordinates
+    catalog_matches: list[str] = Field(default_factory=list)
+    resolved_unit: str | None = None
+    status: Literal["confirmed", "needs_confirmation", "illegible"]
+    resolution_basis: str
+
+
+class PaidMarkerEvidence(BaseModel):
+    page: int
+    text: str
+    bbox: list[float] | None = None
+    confidence: float | None = None
+
+
+class ExcludedPaidRowFacts(BaseModel):
+    """Immutable source facts for a visible row excluded because it is PAID."""
+
+    raw_apartment_number: str | None = None
+    apartment_identity: HandwrittenRowIdentityEvidence | None = None
+    component_amounts: dict[str, Decimal] = Field(default_factory=dict)
+    row_total: Decimal | None = None
+    paid_marker_evidence: list[PaidMarkerEvidence] = Field(default_factory=list)
+    exclusion_reason: str
+
+
+class DateFieldProvenance(BaseModel):
+    field: Literal["service_date", "invoice_date", "due_date_text", "due_date"]
+    value: str | None = None
+    raw_value: str | None = None
+    provenance: Literal["document_observed", "tenant_policy_inference", "unresolved"]
+    source_field: str | None = None
+    policy_id: str | None = None
+    evidence: list[EvidenceReference] = Field(default_factory=list)
 
 
 class LineItemFacts(BaseModel):
@@ -81,6 +140,7 @@ class GLAccountMetadata(BaseModel):
     specificity: str = "broad"
     payable: bool
     description_tokens: list[str] = Field(default_factory=list)
+    scope_qualifiers: list[str] = Field(default_factory=list)
     metadata_source: str
     metadata_confidence: float
 

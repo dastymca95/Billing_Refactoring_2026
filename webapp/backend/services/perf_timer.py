@@ -146,8 +146,15 @@ def summarize(batch_id: str) -> dict[str, Any]:
 
 
 def flush_to_disk(batch_id: str, audit_dir: Path) -> Path | None:
-    """Persist the current batch's timings + summary to
-    `<audit_dir>/performance.json`. Returns the file path on success."""
+    """Persist the current batch's timings + summary.
+
+    PERF-2 writes both:
+    * ``performance.json`` for dashboard-style summaries.
+    * ``performance.jsonl`` for append-friendly profiling and diffing.
+
+    Both files are rewritten from the current in-memory snapshot so
+    repeated endpoint calls do not duplicate rows.
+    """
     if _DISABLED:
         return None
     entries = get_batch_timings(batch_id)
@@ -155,8 +162,9 @@ def flush_to_disk(batch_id: str, audit_dir: Path) -> Path | None:
         return None
     audit_dir.mkdir(parents=True, exist_ok=True)
     out = audit_dir / "performance.json"
+    out_jsonl = audit_dir / "performance.jsonl"
     payload = {
-        "schema": "perf_timer/v1",
+        "schema": "perf_timer/v2",
         "batch_id": batch_id,
         "summary": summarize(batch_id),
         "entries": entries,
@@ -164,10 +172,45 @@ def flush_to_disk(batch_id: str, audit_dir: Path) -> Path | None:
     try:
         with open(out, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, default=str)
+        with open(out_jsonl, "w", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps({"batch_id": batch_id, **entry}, default=str))
+                f.write("\n")
+            f.write(json.dumps({
+                "batch_id": batch_id,
+                "step": "summary",
+                "summary": payload["summary"],
+                "t": time.time(),
+            }, default=str))
+            f.write("\n")
     except Exception as e:
         _LOG.warning("perf_timer flush failed for %s: %s", batch_id, e)
         return None
     return out
+
+
+def read_jsonl(path: Path, *, limit: int = 500) -> list[dict[str, Any]]:
+    """Read a persisted performance JSONL file defensively."""
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    rows.append(parsed)
+    except OSError:
+        return []
+    if limit > 0 and len(rows) > limit:
+        return rows[-limit:]
+    return rows
 
 
 def clear_batch(batch_id: str) -> None:

@@ -38,7 +38,7 @@ REQUIRED_BLOCKERS = {
     "vision_recommended",
 }
 EXPECTED_WEAKLEY = {
-    "Invoice Number": "202202 - 132786 Mar 26",
+    "Invoice Number": "202202-132786 Mar 26",
     "Vendor": "Weakley County Municipal Electric System",
     "Property Abbreviation": "SAGE",
     "Location": "10",

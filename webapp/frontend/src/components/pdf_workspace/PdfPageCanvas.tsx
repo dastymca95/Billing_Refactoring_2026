@@ -20,7 +20,7 @@
 //   This keeps Ctrl+wheel zoom hyper-fluid and only pays the heavy
 //   raster cost once the operator settles on a zoom level.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 type PageInfo = {
   pageWidth: number;
@@ -39,6 +39,16 @@ type Props = {
   suppressFirstFramePlaceholder?: boolean;
 };
 
+type PageFrame = {
+  fileUrl: string;
+  canvas: HTMLCanvasElement;
+  naturalSize: { width: number; height: number };
+  pageNumber: number;
+  pageCount: number;
+  rasterScale: number;
+  dpr: number;
+};
+
 // Per-tab cache for loaded PDF documents. Avoids re-parsing the same
 // file when navigating between its pages. Keyed by the absolute URL
 // the document was loaded from. We cap the cache size aggressively so
@@ -50,6 +60,10 @@ export type PdfDoc = {
 };
 const _docCache = new Map<string, Promise<PdfDoc>>();
 const MAX_DOC_CACHE = 4;
+const _pageFrameCache = new Map<string, PageFrame>();
+const _pageFramePromises = new Map<string, Promise<PageFrame>>();
+const _pagePreviewCache = new Map<string, PageFrame>();
+const MAX_PAGE_FRAME_CACHE = 96;
 
 let _workerSrc: string | null = null;
 
@@ -87,6 +101,118 @@ export async function loadPdfDocument(fileUrl: string): Promise<PdfDoc> {
   return getDoc(fileUrl);
 }
 
+function pageFrameKey(
+  fileUrl: string,
+  pageNumber: number,
+  rasterScale: number,
+  dpr: number,
+): string {
+  return `${fileUrl}::${pageNumber}::${rasterScale.toFixed(3)}::${dpr.toFixed(2)}`;
+}
+
+function pagePreviewKey(fileUrl: string, pageNumber: number, dpr: number): string {
+  return `${fileUrl}::${pageNumber}::${dpr.toFixed(2)}`;
+}
+
+function getCachedPageFrame(
+  fileUrl: string,
+  pageNumber: number,
+  rasterScale: number,
+  dpr: number,
+): PageFrame | null {
+  const key = pageFrameKey(fileUrl, pageNumber, rasterScale, dpr);
+  const frame = _pageFrameCache.get(key);
+  if (!frame) return null;
+  _pageFrameCache.delete(key);
+  _pageFrameCache.set(key, frame);
+  return frame;
+}
+
+function getPreviewPageFrame(
+  fileUrl: string,
+  pageNumber: number,
+  dpr: number,
+): PageFrame | null {
+  return _pagePreviewCache.get(pagePreviewKey(fileUrl, pageNumber, dpr)) ?? null;
+}
+
+function trimPageFrameCache(): void {
+  while (_pageFrameCache.size > MAX_PAGE_FRAME_CACHE) {
+    const oldest = _pageFrameCache.keys().next().value;
+    if (!oldest) break;
+    const frame = _pageFrameCache.get(oldest);
+    _pageFrameCache.delete(oldest);
+    if (frame) {
+      const previewKey = pagePreviewKey(frame.fileUrl, frame.pageNumber, frame.dpr);
+      if (_pagePreviewCache.get(previewKey) === frame) {
+        _pagePreviewCache.delete(previewKey);
+      }
+    }
+  }
+}
+
+function paintPageFrame(canvas: HTMLCanvasElement, frame: PageFrame): void {
+  canvas.width = frame.canvas.width;
+  canvas.height = frame.canvas.height;
+  const ctx = canvas.getContext("2d");
+  if (ctx) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(frame.canvas, 0, 0);
+  }
+}
+
+async function renderPageFrame(
+  fileUrl: string,
+  pageNumber: number,
+  rasterScale: number,
+  dpr: number,
+): Promise<PageFrame> {
+  const key = pageFrameKey(fileUrl, pageNumber, rasterScale, dpr);
+  const cached = _pageFrameCache.get(key);
+  if (cached) return cached;
+  const pending = _pageFramePromises.get(key);
+  if (pending) return pending;
+
+  const promise = (async () => {
+    const { doc } = await getDoc(fileUrl);
+    const page = await doc.getPage(pageNumber);
+    const viewport = page.getViewport({ scale: rasterScale });
+    const w = Math.floor(viewport.width);
+    const h = Math.floor(viewport.height);
+    const offscreen = document.createElement("canvas");
+    offscreen.width = Math.floor(w * dpr);
+    offscreen.height = Math.floor(h * dpr);
+    const offCtx = offscreen.getContext("2d");
+    if (!offCtx) throw new Error("Canvas context unavailable.");
+    offCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const renderTask = page.render({ canvasContext: offCtx, viewport });
+    await renderTask.promise;
+    const frame: PageFrame = {
+      fileUrl,
+      canvas: offscreen,
+      naturalSize: {
+        width: w / rasterScale,
+        height: h / rasterScale,
+      },
+      pageNumber,
+      pageCount: doc.numPages,
+      rasterScale,
+      dpr,
+    };
+    _pageFrameCache.set(key, frame);
+    _pagePreviewCache.set(pagePreviewKey(fileUrl, pageNumber, dpr), frame);
+    trimPageFrameCache();
+    return frame;
+  })();
+
+  _pageFramePromises.set(key, promise);
+  promise.then(
+    () => _pageFramePromises.delete(key),
+    () => _pageFramePromises.delete(key),
+  );
+  return promise;
+}
+
 // How long the user has to be idle (no zoom change) before we trigger
 // a high-fidelity re-raster. 150 ms is the sweet spot — long enough
 // to coalesce a wheel-spin into one render, short enough that pausing
@@ -97,6 +223,7 @@ const RASTER_DEBOUNCE_MS = 150;
 // page never looks too pixelated. 1.6× is roughly where bilinear up-
 // scaling starts to read as fuzzy on retina displays.
 const STRETCH_THRESHOLD = 1.6;
+const DEFAULT_LAYOUT_SIZE = { width: 612, height: 792 };
 
 export function PdfPageCanvas({
   fileUrl,
@@ -149,8 +276,12 @@ export function PdfPageCanvas({
 
   // Reset raster cache when the file or page changes.
   useEffect(() => {
-    setNaturalSize(initialNaturalSize ?? null);
-    setHasFrame(false);
+    const dpr = window.devicePixelRatio || 1;
+    const cached =
+      getCachedPageFrame(fileUrl, pageNumber, zoom, dpr) ||
+      getPreviewPageFrame(fileUrl, pageNumber, dpr);
+    setNaturalSize(cached?.naturalSize ?? initialNaturalSize ?? null);
+    setHasFrame(Boolean(cached));
     setRasterScale(zoom);
     lastZoomRef.current = zoom;
     // We deliberately omit `zoom` here — the goal is to reset only on
@@ -158,6 +289,32 @@ export function PdfPageCanvas({
     // debounce effect below handles).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileUrl, pageNumber, initialNaturalSize?.width, initialNaturalSize?.height]);
+
+  const notifyRenderedFrame = useCallback((frame: PageFrame) => {
+    const displayZoom = lastZoomRef.current;
+    onPageRenderedRef.current?.({
+      pageWidth: Math.round(frame.naturalSize.width * displayZoom),
+      pageHeight: Math.round(frame.naturalSize.height * displayZoom),
+      pageNumber: frame.pageNumber,
+      pageCount: frame.pageCount,
+    });
+    onFirstFrameRef.current?.(frame.pageNumber);
+  }, []);
+
+  useLayoutEffect(() => {
+    const visibleCanvas = canvasRef.current;
+    if (!visibleCanvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cached =
+      getCachedPageFrame(fileUrl, pageNumber, rasterScale, dpr) ||
+      getPreviewPageFrame(fileUrl, pageNumber, dpr);
+    if (!cached) return;
+    paintPageFrame(visibleCanvas, cached);
+    setNaturalSize(cached.naturalSize);
+    setHasFrame(true);
+    setLoadingVisible(false);
+    notifyRenderedFrame(cached);
+  }, [fileUrl, pageNumber, rasterScale, notifyRenderedFrame]);
 
   // Phase 2I — debounce the heavy raster re-render. While the user is
   // wheel-zooming, ``zoom`` keeps changing every few milliseconds; we
@@ -185,70 +342,31 @@ export function PdfPageCanvas({
   // frame until the new one is fully painted.
   useEffect(() => {
     let cancelled = false;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let renderTask: any = null;
     setError(null);
     const cancelDelay = setLoadingDelayed(true);
 
     (async () => {
       try {
-        const { doc } = await getDoc(fileUrl);
-        if (cancelled) return;
-        const page = await doc.getPage(pageNumber);
-        if (cancelled) return;
-
-        const viewport = page.getViewport({ scale: rasterScale });
         const visibleCanvas = canvasRef.current;
         if (!visibleCanvas) return;
 
         const dpr = window.devicePixelRatio || 1;
-        const w = Math.floor(viewport.width);
-        const h = Math.floor(viewport.height);
-        const offscreen = document.createElement("canvas");
-        offscreen.width = Math.floor(w * dpr);
-        offscreen.height = Math.floor(h * dpr);
-        const offCtx = offscreen.getContext("2d");
-        if (!offCtx) return;
-        offCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-        renderTask = page.render({ canvasContext: offCtx, viewport });
-        await renderTask.promise;
+        const frame = await renderPageFrame(fileUrl, pageNumber, rasterScale, dpr);
         if (cancelled) return;
 
-        visibleCanvas.width = offscreen.width;
-        visibleCanvas.height = offscreen.height;
-        const visCtx = visibleCanvas.getContext("2d");
-        if (visCtx) {
-          visCtx.drawImage(offscreen, 0, 0);
-        }
+        paintPageFrame(visibleCanvas, frame);
 
         // Phase 2I — capture natural (zoom = 1) page size from the
         // first successful raster. We back it out of the rasterised
         // size and the scale we used. Keeps the value stable across
         // future re-rasters (which would otherwise round it).
-        const natural =
-          naturalSize ?? {
-            width: w / rasterScale,
-            height: h / rasterScale,
-          };
+        const natural = naturalSize ?? frame.naturalSize;
         if (!naturalSize) setNaturalSize(natural);
 
         setHasFrame(true);
-        onFirstFrameRef.current?.(pageNumber);
+        notifyRenderedFrame(frame);
         cancelDelay();
         setLoadingVisible(false);
-        // Notify the parent with the *displayed* size at the current
-        // zoom (not the rasterised size). The parent uses this for
-        // overlay geometry; the overlay should follow display, not
-        // raster. Use lastZoomRef so we always emit the latest zoom
-        // even if rasterScale has lagged.
-        const displayZoom = lastZoomRef.current;
-        onPageRenderedRef.current?.({
-          pageWidth: Math.round(natural.width * displayZoom),
-          pageHeight: Math.round(natural.height * displayZoom),
-          pageNumber,
-          pageCount: doc.numPages,
-        });
       } catch (e: unknown) {
         if (cancelled) return;
         if ((e as { name?: string })?.name === "RenderingCancelledException")
@@ -265,20 +383,16 @@ export function PdfPageCanvas({
     return () => {
       cancelled = true;
       cancelDelay();
-      try {
-        renderTask?.cancel?.();
-      } catch {
-        /* ignore */
-      }
     };
-  }, [fileUrl, pageNumber, rasterScale, setLoadingDelayed]);
+  }, [fileUrl, pageNumber, rasterScale, setLoadingDelayed, notifyRenderedFrame]);
 
   // Display geometry. Width/height of the wrap follow ``zoom`` so the
   // surrounding layout reflows in real time. The canvas is scaled via
   // CSS by ``zoom / rasterScale`` so the bitmap stretches without a
   // re-raster while the user is wheel-zooming.
-  const displayWidth = naturalSize ? naturalSize.width * zoom : null;
-  const displayHeight = naturalSize ? naturalSize.height * zoom : null;
+  const layoutSize = naturalSize ?? initialNaturalSize ?? DEFAULT_LAYOUT_SIZE;
+  const displayWidth = layoutSize.width * zoom;
+  const displayHeight = layoutSize.height * zoom;
   const stretch = rasterScale > 0 ? zoom / rasterScale : 1;
 
   // Phase 2I — the layout-update effect that used to re-emit
@@ -300,13 +414,11 @@ export function PdfPageCanvas({
     <div
       className={`pdf-canvas-wrap ${hasFrame ? "has-frame" : "waiting-first-frame"}`}
       style={
-        displayWidth != null && displayHeight != null
-          ? {
-              width: `${displayWidth}px`,
-              minHeight: `${displayHeight}px`,
-              height: `${displayHeight}px`,
-            }
-          : undefined
+        {
+          width: `${displayWidth}px`,
+          minHeight: `${displayHeight}px`,
+          height: `${displayHeight}px`,
+        }
       }
     >
       <canvas

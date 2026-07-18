@@ -11,6 +11,7 @@ import type { BatchProgress } from "../types";
 
 type Props = {
   progress?: BatchProgress | null;
+  elapsedMs?: number;
   isCancelling?: boolean;
   onCancel?: () => void;
 };
@@ -29,13 +30,21 @@ const STAGE_LABELS: { key: string; label: string }[] = [
   { key: "template", label: "Building template" },
 ];
 
-export function TemplateLoadingState({ progress, isCancelling, onCancel }: Props) {
+export function TemplateLoadingState({
+  progress,
+  elapsedMs = 0,
+  isCancelling,
+  onCancel,
+}: Props) {
   const status = progress?.status ?? "processing";
   const percent = clampPercent(progress?.percent ?? 0);
   const currentStep = (progress?.current_step || "").trim();
   const filesTotal = numOrNull(progress?.files_total);
   const filesDone = numOrNull(progress?.files_done) ?? 0;
   const activeStage = useStageGuess(currentStep, progress?.stages);
+  const elapsedLabel = formatElapsed(elapsedMs);
+  const avgPerFileLabel =
+    filesDone > 0 ? formatElapsed(elapsedMs / filesDone) : "Calculating";
 
   const heading = isCancelling
     ? "Stopping processing"
@@ -82,6 +91,16 @@ export function TemplateLoadingState({ progress, isCancelling, onCancel }: Props
             className="template-loading-progress-fill"
             style={{ width: `${percent}%` }}
           />
+        </div>
+        <div className="template-loading-timing" aria-label="Processing timing">
+          <div className="template-loading-timing-item">
+            <span className="template-loading-timing-value">{elapsedLabel}</span>
+            <span className="template-loading-timing-label">Elapsed</span>
+          </div>
+          <div className="template-loading-timing-item">
+            <span className="template-loading-timing-value">{avgPerFileLabel}</span>
+            <span className="template-loading-timing-label">Avg / file</span>
+          </div>
         </div>
         <div className="template-loading-meta">
           <span className="template-loading-percent">{Math.round(percent)}%</span>
@@ -235,6 +254,18 @@ function clampPercent(v: unknown): number {
 function numOrNull(v: unknown): number | null {
   if (typeof v !== "number" || !Number.isFinite(v)) return null;
   return v;
+}
+
+function formatElapsed(valueMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(valueMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const two = (n: number) => n.toString().padStart(2, "0");
+  if (hours > 0) {
+    return `${hours}:${two(minutes)}:${two(seconds)}`;
+  }
+  return `${minutes}:${two(seconds)}`;
 }
 
 function useStageGuess(

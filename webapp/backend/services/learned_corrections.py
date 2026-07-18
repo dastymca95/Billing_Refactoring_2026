@@ -312,6 +312,13 @@ def apply_value_overrides_to_rows(
             new_val = act.get("set_value")
             if new_val is None:
                 continue
+            if col == "GL Account":
+                from . import ai_mapping_review
+
+                account = ai_mapping_review.validate_gl_account(str(new_val))
+                if not account or not ai_mapping_review.is_payable_gl_account(account):
+                    continue
+                new_val = account["gl_code"]
             row[col] = new_val
             meta = row.setdefault("_meta", {})
             applied = list(meta.get("learned_corrections_applied") or [])

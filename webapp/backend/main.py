@@ -16,18 +16,25 @@ from fastapi.responses import JSONResponse
 
 from .settings import BATCHES_ROOT, InvalidBatchIdError
 from .api import (
+    accounting_assistant,
     ai_status,
     ai_invoice,
     ai_mappings,
     billing_v2,
     batches,
     canonical_rules,
+    context_intelligence,
+    deterministic_builder,
     cells,
     export,
+    human_adjudication,
     invoice_format_rules,
     preview,
     processing,
+    processing_routes,
     regions,
+    resman_context,
+    tenant_accounting,
     uploads,
     vendor_rules,
 )
@@ -67,6 +74,7 @@ def create_app() -> FastAPI:
     app.include_router(uploads.router)
     app.include_router(preview.router)
     app.include_router(processing.router)
+    app.include_router(processing_routes.router)
     # Phase 2D — cross-batch processing queue endpoint.
     app.include_router(processing.queue_router)
     app.include_router(export.router)
@@ -82,6 +90,12 @@ def create_app() -> FastAPI:
     app.include_router(vendor_rules.router)
     app.include_router(invoice_format_rules.router)
     app.include_router(canonical_rules.router)
+    app.include_router(accounting_assistant.router)
+    app.include_router(human_adjudication.router)
+    app.include_router(tenant_accounting.router)
+    app.include_router(resman_context.router)
+    app.include_router(context_intelligence.router)
+    app.include_router(deterministic_builder.router)
     # Phase 2K — Cell explain / correct / learn.
     app.include_router(cells.router)
     app.include_router(cells.learned_router)

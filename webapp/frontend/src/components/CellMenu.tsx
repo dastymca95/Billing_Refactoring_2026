@@ -24,6 +24,10 @@ type ContextMenuProps = {
   onShowTrace: () => void;
   onEditValue: () => void;
   onRemapSource: () => void;
+  onDeleteRows?: () => void;
+  onDeleteColumns?: () => void;
+  deleteRowsLabel?: string;
+  deleteColumnsLabel?: string;
   onClose: () => void;
 };
 
@@ -34,6 +38,10 @@ export function CellContextMenu({
   onShowTrace,
   onEditValue,
   onRemapSource,
+  onDeleteRows,
+  onDeleteColumns,
+  deleteRowsLabel,
+  deleteColumnsLabel,
   onClose,
 }: ContextMenuProps) {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -55,7 +63,8 @@ export function CellContextMenu({
   }, [onClose]);
   // Clamp to viewport so the menu never opens off-screen.
   const W = 240;
-  const H = 168;
+  const actionCount = 4 + (onDeleteRows ? 1 : 0) + (onDeleteColumns ? 1 : 0);
+  const H = actionCount * 38 + 12;
   const cx = Math.min(x, window.innerWidth - W - 8);
   const cy = Math.min(y, window.innerHeight - H - 8);
   return (
@@ -82,6 +91,29 @@ export function CellContextMenu({
         <RemapIcon />
         <span>Remap source region</span>
       </button>
+      {(onDeleteRows || onDeleteColumns) && <div className="cell-context-menu-separator" />}
+      {onDeleteRows && (
+        <button
+          type="button"
+          role="menuitem"
+          className="danger"
+          onClick={() => { onDeleteRows(); onClose(); }}
+        >
+          <DeleteIcon />
+          <span>{deleteRowsLabel || "Delete row"}</span>
+        </button>
+      )}
+      {onDeleteColumns && (
+        <button
+          type="button"
+          role="menuitem"
+          className="danger"
+          onClick={() => { onDeleteColumns(); onClose(); }}
+        >
+          <DeleteIcon />
+          <span>{deleteColumnsLabel || "Delete column"}</span>
+        </button>
+      )}
     </div>
   );
 }
@@ -450,6 +482,18 @@ function RemapIcon() {
       <rect x="3" y="3" width="18" height="18" rx="2" />
       <path d="M9 9l6 6" />
       <path d="M15 9l-6 6" />
+    </svg>
+  );
+}
+function DeleteIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M3 6h18" />
+      <path d="M8 6V4h8v2" />
+      <path d="M19 6l-1 14H6L5 6" />
+      <path d="M10 11v5" />
+      <path d="M14 11v5" />
     </svg>
   );
 }

@@ -10,8 +10,20 @@ from __future__ import annotations
 
 import csv
 import re
+from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
+
+_TEXT_SAMPLE_CACHE: dict[tuple[str, int, int, int], str] = {}
+_TEXT_SAMPLE_CACHE_MAX = 512
+
+
+def _path_cache_key(path: Path, limit: int) -> tuple[str, int, int, int] | None:
+    try:
+        st = path.stat()
+        return (str(path.resolve()), int(st.st_mtime_ns), int(st.st_size), int(limit))
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +313,28 @@ def _looks_like_zillow_rentals(path: Path) -> tuple[bool, float, str]:
     return False, 0.0, ""
 
 
+def _looks_like_apartments_com(path: Path) -> tuple[bool, float, str]:
+    """Detect Apartments.com / CoStar invoices.
+
+    Current PDFs expose "CoStar Federal Tax ID", "Account #/Location ID",
+    and the Apartments LLC remittance block on page 1.
+    """
+    if path.suffix.lower() != ".pdf":
+        return False, 0.0, ""
+    text_sample = _document_text_sample(path, 5000)
+    hay = f"{path.name}\n{text_sample}".lower()
+    compact = re.sub(r"\s+", "", hay)
+    if (
+        "costarfederaltaxid" in compact
+        and "account#/locationid" in compact
+        and ("apartmentsllc" in compact or "costar.billtrust.com" in hay)
+    ):
+        return True, 0.96, "PDF text matches Apartments.com / CoStar invoice"
+    if "apartments.com" in hay and "invoice number" in hay and "service period" in hay:
+        return True, 0.9, "PDF text matches Apartments.com invoice"
+    return False, 0.0, ""
+
+
 def _looks_like_pennyrile_electric(path: Path) -> tuple[bool, float, str]:
     """Detect Pennyrile Rural Electric Coop Corp (PRECC) PDFs.
 
@@ -400,6 +434,14 @@ def _looks_like_cde_lightband(path: Path) -> tuple[bool, float, str]:
         return True, 0.95, "PDF text mentions CDE Lightband"
     if "service period:" in hay and "electric energy charge" in hay and "date due:" in hay:
         return True, 0.85, "PDF text matches CDE utility billing format"
+    if (
+        "service period:" in hay
+        and "date due:" in hay
+        and "account #:" in hay
+        and ("<<electric sub-total>>" in hay or "<<telecom sub-total>>" in hay)
+        and ("clarksvillede.com" in hay or "cde is not responsible" in hay)
+    ):
+        return True, 0.9, "PDF text matches CDE balance-only utility billing format"
     return False, 0.0, ""
 
 
@@ -424,10 +466,29 @@ def _looks_like_keyword_vendor(
 ) -> tuple[bool, float, str]:
     hay = f"{path.name}\n{_document_text_sample(path, 3500)}".lower()
     compact = re.sub(r"\s+", "", hay)
-    if any(label.lower() in hay or re.sub(r"\s+", "", label.lower()) in compact for label in labels):
-        if not secondary or any(s.lower() in hay or re.sub(r"\s+", "", s.lower()) in compact for s in secondary):
+    if any(_vendor_signal_present(hay, compact, label) for label in labels):
+        if not secondary or any(_vendor_signal_present(hay, compact, signal) for signal in secondary):
             return True, 0.92, reason
     return False, 0.0, ""
+
+
+def _vendor_signal_present(haystack: str, compact_haystack: str, signal: str) -> bool:
+    """Match vendor evidence without treating acronyms as substrings.
+
+    The old ``"nes" in haystack`` test classified Cook's Pest Control as
+    Nashville Electric Service because the invoice footer contained the word
+    ``business``. Short alphabetic signals must be standalone tokens.
+    """
+    normalized = str(signal or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized.isalpha() and len(normalized) <= 4:
+        return re.search(
+            rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])",
+            haystack,
+        ) is not None
+    compact_signal = re.sub(r"\s+", "", normalized)
+    return normalized in haystack or compact_signal in compact_haystack
 
 
 def _looks_like_clarksville_gas_and_water(path: Path) -> tuple[bool, float, str]:
@@ -472,6 +533,15 @@ def _looks_like_union_city_energy_authority(path: Path) -> tuple[bool, float, st
         labels=("Union City Energy Authority", "unioncityenergy.com", "Union City Energy"),
         secondary=("METERED ELECTRIC", "NET AMOUNT DUE", "BANK DRAFT"),
         reason="PDF/OCR text matches Union City Energy Authority bill",
+    )
+
+
+def _looks_like_nashville_electric_service(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=("Nashville Electric Service", "nespower.com", "NES"),
+        secondary=("Current balance due", "Billing period", "Service Address", "Account #:"),
+        reason="PDF text matches Nashville Electric Service bill",
     )
 
 
@@ -556,24 +626,66 @@ def _looks_like_guardian_water_power(path: Path) -> tuple[bool, float, str]:
 
 
 def _looks_like_hopkinsville_electric(path: Path) -> tuple[bool, float, str]:
+    hay = f"{path.name}\n{_document_text_sample(path, 3500)}".lower()
+    if "hop-electric.utilitynexus.com" in hay and "electric service charges" in hay:
+        return True, 0.94, "PDF text matches Hopkinsville Electric portal statement"
     return _looks_like_keyword_vendor(
         path,
-        labels=("Hopkinsville Electric System", "hop-electric.com"),
-        secondary=("Electric Service", "ACCOUNTNUMBER", "TOTALCURRENTCHARGES"),
+        labels=("Hopkinsville Electric System", "hop-electric.com", "hop-electric.utilitynexus.com"),
+        secondary=("Electric Service", "ACCOUNTNUMBER", "TOTALCURRENTCHARGES", "Statement Amount"),
         reason="PDF text matches Hopkinsville Electric System bill",
+    )
+
+
+def _looks_like_cumberland_emc(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=(
+            "Cumberland EMC",
+            "Cumberland Electric Membership Corporation",
+            "cemc.org",
+        ),
+        secondary=("Current Charges Due", "AUTOPAY AMOUNT", "Account Information"),
+        reason="PDF text matches Cumberland EMC bill",
+    )
+
+
+def _looks_like_pleasant_view_utility_district(path: Path) -> tuple[bool, float, str]:
+    return _looks_like_keyword_vendor(
+        path,
+        labels=(
+            "PLEASANT VIEW UTILITY DISTRICT",
+            "pvudwater.com",
+        ),
+        secondary=("WATER SERVICE", "SEWER SERVICE", "WTR LEAK RELIEF"),
+        reason="PDF text matches Pleasant View Utility District bill",
     )
 
 
 def _pdf_text_sample(path: Path, limit: int = 2500) -> str:
     if path.suffix.lower() != ".pdf":
         return ""
+    cache_key = _path_cache_key(path, limit)
+    if cache_key is not None and cache_key in _TEXT_SAMPLE_CACHE:
+        return _TEXT_SAMPLE_CACHE[cache_key]
     try:
         import pdfplumber  # type: ignore
         with pdfplumber.open(path) as pdf:
             if pdf.pages:
-                return (pdf.pages[0].extract_text() or "")[:limit]
+                text = (pdf.pages[0].extract_text() or "")[:limit]
+                if cache_key is not None:
+                    _TEXT_SAMPLE_CACHE[cache_key] = text
+                    if len(_TEXT_SAMPLE_CACHE) > _TEXT_SAMPLE_CACHE_MAX:
+                        _TEXT_SAMPLE_CACHE.pop(next(iter(_TEXT_SAMPLE_CACHE)))
+                return text
     except Exception:
-        return ""
+        pass
+    # Empty text is also deterministic for unchanged scanned PDFs. Caching it
+    # prevents every vendor detector from reopening the same image-only file.
+    if cache_key is not None:
+        _TEXT_SAMPLE_CACHE[cache_key] = ""
+        if len(_TEXT_SAMPLE_CACHE) > _TEXT_SAMPLE_CACHE_MAX:
+            _TEXT_SAMPLE_CACHE.pop(next(iter(_TEXT_SAMPLE_CACHE)))
     return ""
 
 
@@ -647,13 +759,62 @@ def _looks_like_lowes(path: Path) -> tuple[bool, float, str]:
     hay = f"{path.name}\n{_pdf_text_sample(path)}".lower()
     if "lowe's" in hay or "lowes" in hay or "lowe s" in hay:
         return True, 0.85, "variable supplier invoice: Lowe's"
+    if _looks_like_lowes_pro_supply_layout(hay):
+        return True, 0.88, "variable supplier invoice: Lowe's Pro Supply layout"
     return False, 0.0, ""
+
+
+def _looks_like_lowes_pro_supply_layout(hay: str) -> bool:
+    """Detect Lowe's Pro Supply invoices where the logo/vendor is image-only.
+
+    Some LPS PDFs expose the remit/header/table text but not the vendor name.
+    The combination below is specific enough to avoid treating generic supplier
+    invoices as Lowe's while still routing these files out of the unknown path.
+    """
+    compact = re.sub(r"\s+", "", hay or "")
+    return (
+        "bill to #" in hay
+        and "order #" in hay
+        and ("ship point lps-" in hay or "shippointlps-" in compact)
+        and "gl code:" in hay
+        and ("p.o. box 301451" in hay or "pobox301451" in compact)
+    )
 
 
 def _looks_like_home_depot(path: Path) -> tuple[bool, float, str]:
     hay = f"{path.name}\n{_pdf_text_sample(path)}".lower()
     if "home depot" in hay or "the home depot" in hay:
         return True, 0.85, "variable supplier invoice: Home Depot"
+    return False, 0.0, ""
+
+
+def _looks_like_resman_llc(path: Path) -> tuple[bool, float, str]:
+    hay = f"{path.name}\n{_document_text_sample(path, 5000)}".lower()
+    compact = re.sub(r"\s+", "", hay)
+    strong = (
+        "myresman.com" in hay
+        or "resman llc" in hay
+        or "attn: resman" in hay
+        or "invoice#:rsm" in compact
+        or "customerid:rsm-" in compact
+    )
+    if strong and ("rsm-" in hay or re.search(r"\bRSM\d{5,}\b", hay, re.I)):
+        return True, 0.97, "strong ResMan invoice keyword"
+    if re.match(r"^rsm\d{5,}\.pdf$", path.name.lower()):
+        return True, 0.78, "ResMan invoice filename pattern"
+    return False, 0.0, ""
+
+
+def _looks_like_granite_telecommunications(path: Path) -> tuple[bool, float, str]:
+    """Detect Granite's digital multi-page telecom statements."""
+    hay = f"{path.name}\n{_document_text_sample(path, 5000)}".lower()
+    compact = re.sub(r"\s+", "", hay)
+    if (
+        "granitenet.com" in hay
+        or "granitetelecommunications,llc" in compact
+        or "rockreports.granitenet.com" in hay
+    ) and "accountnumber:" in compact:
+        return True, 0.99, "strong Granite Telecommunications statement keywords"
     return False, 0.0, ""
 
 
@@ -665,6 +826,9 @@ _DETECTORS: list[tuple[str, Callable[[Path], tuple[bool, float, str]]]] = [
     ("hardin_county_water_district_no_2", _looks_like_hardin_county_water),
     ("shelbyville_power_system", _looks_like_shelbyville_power),
     ("zillow_rentals", _looks_like_zillow_rentals),
+    ("apartments_com", _looks_like_apartments_com),
+    ("resman_llc", _looks_like_resman_llc),
+    ("granite_telecommunications_llc", _looks_like_granite_telecommunications),
     ("mcminnville_electric_system", _looks_like_mcminnville_electric),
     ("pennyrile_electric", _looks_like_pennyrile_electric),
     ("alabama_power", _looks_like_alabama_power),
@@ -677,6 +841,7 @@ _DETECTORS: list[tuple[str, Callable[[Path], tuple[bool, float, str]]]] = [
     ("kentucky_utilities", _looks_like_kentucky_utilities),
     ("tennessee_american_water", _looks_like_tennessee_american_water),
     ("union_city_energy_authority", _looks_like_union_city_energy_authority),
+    ("nashville_electric_service", _looks_like_nashville_electric_service),
     ("weakley_county_municipal_electric_system", _looks_like_weakley_county_electric),
     ("birmingham_water_works", _looks_like_birmingham_water_works),
     ("city_of_mcminnville_water_sewer_dept", _looks_like_city_of_mcminnville_water),
@@ -685,6 +850,8 @@ _DETECTORS: list[tuple[str, Callable[[Path], tuple[bool, float, str]]]] = [
     ("city_of_union_city", _looks_like_city_of_union_city),
     ("guardian_water_power", _looks_like_guardian_water_power),
     ("hopkinsville_electric_system", _looks_like_hopkinsville_electric),
+    ("cumberland_emc", _looks_like_cumberland_emc),
+    ("pleasant_view_utility_district", _looks_like_pleasant_view_utility_district),
     ("hd_supply", _looks_like_hd_supply),
     ("lowes", _looks_like_lowes),
     ("home_depot", _looks_like_home_depot),
@@ -699,6 +866,9 @@ SUPPORTED_VENDOR_KEYS = {
     "hardin_county_water_district_no_2",
     "shelbyville_power_system",
     "zillow_rentals",
+    "apartments_com",
+    "resman_llc",
+    "granite_telecommunications_llc",
     "mcminnville_electric_system",
     "pennyrile_electric",
     "alabama_power",
@@ -711,6 +881,7 @@ SUPPORTED_VENDOR_KEYS = {
     "kentucky_utilities",
     "tennessee_american_water",
     "union_city_energy_authority",
+    "nashville_electric_service",
     "weakley_county_municipal_electric_system",
     "birmingham_water_works",
     "city_of_mcminnville_water_sewer_dept",
@@ -719,34 +890,233 @@ SUPPORTED_VENDOR_KEYS = {
     "city_of_union_city",
     "guardian_water_power",
     "hopkinsville_electric_system",
+    "cumberland_emc",
+    "pleasant_view_utility_district",
+    "lowes",
 }
 
-AI_ASSIST_VENDOR_KEYS = {"hd_supply", "lowes", "home_depot"}
+AI_ASSIST_VENDOR_KEYS = {"hd_supply", "home_depot"}
+
+
+def _detection_payload(vendor_key: str, confidence: float, reason: str) -> dict:
+    return {
+        "vendor_key": vendor_key,
+        "confidence": confidence,
+        "reason": reason,
+        "supported_in_phase_1": vendor_key in SUPPORTED_VENDOR_KEYS,
+        "processing_mode": (
+            "ai_assisted"
+            if vendor_key in AI_ASSIST_VENDOR_KEYS
+            else "deterministic"
+            if vendor_key in SUPPORTED_VENDOR_KEYS
+            else "manual"
+        ),
+    }
+
+
+def _fast_keyword_detection(path: Path) -> dict | None:
+    """One-pass strong-keyword router.
+
+    Many legacy detector functions open the first PDF page individually.
+    On large batches that makes vendor routing slower than the processor
+    itself. This fast path samples the document once and only returns a
+    result for high-specificity vendor strings; ambiguous cases still
+    fall through to the existing detector chain.
+    """
+    text = _document_text_sample(path, 5000)
+    return detect_vendor_from_text(path, text)
+
+
+def detect_vendor_from_text(path: Path, text: str) -> dict | None:
+    """Route from one already-extracted text sample without another OCR pass."""
+    if not text.strip():
+        return None
+    hay = f"{path.name}\n{text}".lower()
+    compact = re.sub(r"\s+", "", hay)
+    if (
+        "costarfederaltaxid" in compact
+        and "account#/locationid" in compact
+        and ("apartmentsllc" in compact or "costar.billtrust.com" in hay)
+    ):
+        return _detection_payload("apartments_com", 0.97, "strong text keyword: apartments_com")
+    if (
+        "cityofchattanoogawastewaterdepartment" in compact
+        or "sewerpayments.com/chattanooga" in hay
+        or ("cityofchattanooga" in compact and "sewerusagecharges" in compact)
+    ):
+        return _detection_payload(
+            "city_of_chattanooga_wastewater_department",
+            0.98,
+            "strong text keyword: city_of_chattanooga_wastewater_department",
+    )
+    # The processor registry and each processor's vendor_identity contract are
+    # the canonical deterministic inventory.  Consult them before the legacy
+    # hand-maintained keyword list so adding a registered processor cannot
+    # silently leave vendor detection (and therefore cost routing) behind.
+    # Short aliases are deliberately ignored: they are useful for operator
+    # search, but are not strong enough to authorize deterministic routing.
+    registered = _detect_registered_processor_identity(hay)
+    if registered is not None:
+        return registered
+    checks: list[tuple[str, tuple[str, ...], str]] = [
+        ("zillow_rentals", ("zillow rentals", "zillow.com/rental-manager", "rentalpartners@zillowgroup.com", "zillowgroup.com"), "strong text keyword"),
+        ("apartments_com", ("apartments.com", "costarfederaltaxid", "costar.billtrust.com"), "strong text keyword"),
+        ("resman_llc", ("myresman.com", "resmanllc", "invoice#:rsm", "customerid:rsm-"), "strong text keyword"),
+        ("granite_telecommunications_llc", ("granitenet.com", "granitetelecommunications,llc", "rockreports.granitenet.com"), "strong text keyword"),
+        ("pennyrile_electric", ("pennyrileruralelectriccoopcorp", "precc.com"), "strong text keyword"),
+        ("mcminnville_electric_system", ("mcminnvilleelectricsystem", "morfordstreet"), "strong text keyword"),
+        ("alabama_power", ("alabamapower", "alabamapower.com"), "strong text keyword"),
+        ("epb_fiber_optics", ("epbfiberoptics", "epb.com"), "strong text keyword"),
+        ("the_city_of_henderson", ("cityofhenderson", "hendersonky.gov"), "strong text keyword"),
+        ("cde_lightband", ("cdelightband", "clarksvillestelectric"), "strong text keyword"),
+        ("nolin_recc_smarthub", ("nolinrecc", "nolinruralelectric"), "strong text keyword"),
+        ("clarksville_gas_and_water", ("clarksvillegasandwater", "cityofclarksville"), "strong text keyword"),
+        ("knoxville_utilities_board", ("knoxvilleutilitiesboard", "kub.org"), "strong text keyword"),
+        ("kentucky_utilities", ("kentuckyutilities", "lge-ku.com"), "strong text keyword"),
+        ("tennessee_american_water", ("tennesseeamericanwater", "amwater.com"), "strong text keyword"),
+        ("union_city_energy_authority", ("unioncityenergyauthority", "unioncityenergy"), "strong text keyword"),
+        ("nashville_electric_service", ("nashvilleelectricservice", "nespower.com"), "strong text keyword"),
+        ("weakley_county_municipal_electric_system", ("weakleycountymunicipalelectricsystem", "wcmes.com"), "strong text keyword"),
+        ("birmingham_water_works", ("birminghamwaterworks", "bwwb.org"), "strong text keyword"),
+        ("city_of_mcminnville_water_sewer_dept", ("cityofmcminnville", "cityofmcminnvilletn.gov"), "strong text keyword"),
+        ("city_of_chattanooga_wastewater_department", ("chattanoogawastewater", "chattanooga.gov"), "strong text keyword"),
+        ("city_of_martin", ("cityofmartin", "martintn.gov"), "strong text keyword"),
+        ("city_of_union_city", ("cityofunioncity", "unioncitytn.gov/water"), "strong text keyword"),
+        ("guardian_water_power", ("guardianwater&power", "myguardianwp.com"), "strong text keyword"),
+        (
+            "hopkinsville_electric_system",
+            ("hopkinsvilleelectricsystem", "hop-electric.com", "hop-electric.utilitynexus.com"),
+            "strong text keyword",
+        ),
+        ("hopkinsville_water_environment_authority", ("hopkinsvillewaterenvironmentauthority", "hwea-ky.com"), "strong text keyword"),
+        ("cumberland_emc", ("cumberlandemc", "cumberlandelectricmembershipcorporation", "cemc.org"), "strong text keyword"),
+        ("pleasant_view_utility_district", ("pleasantviewutilitydistrict", "pvudwater.com"), "strong text keyword"),
+    ]
+    for vendor_key, needles, reason in checks:
+        if any(needle in compact or needle in hay for needle in needles):
+            return _detection_payload(vendor_key, 0.96, f"{reason}: {vendor_key}")
+    if _looks_like_lowes_pro_supply_layout(hay):
+        return _detection_payload("lowes", 0.88, "strong layout keyword: lowes_pro_supply")
+    return None
+
+
+def _detect_registered_processor_identity(text: str) -> dict | None:
+    """Match strong declarative identities for registered processors only.
+
+    A YAML file alone never activates a route.  ``_registered_identity_specs``
+    first intersects the config directory with ``batch_processor``'s runtime
+    registry, then this function requires a unique, sufficiently long literal
+    identity in the observed source text.  The longest matching identity wins
+    so e.g. a specific utility name is not shadowed by a broader city alias.
+    """
+
+    compact = _identity_token(text)
+    if not compact:
+        return None
+    matches: list[tuple[int, str, str]] = []
+    for vendor_key, identities in _registered_identity_specs():
+        for identity in identities:
+            token = _identity_token(identity)
+            if len(token) < 8 or token not in compact:
+                continue
+            matches.append((len(token), vendor_key, identity))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (-item[0], item[1], item[2].casefold()))
+    best_length = matches[0][0]
+    best_vendor_keys = {item[1] for item in matches if item[0] == best_length}
+    if len(best_vendor_keys) != 1:
+        return None
+    vendor_key = matches[0][1]
+    return _detection_payload(
+        vendor_key,
+        0.97,
+        f"registered deterministic identity: {vendor_key}",
+    )
+
+
+def _identity_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def _registered_identity_specs() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return active identities with an mtime-aware cache.
+
+    Imports are intentionally lazy to avoid a module cycle: ``batch_processor``
+    imports this detector while defining the authoritative processor registry.
+    At request time that registry is complete.  Config mtimes form the cache
+    key, so an approved deterministic-builder edit is visible without a server
+    restart.
+    """
+
+    try:
+        from ..settings import VENDORS_DIR
+        from . import batch_processor
+
+        keys = tuple(sorted(batch_processor._PROCESSOR_LOADERS))  # type: ignore[attr-defined]
+    except Exception:
+        return ()
+    signature: list[tuple[str, int, int]] = []
+    for vendor_key in keys:
+        path = VENDORS_DIR / f"{vendor_key}.yaml"
+        try:
+            stat = path.stat()
+            signature.append((vendor_key, int(stat.st_mtime_ns), int(stat.st_size)))
+        except OSError:
+            signature.append((vendor_key, 0, 0))
+    return _load_registered_identity_specs(tuple(signature))
+
+
+@lru_cache(maxsize=8)
+def _load_registered_identity_specs(
+    signature: tuple[tuple[str, int, int], ...],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    try:
+        import yaml
+        from ..settings import VENDORS_DIR
+    except Exception:
+        return ()
+
+    specs: list[tuple[str, tuple[str, ...]]] = []
+    for vendor_key, _mtime_ns, _size in signature:
+        path = VENDORS_DIR / f"{vendor_key}.yaml"
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        identity = payload.get("vendor_identity")
+        if not isinstance(identity, dict) or not bool(identity.get("active", True)):
+            continue
+        values = [
+            identity.get("vendor_name"),
+            *(identity.get("detection_keywords") or []),
+            *(identity.get("aliases") or []),
+        ]
+        identities = tuple(
+            sorted(
+                {str(value).strip() for value in values if str(value or "").strip()},
+                key=str.casefold,
+            )
+        )
+        if identities:
+            specs.append((vendor_key, identities))
+    return tuple(specs)
 
 
 def detect_vendor_for_file(path: Path) -> dict:
     """Return a dict with detected vendor_key, confidence, reason. If no
     detector claims the file, vendor_key is 'unknown' and the UI should let
     the operator pick from a manual list."""
+    fast = _fast_keyword_detection(path)
+    if fast is not None:
+        return fast
     for vendor_key, fn in _DETECTORS:
         try:
             ok, conf, reason = fn(path)
         except Exception as e:
             ok, conf, reason = False, 0.0, f"detector_error:{type(e).__name__}"
         if ok:
-            return {
-                "vendor_key": vendor_key,
-                "confidence": conf,
-                "reason": reason,
-                "supported_in_phase_1": vendor_key in SUPPORTED_VENDOR_KEYS,
-                "processing_mode": (
-                    "ai_assisted"
-                    if vendor_key in AI_ASSIST_VENDOR_KEYS
-                    else "deterministic"
-                    if vendor_key in SUPPORTED_VENDOR_KEYS
-                    else "manual"
-                ),
-            }
+            return _detection_payload(vendor_key, conf, reason)
     return {
         "vendor_key": "unknown",
         "confidence": 0.0,

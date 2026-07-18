@@ -67,6 +67,8 @@ _INDEX_BY_PROP_UNIT: Optional[dict[tuple[str, str], _UnitRow]] = None
 # strategy then composes a unit hint like "2116C" and looks for that.
 _INDEX_BY_STREETNAME: Optional[dict[str, list[_UnitRow]]] = None
 _INDEX_PATH: Optional[Path] = None
+_PROPERTY_BY_NAME: Optional[dict[str, tuple[str, str]]] = None
+_PROPERTY_NAME_PATH: Optional[Path] = None
 
 
 def _project_root() -> Path:
@@ -75,6 +77,75 @@ def _project_root() -> Path:
 
 def _csv_path() -> Path:
     return _project_root() / "Properties" / "Unit Info Clean.csv"
+
+
+def _property_abbreviations_by_name() -> dict[str, str]:
+    """Load property abbreviations when Unit Info Clean omits that column."""
+
+    path = _project_root() / "Properties" / "Properties.csv"
+    if not path.is_file():
+        return {}
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            with open(path, "r", encoding=enc, newline="") as f:
+                result: dict[str, str] = {}
+                for row in csv.DictReader(f):
+                    name = (row.get("Property Name") or "").strip()
+                    abbreviation = (row.get("Property Abbreviation") or "").strip()
+                    if name and abbreviation:
+                        result.setdefault(name.casefold(), abbreviation)
+                return result
+        except UnicodeDecodeError:
+            continue
+        except Exception as exc:  # pragma: no cover
+            _LOG.warning("Failed to read property abbreviations from %s: %s", path, exc)
+            return {}
+    return {}
+
+
+def _normalize_property_name(value: str) -> str:
+    """Normalize display-name variations without weakening address matching."""
+
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip()
+    trailing_article = re.match(r"^(.*),\s*(the|a|an)$", text, re.I)
+    if trailing_article:
+        text = f"{trailing_article.group(2)} {trailing_article.group(1)}"
+    text = re.sub(r"[^a-z0-9]+", " ", text.casefold())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _property_records_by_name() -> dict[str, tuple[str, str]]:
+    path = _project_root() / "Properties" / "Properties.csv"
+    if not path.is_file():
+        return {}
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            with open(path, "r", encoding=enc, newline="") as f:
+                result: dict[str, tuple[str, str]] = {}
+                for row in csv.DictReader(f):
+                    name = (row.get("Property Name") or "").strip()
+                    abbreviation = (row.get("Property Abbreviation") or "").strip()
+                    key = _normalize_property_name(name)
+                    if key and abbreviation:
+                        result.setdefault(key, (abbreviation, name))
+                return result
+        except UnicodeDecodeError:
+            continue
+        except Exception as exc:  # pragma: no cover
+            _LOG.warning("Failed to read property names from %s: %s", path, exc)
+            return {}
+    return {}
+
+
+def _ensure_property_names_loaded() -> None:
+    global _PROPERTY_BY_NAME, _PROPERTY_NAME_PATH
+    with _LOCK:
+        path = _project_root() / "Properties" / "Properties.csv"
+        if _PROPERTY_BY_NAME is not None and _PROPERTY_NAME_PATH == path:
+            return
+        _PROPERTY_BY_NAME = _property_records_by_name()
+        _PROPERTY_NAME_PATH = path
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +206,7 @@ def _build_index() -> tuple[
     by_addr: dict[str, list[_UnitRow]] = {}
     by_pu: dict[tuple[str, str], _UnitRow] = {}
     by_street_only: dict[str, list[_UnitRow]] = {}
+    property_abbreviations = _property_abbreviations_by_name()
     path = _csv_path()
     if not path.is_file():
         _LOG.warning("Unit Info Clean not found at %s", path)
@@ -145,9 +217,13 @@ def _build_index() -> tuple[
                 with open(path, "r", encoding=enc, newline="") as f:
                     reader = csv.DictReader(f)
                     for row in reader:
+                        property_name = (row.get("Property Name") or "").strip()
                         ur = _UnitRow(
-                            property_name=(row.get("Property Name") or "").strip(),
-                            property_abbreviation=(row.get("Property Abbreviation") or "").strip(),
+                            property_name=property_name,
+                            property_abbreviation=(
+                                (row.get("Property Abbreviation") or "").strip()
+                                or property_abbreviations.get(property_name.casefold(), "")
+                            ),
                             unit_number=(row.get("Unit Number") or "").strip(),
                             address=(row.get("Address") or "").strip(),
                             city=(row.get("City") or "").strip(),
@@ -280,6 +356,59 @@ def parse_bill_address(raw: str) -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 # Public lookup
 # ---------------------------------------------------------------------------
+
+
+def match_by_property_name(property_name: str) -> Optional[UnitMatch]:
+    """Resolve a property display name against the shared property directory.
+
+    Exact normalized names are preferred. A unique containment match handles
+    harmless directory qualifiers such as ``"(Jack Miller)"`` while avoiding
+    ambiguous guesses.
+    """
+
+    _ensure_property_names_loaded()
+    key = _normalize_property_name(property_name)
+    if not key:
+        return None
+
+    resolved = (_PROPERTY_BY_NAME or {}).get(key)
+    strategy = "property_name_exact"
+    confidence = 1.0
+    if resolved is None:
+        candidates = {
+            value
+            for candidate_key, value in (_PROPERTY_BY_NAME or {}).items()
+            if key in candidate_key or candidate_key in key
+        }
+        if len(candidates) == 1:
+            resolved = candidates.pop()
+            strategy = "property_name_unique_containment"
+            confidence = 0.92
+        else:
+            try:
+                from webapp.backend.services import resman_context_data as context_data
+                from webapp.backend.services.tenant_accounting_policies import default_tenant_id
+
+                imported = context_data.find_property_by_name(default_tenant_id(), property_name)
+            except Exception:
+                imported = None
+            abbreviation = str((imported or {}).get("property_code") or "").strip()
+            canonical_name = str((imported or {}).get("property_name") or "").strip()
+            if not abbreviation or not canonical_name:
+                return None
+            resolved = (abbreviation, canonical_name)
+            strategy = "resman_context_property_name"
+            confidence = 1.0
+
+    abbreviation, canonical_name = resolved
+    return UnitMatch(
+        property_abbreviation=abbreviation,
+        property_name=canonical_name,
+        unit_number="",
+        address="",
+        strategy=strategy,
+        confidence=confidence,
+    )
 
 
 def match_by_address(
@@ -417,6 +546,25 @@ def match_by_address(
                     strategy="address_unit_lz_normalized",
                     confidence=0.85,
                 )
+        # Some properties encode the building and unit together in Unit
+        # Info Clean (for example "115 WALNUT ST 13" -> unit "115-13").
+        # The bill parser correctly extracts street_number=115 and
+        # unit_hint=13; try those composed forms before falling back to a
+        # property-only match.
+        composite_targets = {
+            f"{sn}-{uh}".upper(),
+            f"{sn}{uh}".upper(),
+        }
+        for r in candidates:
+            if r.unit_number.upper() in composite_targets:
+                return UnitMatch(
+                    property_abbreviation=r.property_abbreviation,
+                    property_name=r.property_name,
+                    unit_number=r.unit_number,
+                    address=r.address,
+                    strategy="address_composite_unit",
+                    confidence=0.92,
+                )
 
     # Whole-building / no-unit fallback: a unique match, OR the first
     # unit at this street if the property abbrev is unambiguous.
@@ -471,3 +619,13 @@ def lookup_unit(
         strategy="prop_unit_exact",
         confidence=1.0,
     )
+
+
+__all__ = [
+    "UnitMatch",
+    "lookup_unit",
+    "match_by_address",
+    "match_by_property_name",
+    "normalize_street",
+    "parse_bill_address",
+]

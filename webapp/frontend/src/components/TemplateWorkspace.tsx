@@ -2,7 +2,7 @@
 //
 // Wraps ResManTemplatePreview with:
 //   * Summary bar (files / invoices / rows / flagged / edited / total)
-//   * View presets (Required / Review / Full)
+//   * Bulk / Single invoice view switch
 //   * Search box (invoice / vendor / property / location / address)
 //   * Row filters (all / needs review / edited / missing property /
 //                  missing location / amount mismatch / missing url)
@@ -11,7 +11,15 @@
 // The actual editable grid is still rendered by `ResManTemplatePreview`
 // — this component just curates the rows and columns it sees.
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  memo,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 import { api, getFriendlyErrorMessage } from "../api";
 import type {
@@ -19,20 +27,26 @@ import type {
   AiPropertyCandidatesResponse,
   AiVendorCandidatesResponse,
   BatchProgress,
+  AccountingReadiness,
+  HumanAdjudicationContext,
+  HumanAdjudicationOptions,
   PreviewResponse,
   PreviewRow,
+  ReadinessIssue,
 } from "../types";
 import { ColumnFilterMenu } from "./ColumnFilterMenu";
+import { GlAccountExplanation } from "./GlAccountExplanation";
 import { GroupedTotalsTable } from "./GroupedTotalsTable";
 import { ProcessingTimeline } from "./ProcessingTimeline";
+import { RequiredFieldExplanation } from "./RequiredFieldExplanation";
 import {
   ResManTemplatePreview,
+  HumanAdjudicationBadges,
   type CellEdits,
   type GridCellSuggestionConfig,
 } from "./ResManTemplatePreview";
 import { TemplateLoadingState } from "./TemplateLoadingState";
 
-type ViewPreset = "required" | "review" | "full";
 type TemplateViewMode = "bulk" | "single";
 type RowFilter =
   | "all"
@@ -48,6 +62,8 @@ type Props = {
   edits: CellEdits;
   onCellEdit: (rowIndex: number, columnKey: string, newValue: unknown) => void;
   onAddPreviewRow?: (row: PreviewRow, afterRowIndex?: number) => void;
+  onDeletePreviewRows?: (rowIndexes: number[]) => void;
+  onDeletePreviewColumns?: (columns: string[]) => void;
   batchId?: string | null;
   onAiMappingApplied?: () => Promise<void> | void;
   fileCount: number;
@@ -63,7 +79,7 @@ type Props = {
   onSelectRow: (rowIndex: number | null) => void;
   // Phase 1P — Export lives in the template header now (was the
   // sidebar's actions bar). Optional so test renders can omit it.
-  onExport?: () => void;
+  onExport?: (rowIndexes?: number[]) => void;
   isExporting?: boolean;
   hasExport?: boolean;
   // Phase 1U — when a batch switch is in flight, show a panel-local
@@ -74,6 +90,7 @@ type Props = {
   isProcessing?: boolean;
   isCancelling?: boolean;
   progress?: BatchProgress | null;
+  processingElapsedMs?: number;
   onCancel?: () => void;
   // Phase 2C — breadcrumb / context.
   batchName?: string | null;
@@ -98,7 +115,7 @@ type Props = {
   currentRevisionId?: string | null;
   onActivateRevision?: (revisionId: string) => Promise<void> | void;
   onDeleteRevision?: (revisionId: string) => Promise<void> | void;
-  onSaveEdits?: () => Promise<void> | void;
+  onSaveEdits?: (options: HumanAdjudicationOptions) => Promise<void> | void;
   isSavingEdits?: boolean;
   // Phase 2K — cell selection + context-menu hooks.
   selectedColumnKey?: string | null;
@@ -108,6 +125,8 @@ type Props = {
     column: string;
     x: number;
     y: number;
+    selectedRowIndexes?: number[];
+    selectedColumns?: string[];
   }) => void;
   // When rendered inside a popout window, the host injects readOnly
   // and hides edit-only affordances (export, rename).
@@ -124,11 +143,13 @@ const FILTERS: { key: RowFilter; label: string }[] = [
   { key: "missing_url", label: "Missing link" },
 ];
 
-export function TemplateWorkspace({
+function TemplateWorkspaceImpl({
   preview,
   edits,
   onCellEdit,
   onAddPreviewRow,
+  onDeletePreviewRows,
+  onDeletePreviewColumns,
   batchId,
   onAiMappingApplied,
   fileCount,
@@ -144,6 +165,7 @@ export function TemplateWorkspace({
   isProcessing,
   isCancelling,
   progress,
+  processingElapsedMs,
   onCancel,
   batchName,
   vendorLabel,
@@ -171,11 +193,11 @@ export function TemplateWorkspace({
   void onPopoutDocument;
   void onToggleFocusMode;
   void focusMode;
-  const [view, setView] = useState<ViewPreset>("required");
   const [templateMode, setTemplateMode] = useState<TemplateViewMode>("bulk");
   const [singleInvoiceIndex, setSingleInvoiceIndex] = useState(0);
   const [filter, setFilter] = useState<RowFilter>("all");
   const [search, setSearch] = useState("");
+  const deferredSearch = useDeferredValue(search);
   // Phase 2M — Excel-style per-column filters and group-by aggregation.
   // ``columnFilters`` is keyed by column name; the value is the list
   // of allowed cell values for that column (string-coerced). Absent
@@ -194,9 +216,26 @@ export function TemplateWorkspace({
     Record<number, AiGlCandidatesResponse>
   >({});
   const [saveVendorForFuture, setSaveVendorForFuture] = useState(true);
-  const [saveGlForFuture, setSaveGlForFuture] = useState(true);
-  const [applySimilarGl, setApplySimilarGl] = useState(false);
+  const saveGlForFuture = true;
+  const applySimilarGl = false;
   const [bulkSuggestionGeneration, setBulkSuggestionGeneration] = useState(0);
+  const [adjudicationOpen, setAdjudicationOpen] = useState(false);
+  const [adjudicationContext, setAdjudicationContext] =
+    useState<HumanAdjudicationContext | null>(null);
+  const [adjudicationContextError, setAdjudicationContextError] = useState("");
+  useEffect(() => {
+    if (!adjudicationOpen) return;
+    let cancelled = false;
+    setAdjudicationContextError("");
+    void api.humanAdjudicationContext().then((value) => {
+      if (!cancelled) setAdjudicationContext(value);
+    }).catch((error) => {
+      if (!cancelled) setAdjudicationContextError(
+        getFriendlyErrorMessage(error, "Load correction permissions"),
+      );
+    });
+    return () => { cancelled = true; };
+  }, [adjudicationOpen]);
   // Reset filter to "all" whenever a new preview lands so a stale
   // filter doesn't hide every row.
   useEffect(() => {
@@ -246,30 +285,9 @@ export function TemplateWorkspace({
     };
   }, [preview, fileCount, edits]);
 
-  // Curate columns based on view preset.
-  const curatedPreview = useMemo<PreviewResponse | null>(() => {
-    if (!preview) return null;
-    if (view === "full") return preview;
-    if (view === "required") {
-      // "Required" means required + recommended only.
-      const keep = new Set([
-        ...preview.required_columns,
-        ...preview.recommended_columns,
-      ]);
-      const cols = preview.columns.filter((c) => keep.has(c));
-      return { ...preview, columns: cols };
-    }
-    // "review" = required + recommended + Document Url + Reference Number.
-    const keep = new Set([
-      ...preview.required_columns,
-      ...preview.recommended_columns,
-      "Document Url",
-      "Reference Number",
-      "Invoice Description",
-    ]);
-    const cols = preview.columns.filter((c) => keep.has(c));
-    return { ...preview, columns: cols };
-  }, [preview, view]);
+  // Always expose the complete ResMan template. A single column mode
+  // prevents optional fields from being hidden by stale UI state.
+  const curatedPreview = preview;
 
   // Pre-build per-column allow sets for fast lookup inside the row loop.
   const columnFilterSets = useMemo(() => {
@@ -283,7 +301,7 @@ export function TemplateWorkspace({
   // Apply filter + search + per-column filters to row visibility.
   const visibleIndexes = useMemo<Set<number> | null>(() => {
     if (!preview) return null;
-    const q = search.trim().toLowerCase();
+    const q = deferredSearch.trim().toLowerCase();
     const colFilterEntries = Object.entries(columnFilterSets);
     const indexes = new Set<number>();
     preview.rows.forEach((row, i) => {
@@ -348,7 +366,7 @@ export function TemplateWorkspace({
       indexes.add(i);
     });
     return indexes;
-  }, [preview, edits, filter, search, columnFilterSets]);
+  }, [preview, edits, filter, deferredSearch, columnFilterSets]);
 
   // Distinct values for the column the filter menu is currently
   // pointing at. We only compute it for the open menu so picking a
@@ -405,6 +423,19 @@ export function TemplateWorkspace({
       if (nextIndex >= 0) setSingleInvoiceIndex(nextIndex);
     }
     setTemplateMode("single");
+  };
+
+  const selectSingleInvoiceIndex = (nextIndex: number) => {
+    if (invoiceGroups.length === 0) return;
+    const clamped = Math.min(
+      Math.max(0, nextIndex),
+      invoiceGroups.length - 1,
+    );
+    setSingleInvoiceIndex(clamped);
+    const firstRowIndex = invoiceGroups[clamped]?.rowIndexes[0];
+    if (firstRowIndex != null) {
+      onSelectRow(firstRowIndex);
+    }
   };
 
   const commitInvoiceField = (
@@ -700,10 +731,22 @@ export function TemplateWorkspace({
     resolveDocumentUrlForRow(batchId, row);
 
   const editedCount = summary.edited;
+  const [evaluatedReadiness, setEvaluatedReadiness] = useState(preview?.accounting_readiness);
+  useEffect(() => {
+    setEvaluatedReadiness(preview?.accounting_readiness);
+    if (!batchId || !preview || Object.keys(edits).length === 0) return;
+    const timer = window.setTimeout(() => {
+      const rows = preview.rows.map((row, index) => ({ ...row, ...(edits[index] || {}) }));
+      void api.accountingReadiness(batchId, rows).then(setEvaluatedReadiness).catch(() => {
+        setEvaluatedReadiness(undefined);
+      });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [batchId, edits, preview]);
   const canExport = !!onExport
     && !!preview
     && summary.rows > 0
-    && preview.accounting_readiness?.export_allowed === true;
+    && evaluatedReadiness?.export_allowed === true;
   // Phase 2C — titleMeta retired in favour of the breadcrumb header.
 
   return (
@@ -731,6 +774,7 @@ export function TemplateWorkspace({
             />
             {!readOnly && (
               <RevisionsDropdown
+                batchId={batchId || null}
                 revisions={revisions || []}
                 currentRevisionId={currentRevisionId || null}
                 onActivate={onActivateRevision}
@@ -804,6 +848,7 @@ export function TemplateWorkspace({
       {isProcessing ? (
         <TemplateLoadingState
           progress={progress}
+          elapsedMs={processingElapsedMs}
           isCancelling={isCancelling}
           onCancel={onCancel}
         />
@@ -841,41 +886,6 @@ export function TemplateWorkspace({
           </button>
         </div>
 
-        {templateMode === "bulk" && (
-        <div
-          className="view-presets"
-          role="tablist"
-          aria-label="Visible columns"
-          data-testid="column-view-tabs"
-        >
-          <span className="template-controls-label" aria-hidden>
-            Columns:
-          </span>
-          <button
-            role="tab"
-            aria-selected={view === "required"}
-            className={`view-preset-btn ${view === "required" ? "active" : ""}`}
-            onClick={() => setView("required")}
-            title="Required and recommended columns only — the core fields needed for ResMan import."
-          >
-            Required
-          </button>
-          {/* Phase 2F — "Issues" column preset removed. Issues are
-              already visible in the table via row tinting + the
-              Issues pill in the topbar; a column preset just for
-              issue triage was redundant. */}
-          <button
-            role="tab"
-            aria-selected={view === "full"}
-            className={`view-preset-btn ${view === "full" ? "active" : ""}`}
-            onClick={() => setView("full")}
-            title="Every column from the official ResMan Template.xlsx."
-          >
-            All
-          </button>
-        </div>
-        )}
-
         <div className="template-filter-tools">
           {templateMode === "single" && activeInvoiceGroup && (
             <div className="single-invoice-nav" data-testid="single-invoice-nav">
@@ -883,7 +893,7 @@ export function TemplateWorkspace({
                 type="button"
                 className="btn btn-compact"
                 disabled={singleInvoiceIndex <= 0}
-                onClick={() => setSingleInvoiceIndex((v) => Math.max(0, v - 1))}
+                onClick={() => selectSingleInvoiceIndex(singleInvoiceIndex - 1)}
               >
                 Previous
               </button>
@@ -894,9 +904,7 @@ export function TemplateWorkspace({
                 type="button"
                 className="btn btn-compact"
                 disabled={singleInvoiceIndex >= invoiceGroups.length - 1}
-                onClick={() =>
-                  setSingleInvoiceIndex((v) => Math.min(invoiceGroups.length - 1, v + 1))
-                }
+                onClick={() => selectSingleInvoiceIndex(singleInvoiceIndex + 1)}
               >
                 Next
               </button>
@@ -963,6 +971,9 @@ export function TemplateWorkspace({
           )}
           </>
           )}
+        </div>
+
+        <div className="template-fixed-actions" data-testid="template-fixed-actions">
           {/* Phase 2I.13 — Save edits to the active revision. Only
               visible while local cell edits exist; on click we POST
               them to /save-edits which mirrors the changes into both
@@ -973,17 +984,14 @@ export function TemplateWorkspace({
               type="button"
               className="btn btn-compact template-save-btn"
               disabled={isSavingEdits}
-              onClick={() => {
-                void onSaveEdits();
-              }}
+              onClick={() => setAdjudicationOpen(true)}
               data-testid="template-save-button"
               title={`Save ${editedCount} edit${editedCount === 1 ? "" : "s"} to this revision.`}
             >
               {isSavingEdits ? "Saving…" : `Save (${editedCount})`}
             </button>
           )}
-          {/* Phase 2F — Export sits at the right edge of the controls
-              strip so the toolbar reads "view -> filter -> action". */}
+          {/* Export is a fixed workspace action, not part of the search/filter flow. */}
           {!readOnly && onExport && (
             <button
               type="button"
@@ -991,7 +999,7 @@ export function TemplateWorkspace({
                 canExport ? "btn-accent" : ""
               }`}
               disabled={!canExport || isExporting}
-              onClick={onExport}
+              onClick={() => onExport()}
               data-testid="template-export-button"
               title={
                 summary.flagged > 0
@@ -1014,7 +1022,7 @@ export function TemplateWorkspace({
 
       {templateMode === "single" ? (
         activeInvoiceGroup ? (
-          <SingleInvoiceMode
+          <MemoSingleInvoiceMode
             batchId={batchId}
             readOnly={readOnly === true}
             onRefresh={onAiMappingApplied}
@@ -1026,6 +1034,9 @@ export function TemplateWorkspace({
             onAddLineItem={onAddPreviewRow}
             onGroupFieldEdit={commitInvoiceField}
             onReturnToBulk={() => setTemplateMode("bulk")}
+            onExport={onExport}
+            readiness={preview?.invoice_readiness?.[activeInvoiceGroup.key]}
+            isExporting={isExporting}
           />
         ) : (
           <div className="card template-grid-card" data-testid="single-invoice-mode">
@@ -1056,10 +1067,11 @@ export function TemplateWorkspace({
               : null
           }
           onSelectRow={onSelectRow}
-          forceShowOptional={view === "full"}
           selectedColumnKey={selectedColumnKey}
           onSelectCell={onSelectCell}
           onCellContextMenu={onCellContextMenu}
+          onDeleteRows={readOnly ? undefined : onDeletePreviewRows}
+          onDeleteColumns={readOnly ? undefined : onDeletePreviewColumns}
           onColumnFilterClick={(col, anchor) => setFilterMenu({ column: col, anchor })}
           filteredColumns={filteredColumnsSet}
           getCellAiSuggestions={getBulkCellAiSuggestions}
@@ -1084,10 +1096,234 @@ export function TemplateWorkspace({
           onClose={() => setFilterMenu(null)}
         />
       )}
+      {adjudicationOpen && preview && onSaveEdits && (
+        <HumanAdjudicationPanel
+          batchId={batchId || ""}
+          preview={preview}
+          edits={edits}
+          context={adjudicationContext}
+          contextError={adjudicationContextError}
+          saving={isSavingEdits === true}
+          onCancel={() => setAdjudicationOpen(false)}
+          onConfirm={async (options) => {
+            await onSaveEdits(options);
+            setAdjudicationOpen(false);
+          }}
+        />
+      )}
       </>
       )}
     </div>
   );
+}
+
+export const TemplateWorkspace = memo(TemplateWorkspaceImpl);
+
+type PendingAdjudicationChange = {
+  key: string;
+  rowIndex: number;
+  field: string;
+  previousValue: unknown;
+  correctedValue: unknown;
+  invoiceLabel: string;
+  rowLabel: string;
+  evidenceAvailable: boolean;
+};
+
+export function HumanAdjudicationPanel({
+  batchId,
+  preview,
+  edits,
+  context,
+  contextError,
+  saving,
+  onCancel,
+  onConfirm,
+}: {
+  batchId: string;
+  preview: PreviewResponse;
+  edits: CellEdits;
+  context: HumanAdjudicationContext | null;
+  contextError: string;
+  saving: boolean;
+  onCancel: () => void;
+  onConfirm: (options: HumanAdjudicationOptions) => Promise<void> | void;
+}) {
+  const [rationale, setRationale] = useState("");
+  const [benchmark, setBenchmark] = useState(false);
+  const [learning, setLearning] = useState(false);
+  const [rule, setRule] = useState(false);
+  const changes = useMemo<PendingAdjudicationChange[]>(() => {
+    const output: PendingAdjudicationChange[] = [];
+    for (const [rawIndex, fields] of Object.entries(edits)) {
+      const rowIndex = Number(rawIndex);
+      const row = preview.rows[rowIndex];
+      if (!row) continue;
+      for (const [field, correctedValue] of Object.entries(fields)) {
+        output.push({
+          key: `${rowIndex}:${field}`,
+          rowIndex,
+          field,
+          previousValue: (row as Record<string, unknown>)[field],
+          correctedValue,
+          invoiceLabel: String(row["Invoice Number"] || row._meta?.invoice_group_id || "Invoice"),
+          rowLabel: String(row["Line Item Number"] || row._meta?.line_item_id || rowIndex + 1),
+          evidenceAvailable: Boolean(
+            row._meta?.source_file && row._meta?.source_page && row._meta?.trace_ids?.length,
+          ),
+        });
+      }
+    }
+    return output;
+  }, [edits, preview.rows]);
+  const hasGlCorrection = changes.some((item) => item.field === "GL Account");
+  const canSubmit = Boolean(
+    context?.permissions.invoice_correction && rationale.trim().length >= 3 && changes.length,
+  );
+
+  return (
+    <div className="human-adjudication-backdrop" role="presentation">
+      <section
+        className="human-adjudication-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="human-adjudication-title"
+        data-testid="human-adjudication-panel"
+      >
+        <header>
+          <div>
+            <span className="human-adjudication-kicker">Human adjudication</span>
+            <h3 id="human-adjudication-title">Confirm saved corrections</h3>
+            <p>Source facts stay unchanged. Optional uses are separately authorized.</p>
+          </div>
+          <button type="button" className="btn btn-compact" onClick={onCancel} disabled={saving}>Close</button>
+        </header>
+
+        {contextError && <div className="error-banner">{contextError}</div>}
+        {context && (
+          <div className="human-adjudication-actor" data-testid="human-adjudication-actor">
+            {context.reviewer_id} · {formatReviewerRole(context.role)} · tenant {context.tenant_id}
+          </div>
+        )}
+
+        <div className="human-adjudication-change-list">
+          {changes.map((change) => (
+            <article key={change.key} className="human-adjudication-change" data-testid="human-adjudication-change">
+              <div className="human-adjudication-change-main">
+                <strong>{change.field}</strong>
+                <small>Invoice {change.invoiceLabel} · row {change.rowLabel}</small>
+                <div className="human-adjudication-values">
+                  <span><b>Previous AI</b>{displayAdjudicationValue(change.previousValue)}</span>
+                  <span className="is-human"><b>Human correction</b>{displayAdjudicationValue(change.correctedValue)}</span>
+                </div>
+              </div>
+              {change.evidenceAvailable && (
+                <EvidenceCrop
+                  src={api.humanAdjudicationEvidenceCropUrl(batchId, change.rowIndex, change.field)}
+                  alt={`Source evidence for ${change.field}, row ${change.rowLabel}`}
+                />
+              )}
+            </article>
+          ))}
+        </div>
+
+        <label className="human-adjudication-rationale">
+          <span>Reviewer rationale <b>*</b></span>
+          <textarea
+            value={rationale}
+            onChange={(event) => setRationale(event.target.value)}
+            placeholder="Explain what source evidence supports this correction."
+            maxLength={4000}
+            data-testid="human-adjudication-rationale"
+          />
+        </label>
+
+        <div className="human-adjudication-options">
+          <label className="is-required">
+            <input type="checkbox" checked readOnly disabled />
+            <span><b>Apply to this invoice</b><small>Required · survives reprocessing</small></span>
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={benchmark}
+              disabled={!context?.permissions.benchmark_submission}
+              onChange={(event) => setBenchmark(event.target.checked)}
+              data-testid="human-adjudication-benchmark"
+            />
+            <span><b>Add to benchmark</b><small>Submission only; Accountant/AP approval creates exact-evidence gold</small></span>
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={learning}
+              disabled={!context?.permissions.learning_approval}
+              onChange={(event) => setLearning(event.target.checked)}
+              data-testid="human-adjudication-learning"
+            />
+            <span><b>Use as approved learning example</b><small>Tenant-private candidate evidence; never a final decision</small></span>
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={rule}
+              disabled={!hasGlCorrection || !context?.permissions.rule_proposal}
+              onChange={(event) => setRule(event.target.checked)}
+              data-testid="human-adjudication-rule"
+            />
+            <span><b>Ask AI to propose a reusable rule</b><small>GL semantic proposal only; separate Controller approval is required</small></span>
+          </label>
+        </div>
+
+        <footer>
+          <span>{changes.length} correction{changes.length === 1 ? "" : "s"}</span>
+          <div>
+            <button type="button" className="btn btn-compact" onClick={onCancel} disabled={saving}>Cancel</button>
+            <button
+              type="button"
+              className="btn btn-compact btn-accent"
+              disabled={!canSubmit || saving}
+              onClick={() => void onConfirm({
+                rationale: rationale.trim(),
+                add_to_benchmark: benchmark,
+                approve_learning_example: learning,
+                propose_reusable_rule: rule,
+              })}
+              data-testid="human-adjudication-confirm"
+            >
+              {saving ? "Saving…" : "Confirm & save"}
+            </button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function EvidenceCrop({ src, alt }: { src: string; alt: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <span className="human-adjudication-evidence-unavailable">Evidence linked</span>;
+  return (
+    <figure className="human-adjudication-evidence">
+      <img src={src} alt={alt} onError={() => setFailed(true)} />
+      <figcaption>Source evidence</figcaption>
+    </figure>
+  );
+}
+
+function displayAdjudicationValue(value: unknown): string {
+  if (value == null || value === "") return "(blank)";
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  return String(value);
+}
+
+function formatReviewerRole(role: HumanAdjudicationContext["role"]): string {
+  return ({
+    property_manager: "Property Manager",
+    accountant_ap: "Accountant/AP",
+    accounting_manager_controller: "Accounting Manager/Controller",
+    platform_admin: "Platform Admin",
+  } as const)[role];
 }
 
 type InvoiceGroup = {
@@ -1143,6 +1379,9 @@ function SingleInvoiceMode({
   onAddLineItem,
   onGroupFieldEdit,
   onReturnToBulk,
+  onExport,
+  isExporting,
+  readiness,
 }: {
   batchId?: string | null;
   readOnly?: boolean;
@@ -1159,6 +1398,9 @@ function SingleInvoiceMode({
     newValue: unknown,
   ) => void;
   onReturnToBulk: () => void;
+  onExport?: (rowIndexes?: number[]) => void;
+  isExporting?: boolean;
+  readiness?: AccountingReadiness;
 }) {
   const firstIndex = group.rowIndexes[0] ?? 0;
   const first = group.firstRow;
@@ -1177,14 +1419,29 @@ function SingleInvoiceMode({
   const [resolved, setResolved] = useState<Set<string>>(() => new Set());
   const [suggestionGeneration, setSuggestionGeneration] = useState(0);
   const [reviewExpanded, setReviewExpanded] = useState(false);
-  const [saveGlForFuture, setSaveGlForFuture] = useState(true);
-  const [applySimilarGl, setApplySimilarGl] = useState(false);
+  const [effectiveReadiness, setEffectiveReadiness] = useState(readiness);
+  const saveGlForFuture = true;
+  const applySimilarGl = false;
   const [taxPolicy, setTaxPolicy] = useState<
     "distribute_proportionally" | "separate_tax_line" | "exclude_tax" | "manual_review"
   >("distribute_proportionally");
   const reasons = uniqueStrings(
     group.rows.flatMap((row) => row._meta?.manual_review_reasons ?? []),
   );
+  useEffect(() => {
+    setEffectiveReadiness(readiness);
+    if (!batchId) return;
+    const hasGroupEdits = group.rowIndexes.some((index) => edits[index] && Object.keys(edits[index]).length > 0);
+    if (!hasGroupEdits) return;
+    const timer = window.setTimeout(() => {
+      const rows = group.rows.map((row, position) => ({
+        ...row,
+        ...(edits[group.rowIndexes[position]] || {}),
+      }));
+      void api.accountingReadiness(batchId, rows).then(setEffectiveReadiness).catch(() => setEffectiveReadiness(undefined));
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [batchId, edits, group, readiness]);
   const rawFlags = uniqueStrings(
     group.rows.flatMap((row) => row._meta?.ai_validation_flags ?? []),
   );
@@ -1214,13 +1471,12 @@ function SingleInvoiceMode({
         ? rowInvoiceTotal
         : baseInvoiceTotal;
   const resmanLineTotal = lineTotal;
-  const difference = invoiceTotal - resmanLineTotal;
-  const taxReviewPending =
-    flags.includes("tax_handling_requires_review") ||
-    flags.includes("tax_gl_mapping_required") ||
-    first._meta?.ai_tax_handling === "manual_review";
   const tasks = buildReviewTasks(flags, reasons);
-  const blockingCount = tasks.filter((task) => task.blocking && !resolved.has(task.code)).length;
+  const backendBlockers = effectiveReadiness?.blockers ?? [];
+  const headerIssue = (field: string) => readinessIssueForField(effectiveReadiness, field);
+  const lineIssue = (field: string, linePosition: number) =>
+    readinessIssueForField(effectiveReadiness, field, linePosition);
+  const blockingCount = effectiveReadiness ? backendBlockers.length : tasks.filter((task) => task.blocking).length;
   const visibleTasks = tasks.filter((task) => !resolved.has(task.code));
   const reviewSummary =
     visibleTasks.length > 0
@@ -1230,7 +1486,7 @@ function SingleInvoiceMode({
     blockingCount > 0
       ? `Blocked by: ${visibleTasks.filter((task) => task.blocking).map((task) => task.title).join(", ")}`
       : "Invoice ready to export.";
-  const statusLabel = blockingCount > 0 ? "Needs review" : "Ready";
+  const statusLabel = effectiveReadiness?.status === "ready" ? "Ready" : blockingCount > 0 ? "Blocked" : "Needs review";
   const vendorText = String(first.Vendor || first._meta?.ai_detected_vendor || "Not set");
   const billOrCredit = String(cellValue(first, edits, firstIndex, "Bill or Credit") || "Bill");
   const invoiceDate = formatDateForDisplay(cellValue(first, edits, firstIndex, "Invoice Date"));
@@ -1239,11 +1495,6 @@ function SingleInvoiceMode({
   const receivedDate = accountingDate || invoiceDate;
   const description = cellValue(first, edits, firstIndex, "Invoice Description");
   const expenseType = String(cellValue(first, edits, firstIndex, "Expense Type") || "General");
-  const sourceFiles = uniqueStrings(group.rows.map((row) => row._meta?.source_file || ""));
-  const historyDate = invoiceDate || accountingDate || dueDate || "";
-  const enteredActivity = first._meta?.ai_generated
-    ? `Entered by AI-assisted extraction${first._meta.ai_confidence != null ? ` (${formatConfidence(first._meta.ai_confidence)})` : ""}`
-    : "Entered by web console";
   const selectedLineIndex = group.rowIndexes.includes(selectedRowIndex ?? -1)
     ? selectedRowIndex ?? firstIndex
     : firstIndex;
@@ -1639,7 +1890,7 @@ function SingleInvoiceMode({
   return (
     <section className="single-invoice-mode card resman-invoice-mode" data-testid="single-invoice-mode">
       <div className="resman-invoice-titlebar">
-        <span>Invoice</span>
+        <span className="resman-invoice-title">Single invoice</span>
         <div className="single-invoice-actions">
           <span className={`single-status-pill ${blockingCount > 0 ? "needs-review" : "ready"}`} data-testid="single-invoice-status">
             {statusLabel}
@@ -1660,7 +1911,7 @@ function SingleInvoiceMode({
           >
             {saving === "vision" ? "Scanning..." : "Use vision assist"}
           </button>
-          <button type="button" className="btn btn-compact" onClick={onReturnToBulk}>
+          <button type="button" className="btn btn-compact single-return-bulk-button" onClick={onReturnToBulk}>
             Bulk
           </button>
         </div>
@@ -1669,12 +1920,13 @@ function SingleInvoiceMode({
       <div className="single-invoice-body resman-invoice-body">
         <div className="resman-invoice-top">
           <div className="resman-invoice-form">
-            <ResManReadonlyField label="Vendor" required value={vendorText} />
+            <ResManReadonlyField label="Vendor" required value={vendorText} issue={headerIssue("Vendor")} />
             <ResManReadonlyField label="Expense type" required value={expenseType} />
             <ResManEditableField
               label="Number"
               required
               value={cellValue(first, edits, firstIndex, "Invoice Number")}
+              issue={headerIssue("Invoice Number")}
               onCommit={(value) => onGroupFieldEdit(group, "Invoice Number", value)}
             />
             <div className="resman-form-split">
@@ -1682,12 +1934,14 @@ function SingleInvoiceMode({
                 label="Invoice date"
                 required
                 value={invoiceDate}
+                issue={headerIssue("Invoice Date")}
                 onCommit={(value) => onGroupFieldEdit(group, "Invoice Date", value)}
               />
               <ResManEditableField
                 label="Received date"
                 required
                 value={receivedDate}
+                issue={headerIssue("Accounting Date")}
                 onCommit={(value) => onGroupFieldEdit(group, "Accounting Date", value)}
               />
             </div>
@@ -1696,12 +1950,14 @@ function SingleInvoiceMode({
                 label="Due date"
                 required
                 value={dueDate}
+                issue={headerIssue("Due Date")}
                 onCommit={(value) => onGroupFieldEdit(group, "Due Date", value)}
               />
               <ResManEditableField
                 label="Accounting date"
                 required
                 value={accountingDate}
+                issue={headerIssue("Accounting Date")}
                 onCommit={(value) => onGroupFieldEdit(group, "Accounting Date", value)}
               />
             </div>
@@ -1744,6 +2000,7 @@ function SingleInvoiceMode({
               label="Description"
               required
               value={description}
+              issue={headerIssue("Invoice Description")}
               onCommit={(value) => onGroupFieldEdit(group, "Invoice Description", value)}
               aiSuggestions={{
                 title: "Invoice description suggestions",
@@ -1768,22 +2025,17 @@ function SingleInvoiceMode({
               <dd>{displayValue(first._meta?.ai_service_address)}</dd>
               <dt>AI confidence</dt>
               <dd>{formatConfidence(first._meta?.ai_confidence)}</dd>
-              <dt>Source document</dt>
-              <dd>
-                {sourceDocumentUrl ? (
-                  <a
-                    className="single-source-link"
-                    href={sourceDocumentUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    {sourceFile || "Open source document"}
-                  </a>
-                ) : (
-                  displayValue(first._meta?.source_file)
-                )}
-              </dd>
             </dl>
+            <div className="resman-documents-bar">
+              <span>Documents</span>
+              {sourceDocumentUrl ? (
+                <a href={sourceDocumentUrl} target="_blank" rel="noreferrer">
+                  {sourceFile || "Open source"}
+                </a>
+              ) : (
+                <span>{displayValue(first._meta?.source_file)}</span>
+              )}
+            </div>
             <div className="single-property-resolver resman-property-resolver" data-testid="single-property-resolver">
               <div className="single-resolver-row">
                 <input value={propertyQuery} onChange={(e) => setPropertyQuery(e.target.value)} placeholder="Search property or use service address" aria-label="Search property" />
@@ -1839,18 +2091,6 @@ function SingleInvoiceMode({
         <section className="resman-line-section">
           <div className="resman-line-heading">
             <h4>Line Items</h4>
-            <div className="resman-line-options" aria-label="GL mapping options">
-              <label><input type="checkbox" checked={saveGlForFuture} onChange={(e) => setSaveGlForFuture(e.target.checked)} /> Save mapping for future</label>
-              <label><input type="checkbox" checked={applySimilarGl} onChange={(e) => setApplySimilarGl(e.target.checked)} /> Apply to similar items</label>
-            </div>
-            <button
-              type="button"
-              className="btn btn-compact"
-              onClick={addLineItem}
-              disabled={!onAddLineItem}
-            >
-              Add line item
-            </button>
           </div>
           <div className="single-line-items resman-line-items" data-testid="single-invoice-line-items">
             <table>
@@ -1859,11 +2099,11 @@ function SingleInvoiceMode({
                 <col className="resman-col-location" />
                 <col className="resman-col-gl" />
                 <col className="resman-col-description" />
+                <col className="resman-col-item-meaning" />
                 <col className="resman-col-unit" />
                 <col className="resman-col-quantity" />
                 <col className="resman-col-total" />
                 <col className="resman-col-tax" />
-                <col className="resman-col-add" />
               </colgroup>
               <thead>
                 <tr>
@@ -1871,11 +2111,11 @@ function SingleInvoiceMode({
                   <th>Location</th>
                   <th>GL Account</th>
                   <th>Description</th>
+                  <th>Item meaning</th>
                   <th>Unit price</th>
-                  <th>Quantity</th>
+                  <th>Qty</th>
                   <th>Total</th>
                   <th>Tax</th>
-                  <th aria-label="Add line item" />
                 </tr>
               </thead>
               <tbody>
@@ -1885,6 +2125,10 @@ function SingleInvoiceMode({
                   const amount = Number(cellValue(row, edits, rowIndex, "Amount") || 0);
                   const currentGl = String(cellValue(row, edits, rowIndex, "GL Account") ?? "").trim();
                   const currentGlName = glNameForCode(currentGl, lineGlCandidates[rowIndex]?.candidates ?? []);
+                  const glExplanationRow =
+                    edits[rowIndex] && Object.keys(edits[rowIndex]).length
+                      ? ({ ...row, ...edits[rowIndex] } as PreviewRow)
+                      : row;
                   const rowSourceDescription = sourceLineDescription(row);
                   const rowGlSuggestions = toGlSuggestionItems(
                     rotateItems(lineGlCandidates[rowIndex]?.candidates ?? [], suggestionGeneration),
@@ -1898,7 +2142,7 @@ function SingleInvoiceMode({
                   );
                   return (
                     <tr key={rowIndex} className={isSelected ? "selected-row" : ""} onClick={() => onSelectRow(rowIndex)} data-testid="single-invoice-line-item">
-                      <SingleLineCell row={row} edits={edits} rowIndex={rowIndex} column="Property Abbreviation" onCellEdit={onCellEdit} />
+                      <SingleLineCell row={row} edits={edits} rowIndex={rowIndex} column="Property Abbreviation" onCellEdit={onCellEdit} issue={lineIssue("Property Abbreviation", idx)} />
                       <SingleLineCell row={row} edits={edits} rowIndex={rowIndex} column="Location" onCellEdit={onCellEdit} />
                       <td className="resman-gl-cell">
                         <div className="resman-gl-field">
@@ -1907,6 +2151,7 @@ function SingleInvoiceMode({
                             edits={edits}
                             rowIndex={rowIndex}
                             column="GL Account"
+                            issue={lineIssue("GL Account", idx)}
                             onCellEdit={onCellEdit}
                             aiSuggestions={{
                               title: "GL account suggestions",
@@ -1917,6 +2162,13 @@ function SingleInvoiceMode({
                               onRegenerate: regenerateSuggestions,
                             }}
                           />
+                          {currentGl && (
+                            <GlAccountExplanation
+                              row={glExplanationRow}
+                              glAccount={currentGl}
+                              glName={currentGlName}
+                            />
+                          )}
                           {currentGlName && <span className="resman-gl-name">{currentGlName}</span>}
                         </div>
                       </td>
@@ -1925,6 +2177,7 @@ function SingleInvoiceMode({
                         edits={edits}
                         rowIndex={rowIndex}
                         column="Line Item Description"
+                        issue={lineIssue("Line Item Description", idx)}
                         onCellEdit={onCellEdit}
                         aiSuggestions={{
                           title: "Line description suggestions",
@@ -1933,13 +2186,15 @@ function SingleInvoiceMode({
                           onRegenerate: regenerateSuggestions,
                         }}
                       />
+                      <td className="resman-item-meaning-cell">
+                        <span title={plainLanguageItemDescription(row)}>
+                          {plainLanguageItemDescription(row) || "Needs interpretation"}
+                        </span>
+                      </td>
                       <SingleLineCell row={row} edits={edits} rowIndex={rowIndex} column="Unit Price" onCellEdit={onCellEdit} numeric fallbackValue={amount} />
                       <SingleLineCell row={row} edits={edits} rowIndex={rowIndex} column="Quantity" onCellEdit={onCellEdit} numeric fallbackValue={1} />
-                      <SingleLineCell row={row} edits={edits} rowIndex={rowIndex} column="Amount" onCellEdit={onCellEdit} numeric />
+                      <SingleLineCell row={row} edits={edits} rowIndex={rowIndex} column="Amount" onCellEdit={onCellEdit} numeric issue={lineIssue("Amount", idx)} />
                       <td className="resman-tax-cell"><input type="checkbox" readOnly checked={taxAmount > 0 && idx === 0} /></td>
-                      <td className="resman-plus-cell">
-                        <button type="button" onClick={(e) => { e.stopPropagation(); addLineItem(); }} disabled={!onAddLineItem}>+</button>
-                      </td>
                     </tr>
                   );
                 })}
@@ -1954,23 +2209,6 @@ function SingleInvoiceMode({
           </div>
         </section>
 
-        <div className="single-totals-card resman-totals-card" data-testid="single-invoice-totals">
-          <div className="single-total-primary" data-testid="single-total-invoice">
-            <span>Invoice total</span>
-            <ResManMoneyInput
-              value={invoiceTotal}
-              ariaLabel="Invoice total summary"
-              onCommit={(value) => onGroupFieldEdit(group, "Invoice Total", value)}
-            />
-          </div>
-          <div data-testid="single-total-merchandise"><span>Merchandise</span><strong>{money(merchandiseSubtotal)}</strong></div>
-          <div data-testid="single-total-tax"><span>Tax</span><strong>{money(taxAmount)}</strong></div>
-          <div><span>ResMan line total</span><strong>{money(resmanLineTotal)}</strong></div>
-          <div className={Math.abs(difference) > 0.009 ? "single-total-difference has-difference" : "single-total-difference"}>
-            <span>{taxReviewPending ? "Pending tax" : "Difference"}</span>
-            <strong>{money(difference)}</strong>
-          </div>
-        </div>
         {taxAmount > 0 && (
           <div className="resman-tax-actions" data-testid="single-tax-actions">
             <span>Tax / difference</span>
@@ -1998,26 +2236,25 @@ function SingleInvoiceMode({
           </div>
         )}
 
-        <div className="single-review-tasks resman-review-tasks" data-testid="single-review-tasks">
-          <div className="single-section-heading compact-review-heading">
-            <strong>{visibleTasks.length} review task{visibleTasks.length === 1 ? "" : "s"}</strong>
-            <span>{reviewSummary}</span>
-            {visibleTasks.length > 0 && (
-              <button type="button" className="single-link-button" onClick={() => setReviewExpanded((v) => !v)}>
-                {reviewExpanded ? "Hide" : "Review"}
-              </button>
-            )}
-          </div>
-          {error && <div className="ai-mapping-error">{error}</div>}
-          {!reviewExpanded && visibleTasks.length > 0 ? (
-            <div className="single-task compact-summary">
-              <span>{blockingCount > 0 ? `${blockingCount} blocking issue${blockingCount === 1 ? "" : "s"} remain.` : "Only non-blocking review notes remain."}</span>
+        {(visibleTasks.length > 0 || error) && (
+          <div className="single-review-tasks resman-review-tasks" data-testid="single-review-tasks">
+            <div className="single-section-heading compact-review-heading">
+              <strong>Review</strong>
+              <span>{reviewSummary}</span>
+              {visibleTasks.length > 0 && (
+                <button type="button" className="single-link-button" onClick={() => setReviewExpanded((v) => !v)}>
+                  {reviewExpanded ? "Hide" : "Review"}
+                </button>
+              )}
             </div>
-          ) : null}
-          {visibleTasks.length === 0 ? (
-            <div className="single-task resolved">No review tasks remain.</div>
-          ) : reviewExpanded ? (
-            visibleTasks.map((task) => (
+            {error && <div className="ai-mapping-error">{error}</div>}
+            {!reviewExpanded && visibleTasks.length > 0 ? (
+              <div className="single-task compact-summary">
+                <span>{blockingCount > 0 ? `${blockingCount} blocking issue${blockingCount === 1 ? "" : "s"} remain.` : "Non-blocking review notes remain."}</span>
+              </div>
+            ) : null}
+            {reviewExpanded ? (
+              visibleTasks.map((task) => (
               <div className={`single-task ${resolved.has(task.code) ? "resolved" : ""}`} key={task.code}>
                 <div>
                   <strong>{task.title}</strong>
@@ -2070,72 +2307,36 @@ function SingleInvoiceMode({
                   )}
                 </div>
               </div>
-            ))
-          ) : null}
-        </div>
+              ))
+            ) : null}
+          </div>
+        )}
 
         <section className="resman-notes-section">
           <label>Notes</label>
-          <textarea />
+          <textarea placeholder="Add invoice notes..." />
           <div className="single-review-footer resman-action-footer">
             <button type="button" className="resman-primary-action" onClick={() => setResolved(new Set(tasks.map((task) => task.code)))} data-testid="single-mark-reviewed">
               Save
             </button>
-            <button type="button" className="resman-primary-action" disabled>
-              Save & New
-            </button>
-            <button type="button" className="resman-primary-action" onClick={onReturnToBulk}>
-              Cancel
-            </button>
             <button
               type="button"
               className="btn btn-compact btn-accent"
-              disabled={blockingCount > 0}
+              disabled={!onExport || isExporting || effectiveReadiness?.export_allowed !== true}
+              onClick={() => onExport?.(group.rowIndexes)}
               title={readyBlockerTitle}
               data-testid="single-ready-export"
             >
-              Ready to export
+              {isExporting ? "Exporting..." : "Export invoice"}
             </button>
           </div>
         </section>
-
-        <section className="resman-history-section">
-          <h4>Invoice History</h4>
-          <table>
-            <thead>
-              <tr>
-                <th>Date</th>
-                <th>Activity</th>
-                <th>Timestamp</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>{historyDate}</td>
-                <td>{enteredActivity}</td>
-                <td>{new Date().toLocaleString()}</td>
-              </tr>
-              <tr>
-                <td>{historyDate}</td>
-                <td>{blockingCount > 0 ? `${blockingCount} review task(s) pending` : "Invoice ready to export"}</td>
-                <td>{new Date().toLocaleString()}</td>
-              </tr>
-            </tbody>
-          </table>
-        </section>
-
-        <div className="resman-documents-bar">
-          <span>Documents ({Math.max(1, sourceFiles.length)})</span>
-          {sourceDocumentUrl && (
-            <a href={sourceDocumentUrl} target="_blank" rel="noreferrer">
-              Open source
-            </a>
-          )}
-        </div>
       </div>
     </section>
   );
 }
+
+const MemoSingleInvoiceMode = memo(SingleInvoiceMode);
 
 type ReviewTask = {
   code: string;
@@ -2553,18 +2754,51 @@ function ResManField({
   );
 }
 
+function readinessIssueForField(
+  readiness: AccountingReadiness | undefined,
+  field: string,
+  linePosition?: number,
+): ReadinessIssue | undefined {
+  const matching = readiness?.blockers.filter(
+    (issue) => !issue.resolved && issue.field === field,
+  ) ?? [];
+  if (linePosition == null) return matching[0];
+  return matching.find(
+    (issue) => issue.line_item_id == null || issue.line_item_id === String(linePosition),
+  );
+}
+
+function RequiredFieldNotice({
+  issue,
+  compact = false,
+}: {
+  issue: ReadinessIssue;
+  compact?: boolean;
+}) {
+  return <span className={`required-field-notice ${compact ? "is-compact" : ""}`}
+    role="note" data-testid="required-field-notice">
+    <RequiredFieldExplanation issue={issue} />
+  </span>;
+}
+
+function plainLanguageItemDescription(row: PreviewRow): string {
+  return String(row._meta?.ai_item_plain_language_description || "").trim();
+}
+
 function ResManReadonlyField({
   label,
   required,
   value,
+  issue,
 }: {
   label: string;
   required?: boolean;
   value: unknown;
+  issue?: ReadinessIssue;
 }) {
   return (
     <ResManField label={label} required={required}>
-      <span className="resman-static-value">{displayValue(value)}</span>
+      <span className="resman-static-value">{issue ? <RequiredFieldNotice issue={issue} /> : displayValue(value)}</span>
     </ResManField>
   );
 }
@@ -2575,11 +2809,13 @@ function ResManEditableField({
   value,
   onCommit,
   aiSuggestions,
+  issue,
 }: {
   label: string;
   required?: boolean;
   value: unknown;
   onCommit: (value: string) => void;
+  issue?: ReadinessIssue;
   aiSuggestions?: {
     title: string;
     items: FieldSuggestion[];
@@ -2600,7 +2836,7 @@ function ResManEditableField({
     <ResManField label={label} required={required}>
       <div className={aiSuggestions ? "resman-input-with-ai" : undefined}>
         <input
-          className="resman-input"
+          className={`resman-input ${issue ? "has-required-field-issue" : ""}`}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onBlur={commit}
@@ -2612,7 +2848,11 @@ function ResManEditableField({
             }
           }}
           data-testid={`single-invoice-field-${fieldTestId(label)}`}
+          placeholder={issue?.message}
+          aria-invalid={issue ? true : undefined}
+          title={issue?.message}
         />
+        {issue && !draft && <RequiredFieldNotice issue={issue} compact />}
         {aiSuggestions && (
           <AiSuggestionControl
             title={aiSuggestions.title}
@@ -2792,6 +3032,7 @@ function SingleLineCell({
   numeric,
   fallbackValue,
   aiSuggestions,
+  issue,
 }: {
   row: PreviewRow;
   edits: CellEdits;
@@ -2800,6 +3041,7 @@ function SingleLineCell({
   onCellEdit: (rowIndex: number, columnKey: string, newValue: unknown) => void;
   numeric?: boolean;
   fallbackValue?: unknown;
+  issue?: ReadinessIssue;
   aiSuggestions?: {
     title: string;
     items: FieldSuggestion[];
@@ -2819,6 +3061,7 @@ function SingleLineCell({
         numeric={numeric}
         fallbackValue={fallbackValue}
         aiSuggestions={aiSuggestions}
+        issue={issue}
       />
     </td>
   );
@@ -2833,6 +3076,7 @@ function SingleLineInput({
   numeric,
   fallbackValue,
   aiSuggestions,
+  issue,
 }: {
   row: PreviewRow;
   edits: CellEdits;
@@ -2841,6 +3085,7 @@ function SingleLineInput({
   onCellEdit: (rowIndex: number, columnKey: string, newValue: unknown) => void;
   numeric?: boolean;
   fallbackValue?: unknown;
+  issue?: ReadinessIssue;
   aiSuggestions?: {
     title: string;
     items: FieldSuggestion[];
@@ -2868,7 +3113,7 @@ function SingleLineInput({
   };
   const input = (
     <input
-      className={numeric ? "num" : ""}
+      className={`${numeric ? "num" : ""} ${issue ? "has-required-field-issue" : ""}`}
       value={draft}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={() => commit()}
@@ -2879,12 +3124,23 @@ function SingleLineInput({
         }
       }}
       data-testid={`single-line-cell-${rowIndex}-${fieldTestId(column)}`}
+      placeholder={issue?.message}
+      aria-invalid={issue ? true : undefined}
+      title={issue?.message}
     />
   );
-  if (!aiSuggestions) return input;
+  const issueNotice = issue && !draft ? <RequiredFieldNotice issue={issue} compact /> : null;
+  const adjudicationBadges = row._meta?.human_adjudication_badges?.[column] ?? [];
+  if (!aiSuggestions) return (
+    <div className="required-field-control">
+      {input}{issueNotice}<HumanAdjudicationBadges badges={adjudicationBadges} />
+    </div>
+  );
   return (
     <div className="resman-line-input-with-ai">
       {input}
+      {issueNotice}
+      <HumanAdjudicationBadges badges={adjudicationBadges} />
       <AiSuggestionControl
         title={aiSuggestions.title}
         items={aiSuggestions.items}
@@ -3452,17 +3708,20 @@ function CheckCircleIcon() {
 // Phase 2D — Revisions dropdown.
 // =============================================================================
 function RevisionsDropdown({
+  batchId,
   revisions,
   currentRevisionId,
   onActivate,
   onDelete,
 }: {
+  batchId: string | null;
   revisions: import("../types").RevisionEntry[];
   currentRevisionId: string | null;
   onActivate?: (revisionId: string) => Promise<void> | void;
   onDelete?: (revisionId: string) => Promise<void> | void;
 }) {
   const [open, setOpen] = useState(false);
+  const [activity, setActivity] = useState<import("../types").OperatorActivityEvent[]>([]);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
@@ -3475,6 +3734,16 @@ function RevisionsDropdown({
     top: number;
     left: number;
   } | null>(null);
+  useEffect(() => {
+    if (!open || !batchId) return;
+    let cancelled = false;
+    void api.listBatchActivity(batchId).then((response) => {
+      if (!cancelled) setActivity(response.items);
+    }).catch(() => {
+      if (!cancelled) setActivity([]);
+    });
+    return () => { cancelled = true; };
+  }, [open, batchId]);
   useEffect(() => {
     if (!open) {
       setPopoverPos(null);
@@ -3567,6 +3836,20 @@ function RevisionsDropdown({
           data-testid="template-revisions-popover"
           style={{ top: popoverPos.top, left: popoverPos.left }}
         >
+          <div className="revisions-section-label">Change history</div>
+          {activity.length ? <div className="template-activity-list">
+            {activity.slice(0, 12).map((event) => <article key={event.event_id} className={`template-activity-item is-${event.source}`}>
+              <div><strong>{event.summary}</strong><span>{event.source}</span></div>
+              {Array.isArray(event.details?.changes) && event.details.changes.slice(0, 6).map((item, index) => {
+                const change = item && typeof item === "object" ? item as Record<string, unknown> : {};
+                return <small key={`${event.event_id}:${index}`}>
+                  Row {Number(change.row_index ?? 0) + 1} · {String(change.field ?? "field")} · {String(change.before ?? change.old_value ?? "(blank)")} → {String(change.after ?? change.new_value ?? "(blank)")}
+                </small>;
+              })}
+              <small>{event.actor}</small>
+              <time>{formatRevisionStamp(event.created_at)}</time>
+            </article>)}
+          </div> : <div className="revisions-empty-row"><ClockHistoryIcon /><span>No manual or AI changes recorded yet</span></div>}
           <div className="revisions-section-label">Revisions</div>
           {revisions.length === 0 ? (
             <div className="revisions-empty-row">
