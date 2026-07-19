@@ -84,8 +84,13 @@ def resolve_canonical_concept(
     return CanonicalConceptResolution(None, line_family, trade_family, work_mode, None)
 
 
-def tenant_accounting_context_fingerprint(dependencies: dict[str, str] | None = None) -> str:
-    payload = dependencies or dependency_versions()
+def tenant_accounting_context_fingerprint(
+    dependencies: dict[str, str] | None = None, *, tenant_id: str | None = None,
+) -> str:
+    if dependencies is None and tenant_id is None:
+        from .tenant_accounting_policies import default_tenant_id
+        tenant_id = default_tenant_id()
+    payload = dependencies or dependency_versions(tenant_id)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

@@ -95,6 +95,26 @@ async function mockInvoiceProcessor(page: Page) {
         rule_proposal: true, rule_approval: true, shared_knowledge_promotion: false,
       },
     };
+    else if (path.startsWith("/api/knowledge-core/batches/")) body = {
+      contract_version: "accounting-knowledge-core/1.0", tenant_id: "tenant-a",
+      line_item_id: "line-1", canonical_concept: "repair_service",
+      document_evidence: { immutable: true },
+      historical_vendor_priors: [{ dimension: "vendor", gl_code: "6100", count: 8, amount: "200.00", share: .8, snapshot_id: "cis-test", authoritative: false }],
+      historical_property_priors: [], vendor_property_joint_priors: [],
+      historical_profile_state: "ready",
+      similar_approved_learning_examples: [{ learning_example_id: "learn-1", revision_id: "har-old", canonical_concept: "repair_service", document_family: "invoice", line_family: "service", trade_family: "general", work_mode: "service", gl_code: "6100", evidence_fingerprint: "evidence", candidate_only: true }],
+      active_governed_rules: [{ rule_id: "rule-1", version: 1, title: "Approved repair policy", status: "active", allowed_gl_codes: ["6100"], scope: {}, candidate_constraint_only: true }],
+      contradictions: [], confidence: .84, provenance: [],
+      benchmark_examples_visible_to_production: 0, selection_authority: false, export_authority: false,
+    };
+    else if (path === "/api/knowledge-core/impact") {
+      const payload = request.postDataJSON() as Record<string, boolean>;
+      body = { contract_version: "accounting-knowledge-core/1.0", invoice_corrections: 1,
+        benchmark_examples: payload.add_to_benchmark ? 1 : 0,
+        learning_examples: payload.approve_learning_example ? 1 : 0,
+        learning_duplicates_avoided: 0, rule_proposals: 0, affected_rows: 1,
+        requires_bulk_scope_confirmation: false, statements: [] };
+    }
     else if (path.endsWith("/save-edits")) {
       saveBody = request.postDataJSON() as Record<string, unknown>;
       saved = true;
@@ -150,9 +170,12 @@ test("table edit opens scoped adjudication panel and persists badges/history", a
   await expect(panel.getByText("Human correction")).toBeVisible();
   await expect(panel.getByText("Invoice HUMAN-1", { exact: false })).toBeVisible();
   await expect(panel.getByText("row line-1", { exact: false })).toBeVisible();
+  await expect(panel.getByTestId("human-adjudication-knowledge")).toContainText("Historical context: GL 6100");
+  await expect(panel.getByTestId("human-adjudication-knowledge")).toContainText("Approved repair policy");
   await panel.getByTestId("human-adjudication-rationale").fill("The source document identifies location B.");
   await panel.getByTestId("human-adjudication-benchmark").check();
   await panel.getByTestId("human-adjudication-learning").check();
+  await expect(panel.getByTestId("human-adjudication-impact")).toContainText("1 benchmark example");
   await panel.getByTestId("human-adjudication-confirm").click();
   await expect(panel).toBeHidden();
 

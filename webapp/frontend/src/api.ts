@@ -1309,6 +1309,28 @@ export const api = {
     return jsonOrThrow<HumanAdjudicationContext>(res);
   },
 
+  async accountingKnowledgeLine(batchId: string, rowIndex: number) {
+    const res = await fetch(`/api/knowledge-core/batches/${encodeURIComponent(batchId)}/lines/${rowIndex}`);
+    return jsonOrThrow<import("./types").KnowledgeLineContext>(res);
+  },
+
+  async accountingKnowledgeImpact(
+    batchId: string,
+    edits: Record<number, Record<string, unknown>>,
+    scopes: Pick<HumanAdjudicationOptions, "add_to_benchmark" | "approve_learning_example" | "propose_reusable_rule">,
+  ) {
+    const res = await fetch("/api/knowledge-core/impact", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ batch_id: batchId, edits, ...scopes }),
+    });
+    return jsonOrThrow<import("./types").KnowledgeImpactEstimate>(res);
+  },
+
+  async accountingKnowledgeAnalytics() {
+    const res = await fetch("/api/knowledge-core/analytics");
+    return jsonOrThrow<import("./types").KnowledgeAnalytics>(res);
+  },
+
   humanAdjudicationEvidenceCropUrl(
     batchId: string,
     rowIndex: number,

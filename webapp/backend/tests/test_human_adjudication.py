@@ -222,8 +222,19 @@ def test_rule_proposal_requires_separate_controller_approval(monkeypatch):
             actor=_actor(role=adjudication.ReviewerRole.ACCOUNTANT_AP),
         )
 
-    # The tenant policy engine itself is exercised here; the controller's
-    # explicit approval is the only activation boundary.
+    with pytest.raises(ValueError, match="must be simulated"):
+        adjudication.approve_rule(revision_id, actor=_actor())
+    policy_id = str(proposed[0].details["tenant_policy_id"])
+    tenant_accounting_policies.simulate_policy(
+        "tenant-a", policy_id,
+        [tenant_accounting_policies.PolicySimulationLine(
+            line_id="line-1", raw_description="Legal filing fee",
+            document_family="invoice", line_family="fee", trade_family="legal",
+            work_mode="fee", current_gl="6205", candidate_gl_codes=["6205"],
+        )],
+        actor="controller-test",
+    )
+    # Simulation and controller approval are independent governance events.
     approved = adjudication.approve_rule(revision_id, actor=_actor())
     assert approved.event_type == "rule_approved"
     assert approved.details["tenant_policy_status"] == "active"

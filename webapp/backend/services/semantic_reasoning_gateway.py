@@ -69,7 +69,8 @@ class InvoiceSemanticProposalEnvelope(BaseModel):
 
 def enrich_unknown_semantics(*, facts: LineItemFacts, semantics: SemanticClassification,
                              document_id: str, document_context: str,
-                             force_no_safe_decision: bool = False) -> SemanticReasoningResult:
+                             force_no_safe_decision: bool = False,
+                             tenant_id: str | None = None) -> SemanticReasoningResult:
     """Escalate only unresolved semantics and fail closed to the original result."""
     if not _enabled() or (not force_no_safe_decision and not _needs_escalation(semantics)):
         return SemanticReasoningResult(semantics=semantics, trace={"route": "deterministic", "called": False})
@@ -90,7 +91,7 @@ def enrich_unknown_semantics(*, facts: LineItemFacts, semantics: SemanticClassif
     cache_key = semantic_candidate_cache_key(
         [concept], candidate_gl_codes=[sorted(catalog)], provider=profile.provider,
         profile_id=profile.profile_id, model_id=profile.model_id,
-        tenant_context_fingerprint=tenant_accounting_context_fingerprint(),
+        tenant_context_fingerprint=tenant_accounting_context_fingerprint(tenant_id=tenant_id),
         version=SEMANTIC_REASONING_VERSION,
     )
     cache_path = (settings.WEBAPP_DATA_ROOT / "ai_cache" / "semantic_reasoning"
@@ -128,6 +129,7 @@ def enrich_invoice_semantics(
     lines: list[InvoiceSemanticLineRequest],
     document_id: str,
     document_context: str,
+    tenant_id: str | None = None,
 ) -> dict[str, SemanticReasoningResult]:
     """Resolve all genuinely blocked lines in one bounded provider request.
 
@@ -173,7 +175,7 @@ def enrich_invoice_semantics(
     cache_key = semantic_candidate_cache_key(
         concepts, candidate_gl_codes=allowed_by_line, provider=profile.provider,
         profile_id=profile.profile_id, model_id=profile.model_id,
-        tenant_context_fingerprint=tenant_accounting_context_fingerprint(),
+        tenant_context_fingerprint=tenant_accounting_context_fingerprint(tenant_id=tenant_id),
         version=SEMANTIC_REASONING_VERSION,
     )
     cache_path = (settings.WEBAPP_DATA_ROOT / "ai_cache" / "semantic_reasoning_grouped"

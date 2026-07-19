@@ -25,16 +25,16 @@ from .canonical_semantics import resolve_canonical_concept
 from .gl_catalog import load_gl_catalog
 from .invoice_identity import build_invoice_identities
 from .tenant_accounting_policies import (
-    PolicySimulationLine,
     TenantPolicyAction,
     TenantPolicyDraft,
     TenantPolicyScope,
+    TenantPolicyStatus,
     TenantPolicyType,
     create_policy_draft,
     decide_policy,
     default_tenant_id,
+    get_policy,
     resolve_tenant_context,
-    simulate_policy,
     tenant_id_for_row,
     validate_tenant_id,
 )
@@ -130,6 +130,8 @@ class AdjudicationOptions(BaseModel):
     add_to_benchmark: bool = False
     approve_learning_example: bool = False
     propose_reusable_rule: bool = False
+    bulk_scope_confirmed: bool = False
+    group_equivalent_corrections: bool = True
 
 
 class HumanAdjudicationRevision(BaseModel):
@@ -149,8 +151,10 @@ class HumanAdjudicationRevision(BaseModel):
     local_row_index: int = Field(ge=0)
     field: str
     original_ai_value: Any = None
+    original_posted_value: Any = None
     previous_value: Any = None
     corrected_value: Any = None
+    final_approved_value: Any = None
     evidence: SourceEvidenceSnapshot
     versions: ProcessingVersionSnapshot
     confidence: float | None = Field(default=None, ge=0, le=1)
@@ -278,6 +282,13 @@ def record_manual_edits(
                 local_row_index=local_index,
                 field=field,
                 original_ai_value=(prior.original_ai_value if prior else row.get(field)),
+                original_posted_value=(
+                    prior.original_posted_value if prior else
+                    (row.get("_meta", {}).get("original_posted_values", {}).get(field)
+                     if isinstance(row.get("_meta"), dict)
+                     and isinstance(row.get("_meta", {}).get("original_posted_values"), dict)
+                     else None)
+                ),
                 previous_value=row.get(field),
                 corrected_value=corrected,
                 evidence=_source_evidence(batch_id, row, field),
@@ -300,18 +311,37 @@ def record_manual_edits(
 
     if not revisions:
         return AdjudicationApplyReport(batch_id=batch_id)
+    optional_scope = options.add_to_benchmark or options.approve_learning_example or options.propose_reusable_rule
+    affected_rows = {item.global_row_index for item in revisions}
+    if len(affected_rows) > 1 and optional_scope and not options.bulk_scope_confirmed:
+        raise ValueError("Bulk benchmark, learning or rule scope requires explicit human confirmation.")
     _append_jsonl(_revisions_path(actor.tenant_id), revisions)
 
     events: list[GovernanceEvent] = []
+    benchmark_seen: set[tuple[str, str, str]] = set()
+    learning_seen: set[tuple[str, str, str, str, str, str, str]] = set()
+    rule_seen: set[tuple[str, str, str, str, str]] = set()
+    prior_governance = _governance_by_revision(actor.tenant_id)
+    for prior_revision in _latest_by_key(existing).values():
+        prior_events = prior_governance.get(prior_revision.revision_id, [])
+        if any(item.event_type == "learning_approved" and item.status == "approved" for item in prior_events):
+            learning_seen.add(_learning_key(prior_revision))
     for revision in revisions:
-        if options.add_to_benchmark:
+        benchmark_key = (revision.evidence.evidence_fingerprint, revision.field, _text(revision.corrected_value))
+        if options.add_to_benchmark and benchmark_key not in benchmark_seen:
+            benchmark_seen.add(benchmark_key)
             events.append(_event(revision, "benchmark_submitted", "pending_approval", actor))
-        if options.approve_learning_example:
+        learning_key = _learning_key(revision)
+        if options.approve_learning_example and learning_key not in learning_seen:
+            learning_seen.add(learning_key)
             events.append(_event(revision, "learning_approved", "approved", actor, {
                 "retrieval_scope": "tenant_private",
                 "selection_authority": False,
+                "deduplication_key": _hash(learning_key),
             }))
-        if options.propose_reusable_rule and revision.field == "GL Account":
+        if (options.propose_reusable_rule and revision.field == "GL Account"
+                and learning_key not in rule_seen):
+            rule_seen.add(learning_key)
             policy_id = _create_rule_draft(revision, actor)
             events.append(_event(revision, "rule_proposed", "pending_approval", actor, {
                 "tenant_policy_id": policy_id,
@@ -439,8 +469,36 @@ def decide_benchmark(
 def approve_learning(revision_id: str, *, actor: ActorContext) -> GovernanceEvent:
     actor.require(AuthorizationScope.LEARNING_APPROVAL)
     revision = _revision_for_actor(revision_id, actor)
+    events = list_governance_events(actor.tenant_id)
+    prior_same_revision = next((
+        item for item in events
+        if item.revision_id == revision_id
+        and item.event_type == "learning_approved"
+        and item.status == "approved"
+    ), None)
+    if prior_same_revision is not None:
+        return prior_same_revision
+    approved_revision_ids = {
+        item.revision_id for item in events
+        if item.event_type == "learning_approved" and item.status == "approved"
+    }
+    revisions = {item.revision_id: item for item in list_revisions(actor.tenant_id)}
+    duplicate = next((
+        item for item_id, item in revisions.items()
+        if item_id in approved_revision_ids and _learning_key(item) == _learning_key(revision)
+    ), None)
+    if duplicate is not None:
+        event = _event(revision, "learning_duplicate_ignored", "duplicate", actor, {
+            "retrieval_scope": "tenant_private",
+            "selection_authority": False,
+            "existing_revision_id": duplicate.revision_id,
+            "deduplication_key": _hash(_learning_key(revision)),
+        })
+        _append_jsonl(_events_path(actor.tenant_id), [event])
+        return event
     event = _event(revision, "learning_approved", "approved", actor, {
         "retrieval_scope": "tenant_private", "selection_authority": False,
+        "deduplication_key": _hash(_learning_key(revision)),
     })
     _append_jsonl(_events_path(actor.tenant_id), [event])
     return event
@@ -456,17 +514,11 @@ def approve_rule(revision_id: str, *, actor: ActorContext) -> GovernanceEvent:
     policy_id = str(proposed.details.get("tenant_policy_id") or "")
     if not policy_id:
         raise ValueError("The rule proposal is missing its tenant policy draft.")
-    line = PolicySimulationLine(
-        line_id=revision.source_line_fingerprint,
-        raw_description=" ".join(revision.evidence.observed_text) or revision.canonical_concept,
-        document_family=revision.document_family,
-        line_family=revision.line_family,
-        trade_family=revision.trade_family,
-        work_mode=revision.work_mode,
-        current_gl=_text(revision.corrected_value) or None,
-        candidate_gl_codes=[_text(revision.corrected_value)],
-    )
-    simulate_policy(actor.tenant_id, policy_id, [line], actor=actor.reviewer_id)
+    policy = get_policy(actor.tenant_id, policy_id)
+    if policy.status is not TenantPolicyStatus.SIMULATED or policy.latest_simulation is None:
+        raise ValueError(
+            "The proposed rule must be simulated through the tenant policy workflow before approval."
+        )
     decided = decide_policy(
         actor.tenant_id, policy_id, approve=True, actor=actor.reviewer_id,
     )
@@ -491,7 +543,12 @@ def approved_learning_candidates(
     for revision in _latest_by_key(list_revisions(tenant_id)).values():
         if revision.field != "GL Account" or revision.canonical_concept != canonical_concept:
             continue
-        if revision.work_mode != work_mode or revision.line_family != line_family:
+        if (
+            revision.document_family != document_family
+            or revision.line_family != line_family
+            or revision.trade_family != trade_family
+            or revision.work_mode != work_mode
+        ):
             continue
         events = governance.get(revision.revision_id, [])
         if not any(item.event_type == "learning_approved" and item.status == "approved"
@@ -501,10 +558,10 @@ def approved_learning_candidates(
             "gl_code": _text(revision.corrected_value),
             "revision_id": revision.revision_id,
             "canonical_concept": canonical_concept,
-            "document_family": document_family,
-            "line_family": line_family,
-            "trade_family": trade_family,
-            "work_mode": work_mode,
+            "document_family": revision.document_family,
+            "line_family": revision.line_family,
+            "trade_family": revision.trade_family,
+            "work_mode": revision.work_mode,
             "evidence_fingerprint": revision.evidence.evidence_fingerprint,
             "selection_authority": False,
         })
@@ -552,6 +609,10 @@ def _apply_revision(
         "reviewer_id": revision.reviewer_id,
         "created_at": revision.created_at.isoformat(),
         "rationale": revision.rationale,
+        "original_ai_value": revision.original_ai_value,
+        "original_posted_value": revision.original_posted_value,
+        "corrected_value": revision.corrected_value,
+        "final_approved_value": revision.final_approved_value,
     }
     meta["human_adjudication_applied"] = applied
 
@@ -770,6 +831,21 @@ def _event(
         actor_role=actor.role,
         details=dict(details or {}),
         created_at=_now(),
+    )
+
+
+def _learning_key(
+    revision: HumanAdjudicationRevision,
+) -> tuple[str, str, str, str, str, str, str]:
+    """Tenant-private semantic identity; literal invoice IDs are excluded."""
+    return (
+        revision.field,
+        revision.document_family or "",
+        revision.canonical_concept or "",
+        revision.line_family or "",
+        revision.trade_family or "",
+        revision.work_mode or "",
+        _text(revision.corrected_value),
     )
 
 

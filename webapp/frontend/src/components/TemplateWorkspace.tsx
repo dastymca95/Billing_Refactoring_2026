@@ -30,6 +30,8 @@ import type {
   AccountingReadiness,
   HumanAdjudicationContext,
   HumanAdjudicationOptions,
+  KnowledgeImpactEstimate,
+  KnowledgeLineContext,
   PreviewResponse,
   PreviewRow,
   ReadinessIssue,
@@ -1153,6 +1155,10 @@ export function HumanAdjudicationPanel({
   const [benchmark, setBenchmark] = useState(false);
   const [learning, setLearning] = useState(false);
   const [rule, setRule] = useState(false);
+  const [bulkScopeConfirmed, setBulkScopeConfirmed] = useState(false);
+  const [knowledgeByRow, setKnowledgeByRow] = useState<Record<number, KnowledgeLineContext>>({});
+  const [impact, setImpact] = useState<KnowledgeImpactEstimate | null>(null);
+  const [knowledgeError, setKnowledgeError] = useState("");
   const changes = useMemo<PendingAdjudicationChange[]>(() => {
     const output: PendingAdjudicationChange[] = [];
     for (const [rawIndex, fields] of Object.entries(edits)) {
@@ -1177,8 +1183,26 @@ export function HumanAdjudicationPanel({
     return output;
   }, [edits, preview.rows]);
   const hasGlCorrection = changes.some((item) => item.field === "GL Account");
+  const affectedRows = new Set(changes.map((item) => item.rowIndex)).size;
+  const hasOptionalScope = benchmark || learning || rule;
+  useEffect(() => {
+    let cancelled = false;
+    const indexes = [...new Set(changes.map((item) => item.rowIndex))];
+    setKnowledgeError("");
+    void Promise.all(indexes.map(async (index) => [index, await api.accountingKnowledgeLine(batchId, index)] as const))
+      .then((items) => { if (!cancelled) setKnowledgeByRow(Object.fromEntries(items)); })
+      .catch((reason) => { if (!cancelled) setKnowledgeError(getFriendlyErrorMessage(reason, "Load accounting knowledge")); });
+    void api.accountingKnowledgeImpact(batchId, edits, {
+      add_to_benchmark: benchmark,
+      approve_learning_example: learning,
+      propose_reusable_rule: rule,
+    }).then((value) => { if (!cancelled) setImpact(value); })
+      .catch((reason) => { if (!cancelled) setKnowledgeError(getFriendlyErrorMessage(reason, "Estimate correction impact")); });
+    return () => { cancelled = true; };
+  }, [batchId, edits, benchmark, learning, rule, changes]);
   const canSubmit = Boolean(
-    context?.permissions.invoice_correction && rationale.trim().length >= 3 && changes.length,
+    context?.permissions.invoice_correction && rationale.trim().length >= 3 && changes.length
+      && !(affectedRows > 1 && hasOptionalScope && !bulkScopeConfirmed),
   );
 
   return (
@@ -1207,7 +1231,12 @@ export function HumanAdjudicationPanel({
         )}
 
         <div className="human-adjudication-change-list">
-          {changes.map((change) => (
+          {changes.map((change) => {
+            const knowledge = knowledgeByRow[change.rowIndex];
+            const historical = knowledge?.vendor_property_joint_priors[0]
+              || knowledge?.historical_vendor_priors[0]
+              || knowledge?.historical_property_priors[0];
+            return (
             <article key={change.key} className="human-adjudication-change" data-testid="human-adjudication-change">
               <div className="human-adjudication-change-main">
                 <strong>{change.field}</strong>
@@ -1223,9 +1252,28 @@ export function HumanAdjudicationPanel({
                   alt={`Source evidence for ${change.field}, row ${change.rowLabel}`}
                 />
               )}
+              {knowledge && <div className="human-adjudication-knowledge" data-testid="human-adjudication-knowledge">
+                <strong>Accounting Knowledge Core</strong>
+                <small>
+                  Historical evidence is not truth · non-authoritative signal strength {Math.round(knowledge.confidence * 100)}%
+                  {knowledge.historical_profile_state === "stale" ? " · stale history excluded" : ""}
+                </small>
+                <p>{historical
+                  ? `Historical context: GL ${historical.gl_code} in ${Math.round(historical.share * 100)}% of the closest observed profile (${historical.count} uses).`
+                  : "No current historical prior matched this line."}</p>
+                <p>{knowledge.similar_approved_learning_examples.length
+                  ? `${knowledge.similar_approved_learning_examples.length} similar human-confirmed learning example(s): ${knowledge.similar_approved_learning_examples.map((item) => item.gl_code).join(", ")}.`
+                  : "No similar approved learning examples."}</p>
+                <p>{knowledge.active_governed_rules.length
+                  ? `Active governed rules: ${knowledge.active_governed_rules.map((item) => item.title).join(", ")}.`
+                  : "No active governed rule matches this line."}</p>
+                {knowledge.contradictions.map((item) => <p className="is-contradiction" key={item.code}>{item.message}</p>)}
+              </div>}
             </article>
-          ))}
+          );})}
         </div>
+
+        {knowledgeError && <div className="error-banner">{knowledgeError}</div>}
 
         <label className="human-adjudication-rationale">
           <span>Reviewer rationale <b>*</b></span>
@@ -1275,6 +1323,19 @@ export function HumanAdjudicationPanel({
           </label>
         </div>
 
+        {impact && <section className="human-adjudication-impact" data-testid="human-adjudication-impact">
+          <strong>Estimated governed impact</strong>
+          <span>{impact.invoice_corrections} invoice correction(s)</span>
+          <span>{impact.benchmark_examples} benchmark example(s)</span>
+          <span>{impact.learning_examples} deduplicated learning example(s)</span>
+          <span>{impact.rule_proposals} rule proposal(s)</span>
+          <small>Nothing is promoted automatically. Benchmark has zero production effect; learning remains candidate-only.</small>
+        </section>}
+        {affectedRows > 1 && hasOptionalScope && <label className="human-adjudication-bulk-confirm">
+          <input type="checkbox" checked={bulkScopeConfirmed} onChange={(event) => setBulkScopeConfirmed(event.target.checked)} />
+          I reviewed the grouped scope for {affectedRows} rows and authorize these optional uses.
+        </label>}
+
         <footer>
           <span>{changes.length} correction{changes.length === 1 ? "" : "s"}</span>
           <div>
@@ -1288,6 +1349,8 @@ export function HumanAdjudicationPanel({
                 add_to_benchmark: benchmark,
                 approve_learning_example: learning,
                 propose_reusable_rule: rule,
+                bulk_scope_confirmed: bulkScopeConfirmed,
+                group_equivalent_corrections: true,
               })}
               data-testid="human-adjudication-confirm"
             >

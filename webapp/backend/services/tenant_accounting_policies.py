@@ -641,6 +641,46 @@ def apply_active_policies(
     })
 
 
+def active_policy_evidence(
+    tenant_id: str, *, row: dict[str, Any], semantics_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Expose matching approved constraints without mutating candidates."""
+    tenant_id = validate_tenant_id(tenant_id)
+    semantics = SemanticClassification(
+        semantic_version=str(semantics_payload.get("semantic_version") or "semantic-classification/unknown"),
+        line_item_id=str(semantics_payload.get("line_item_id") or "unknown"),
+        document_family=str(semantics_payload.get("document_family") or "unknown"),
+        line_family=str(semantics_payload.get("line_family") or "unknown"),
+        trade_family=str(semantics_payload.get("trade_family") or "unknown"),
+        work_mode=str(semantics_payload.get("work_mode") or "unknown"),
+        recurrence=str(semantics_payload.get("recurrence") or "unknown"),
+        capital_context=str(semantics_payload.get("capital_context") or "unknown"),
+        specific_assets=list(semantics_payload.get("specific_assets") or []),
+        location_detected=semantics_payload.get("location_detected"),
+        positive_evidence=[], negative_evidence=[],
+        contradictions=list(semantics_payload.get("contradictions") or []),
+        confidence=float(semantics_payload.get("confidence") or 0),
+    )
+    vendor = resolve_vendor_entity(tenant_id, str(row.get("Vendor") or ""))
+    output: list[dict[str, Any]] = []
+    for policy in list_policies(tenant_id, include_rejected=False):
+        if policy.status is not TenantPolicyStatus.ACTIVE or not _policy_matches(policy, row, semantics, vendor):
+            continue
+        output.append({
+            "contract_version": "governed-rule/1.0",
+            "rule_id": policy.policy_id,
+            "tenant_id": tenant_id,
+            "version": policy.version,
+            "title": policy.title,
+            "status": policy.status.value,
+            "allowed_gl_codes": list(policy.action.allowed_gl_codes),
+            "scope": policy.scope.model_dump(mode="json"),
+            "simulation_id": policy.latest_simulation.simulation_id if policy.latest_simulation else None,
+            "candidate_constraint_only": True,
+        })
+    return output
+
+
 def _build_simulation(
     tenant_id: str,
     policy: TenantAccountingPolicy,

@@ -1660,6 +1660,26 @@ def _authorize_export(batch_id: str, rows: list[dict[str, Any]]) -> dict[str, An
     return accounting_readiness.as_dict(decision)
 
 
+def _record_approved_export_knowledge(
+    batch_id: str, rows: list[dict[str, Any]], readiness: dict[str, Any],
+) -> None:
+    """Record final values only after the authorized workbook was written."""
+    try:
+        from .accounting_knowledge_core import record_approved_export
+        from .tenant_accounting_policies import tenant_id_for_row
+
+        by_tenant: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_tenant.setdefault(tenant_id_for_row(row), []).append(row)
+        for tenant_id, tenant_rows in by_tenant.items():
+            record_approved_export(
+                tenant_id=tenant_id, batch_id=batch_id, rows=tenant_rows,
+                readiness=readiness,
+            )
+    except Exception as exc:  # workbook is already written; keep export behavior stable
+        _LOG.warning("Could not append Accounting Knowledge final-value event: %s", type(exc).__name__)
+
+
 def export_batch(batch_id: str, edited_rows: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
     bdir = batch_store.get_batch_dir(batch_id)
     processed_dir = bdir / "processed"
@@ -1685,6 +1705,7 @@ def export_batch(batch_id: str, edited_rows: Optional[list[dict[str, Any]]] = No
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         dest = export_dir / f"resman_import_edited_{ts}.xlsx"
         rows_written = _write_edited_rows_to_template(RESMAN_TEMPLATE, dest, edited_rows)
+        _record_approved_export_knowledge(batch_id, edited_rows, readiness)
         return {
             "batch_id": batch_id,
             "exported": [{
@@ -1714,6 +1735,7 @@ def export_batch(batch_id: str, edited_rows: Optional[list[dict[str, Any]]] = No
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             dest = export_dir / f"resman_import_preview_{ts}.xlsx"
             rows_written = _write_edited_rows_to_template(RESMAN_TEMPLATE, dest, preview_rows)
+            _record_approved_export_knowledge(batch_id, preview_rows, readiness)
             return {
                 "batch_id": batch_id,
                 "exported": [{
@@ -1752,6 +1774,7 @@ def export_batch(batch_id: str, edited_rows: Optional[list[dict[str, Any]]] = No
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             dest = export_dir / f"resman_import_preview_{ts}.xlsx"
             rows_written = _write_edited_rows_to_template(RESMAN_TEMPLATE, dest, preview_rows)
+            _record_approved_export_knowledge(batch_id, preview_rows, readiness)
             return {
                 "batch_id": batch_id,
                 "exported": [{

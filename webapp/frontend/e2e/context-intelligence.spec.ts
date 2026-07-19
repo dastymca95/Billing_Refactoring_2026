@@ -7,6 +7,7 @@ test("operator explicitly scans ResMan and opens compact vendor detail", async (
   let patternUpdates = 0;
   let builderApprovals = 0;
   let builderSelectedColumn: string | null = null;
+  let knowledgeAnalyticsAvailable = false;
   const snapshot = {
     contract_version: "context-intelligence/1.1",
     analytics_version: "vendor-property-gl-matrix/1.0",
@@ -72,6 +73,19 @@ test("operator explicitly scans ResMan and opens compact vendor detail", async (
     } else if (path === "/api/context-intelligence/scan") {
       generated = true;
       body = { state: "ready", snapshot };
+    } else if (path === "/api/knowledge-core/analytics") {
+      if (!knowledgeAnalyticsAvailable) {
+        await route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ detail: "Not Found" }) });
+        return;
+      }
+      body = {
+        contract_version: "accounting-knowledge-core/1.0", tenant_id: "local-default",
+        historical_gl_distribution: { "6100": 12 }, approved_export_gl_distribution: { "6100": 2 },
+        posted_gl_distribution: {}, final_posted_gl_distribution: {},
+        ai_prediction_distribution: { "6200": 3 }, human_correction_distribution: { "6100": 3 },
+        disagreement_rate: .25, approved_benchmark_count: 2, approved_learning_count: 3,
+        active_rule_count: 1, rule_coverage: .5, correction_drift_over_time: [], provenance: [],
+      };
     } else if (path === "/api/context-intelligence/matrix") {
       body = { contract_version: "context-intelligence/1.1", snapshot_id: "cis-test", tenant_id: "local-default", page: 1, page_size: 50, total: 1, items: [vendor] };
     } else if (path.includes("/api/context-intelligence/vendors/") && path.endsWith("/governance")) {
@@ -118,12 +132,17 @@ test("operator explicitly scans ResMan and opens compact vendor detail", async (
   await page.goto("/");
   await page.getByRole("button", { name: "Context Matrix" }).click();
   await expect(page.getByText("Context has not been scanned")).toBeVisible();
+  await expect(page.getByText("Accounting Knowledge Core metrics are temporarily unavailable.", { exact: false })).toBeVisible();
+  await expect(page.getByTestId("context-unavailable-state")).toHaveCount(0);
   await expect(page.getByText("Example Utility")).toHaveCount(0);
 
+  knowledgeAnalyticsAvailable = true;
   await page.getByRole("button", { name: "Scan ResMan", exact: true }).click();
   await expect(page.getByText("Example Utility")).toBeVisible();
   await expect(page.getByText("Deterministic candidate", { exact: true })).toBeVisible();
   await expect(page.getByLabel("Deterministic parser active")).toBeVisible();
+  await expect(page.getByTestId("knowledge-analytics")).toContainText("25%");
+  await expect(page.getByTestId("knowledge-analytics")).toContainText("Approved learning");
 
   await page.getByText("Example Utility").dblclick();
   await expect(page.getByRole("dialog", { name: "Example Utility context detail" })).toBeVisible();
