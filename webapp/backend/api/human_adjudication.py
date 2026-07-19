@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from ..services import batch_store, human_adjudication as adjudication
+from ..services import batch_store, human_adjudication as adjudication, tenant_accounting_policies
 
 
 router = APIRouter(prefix="/api", tags=["human-adjudication"])
@@ -111,8 +111,11 @@ def approve_rule(revision_id: str) -> dict[str, Any]:
 @router.get("/batches/{batch_id}/adjudications/evidence/{row_index}/{field}/crop")
 def evidence_crop(batch_id: str, row_index: int, field: str) -> Response:
     """Render only the persisted source bbox; never expose filesystem paths."""
+    actor = _actor()
     result = _load_result(batch_id)
     row = _row_at(result, row_index)
+    if tenant_accounting_policies.tenant_id_for_row(row) != actor.tenant_id:
+        raise HTTPException(status_code=403, detail="Evidence cannot cross tenant boundaries.")
     evidence = adjudication.source_evidence_for_cell(
         batch_id=batch_id, row=row, field=field,
     )

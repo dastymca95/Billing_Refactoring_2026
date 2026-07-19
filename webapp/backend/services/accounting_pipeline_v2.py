@@ -113,6 +113,8 @@ def decide_row(row: dict[str, Any], *, document_id: str, line_item_id: str, extr
         document_family=_document_family(row),
         document_context=document_context if document_context is not None else _text(source.get("raw_invoice_description")))
     from .semantic_reasoning_gateway import SemanticReasoningResult, enrich_unknown_semantics
+    from .tenant_accounting_policies import tenant_id_for_row
+    tenant_id = tenant_id_for_row(row)
     semantic_reasoning = semantic_reasoning_result or SemanticReasoningResult(
         semantics=semantics,
         trace={"route": "deterministic", "called": False,
@@ -123,6 +125,7 @@ def decide_row(row: dict[str, Any], *, document_id: str, line_item_id: str, extr
             facts=facts_line, semantics=semantics, document_id=document_id,
             document_context=(document_context if document_context is not None
                               else _text(source.get("raw_invoice_description"))),
+            tenant_id=tenant_id,
         )
     semantics = semantic_reasoning.semantics
     candidates = _adapt_candidates(row, normalized_description or raw_description or raw_activity)
@@ -135,70 +138,33 @@ def decide_row(row: dict[str, Any], *, document_id: str, line_item_id: str, extr
         invoice_context={"invoice_id": facts.invoice_id},
     ))
     from .operator_accounting_rules import apply_active_rules
-    from .tenant_accounting_policies import (
-        apply_active_policies,
-        tenant_id_for_row,
-    )
-    tenant_id = tenant_id_for_row(row)
+    from .tenant_accounting_policies import apply_active_policies
     # Human-approved learning examples are tenant-private candidate evidence.
     # They never write the row or bypass semantic/catalog compatibility; the
     # central engine remains the only selected-GL authority.
     from .canonical_semantics import resolve_canonical_concept
-    from .human_adjudication import approved_learning_candidates
     canonical = resolve_canonical_concept(
         normalized_description or raw_description or raw_activity,
         line_family=semantics.line_family,
         trade_family=semantics.trade_family,
         work_mode=semantics.work_mode,
     )
-    learning_evidence = approved_learning_candidates(
-        tenant_id=tenant_id,
+    from .accounting_knowledge_core import AccountingKnowledgeCore
+    knowledge = AccountingKnowledgeCore().line_context(
+        tenant_id=tenant_id, row=row, semantics_payload=model_dict(semantics),
         canonical_concept=canonical.concept_id,
-        document_family=semantics.document_family,
-        line_family=semantics.line_family,
-        trade_family=semantics.trade_family,
-        work_mode=semantics.work_mode,
     )
-    for learned in learning_evidence:
-        code = _text(learned.get("gl_code"))
-        if not code or code not in catalog or not catalog[code].payable:
-            continue
-        candidates.append(GLCandidate(
-            gl_code=code,
-            gl_name=catalog[code].gl_name,
-            source="human_approved_learning_example",
-            source_id=str(learned.get("revision_id") or "human-adjudication"),
-            base_score=0.78,
-            positive_evidence=[learned],
-            rule_version="human-invoice-adjudication/1.0",
-        ))
-    if learning_evidence:
-        meta["human_learning_candidate_evidence"] = learning_evidence
-    from .context_intelligence import historical_gl_evidence
-    context_evidence = historical_gl_evidence(
-        tenant_id,
-        _text(row.get("Vendor")) or None,
-        _text(row.get("Property Abbreviation")) or None,
-    )
-    for historical in context_evidence:
-        code = _text(historical.get("gl_code"))
-        if not code or code not in catalog:
-            continue
-        candidates.append(GLCandidate(
-            gl_code=code,
-            gl_name=catalog[code].gl_name,
-            source="context_intelligence_history",
-            source_id=str(historical.get("snapshot_id") or "context-intelligence"),
-            base_score=min(.70, .45 + .25 * float(historical.get("share") or 0)),
-            positive_evidence=[{
-                **historical,
-                "evidence_kind": "tenant_historical_frequency",
-                "selection_authority": False,
-            }],
-            rule_version="context-intelligence/1.0",
-        ))
-    if context_evidence:
-        meta["context_intelligence_evidence"] = context_evidence
+    _extend_knowledge_candidates(candidates, knowledge, catalog)
+    meta["accounting_knowledge_context"] = knowledge.model_dump(mode="json")
+    # Compatibility adapters remain during the transition; both are derived
+    # from the shared typed context and neither contains benchmark examples.
+    meta["human_learning_candidate_evidence"] = [
+        item.model_dump(mode="json") for item in knowledge.similar_approved_learning_examples
+    ]
+    meta["context_intelligence_evidence"] = [
+        item.model_dump(mode="json") for item in knowledge.vendor_property_joint_priors
+        or knowledge.historical_vendor_priors
+    ]
     rule_application = apply_active_rules(
         row=row,
         semantics=semantics,
@@ -229,6 +195,7 @@ def decide_row(row: dict[str, Any], *, document_id: str, line_item_id: str, extr
             document_context=(document_context if document_context is not None
                               else _text(source.get("raw_invoice_description"))),
             force_no_safe_decision=True,
+            tenant_id=tenant_id,
         )
         if fallback_reasoning.trace.get("route") == "ai_contextual_semantics":
             semantics = fallback_reasoning.semantics
@@ -246,27 +213,12 @@ def decide_row(row: dict[str, Any], *, document_id: str, line_item_id: str, extr
                 trade_family=semantics.trade_family,
                 work_mode=semantics.work_mode,
             )
-            learning_evidence = approved_learning_candidates(
-                tenant_id=tenant_id,
+            knowledge = AccountingKnowledgeCore().line_context(
+                tenant_id=tenant_id, row=row, semantics_payload=model_dict(semantics),
                 canonical_concept=canonical.concept_id,
-                document_family=semantics.document_family,
-                line_family=semantics.line_family,
-                trade_family=semantics.trade_family,
-                work_mode=semantics.work_mode,
             )
-            for learned in learning_evidence:
-                code = _text(learned.get("gl_code"))
-                if not code or code not in catalog or not catalog[code].payable:
-                    continue
-                candidates.append(GLCandidate(
-                    gl_code=code,
-                    gl_name=catalog[code].gl_name,
-                    source="human_approved_learning_example",
-                    source_id=str(learned.get("revision_id") or "human-adjudication"),
-                    base_score=0.78,
-                    positive_evidence=[learned],
-                    rule_version="human-invoice-adjudication/1.0",
-                ))
+            _extend_knowledge_candidates(candidates, knowledge, catalog)
+            meta["accounting_knowledge_context"] = knowledge.model_dump(mode="json")
             rule_application = apply_active_rules(
                 row=row,
                 semantics=semantics,
@@ -325,6 +277,54 @@ def decide_row(row: dict[str, Any], *, document_id: str, line_item_id: str, extr
             reasons.append("accounting_decision_blocking")
         meta["manual_review_reasons"] = sorted(set(reasons))
     return decision
+
+
+def _extend_knowledge_candidates(
+    candidates: list[GLCandidate], knowledge: Any, catalog: dict[str, Any],
+) -> None:
+    """Adapt typed Knowledge Core evidence into candidate-only engine input."""
+    existing = {(item.gl_code, item.source, item.source_id) for item in candidates}
+    for learned in knowledge.similar_approved_learning_examples:
+        code = _text(learned.gl_code)
+        key = (code, "human_approved_learning_example", learned.revision_id)
+        if key in existing or not code or code not in catalog or not catalog[code].payable:
+            continue
+        candidates.append(GLCandidate(
+            gl_code=code, gl_name=catalog[code].gl_name,
+            source="human_approved_learning_example", source_id=learned.revision_id,
+            base_score=0.78,
+            positive_evidence=[{
+                **learned.model_dump(mode="json"),
+                "selection_authority": False,
+            }],
+            rule_version="accounting-knowledge-core/1.0",
+        ))
+        existing.add(key)
+    prior_groups = (
+        knowledge.vendor_property_joint_priors,
+        knowledge.historical_vendor_priors,
+        knowledge.historical_property_priors,
+    )
+    seen_history: set[tuple[str, str]] = set()
+    for group in prior_groups:
+        for historical in group:
+            code = _text(historical.gl_code)
+            history_key = (code, historical.snapshot_id)
+            if history_key in seen_history or not code or code not in catalog or not catalog[code].payable:
+                continue
+            seen_history.add(history_key)
+            candidates.append(GLCandidate(
+                gl_code=code, gl_name=catalog[code].gl_name,
+                source="context_intelligence_history",
+                source_id=historical.snapshot_id,
+                base_score=min(.70, .45 + .25 * float(historical.share)),
+                positive_evidence=[{
+                    **historical.model_dump(mode="json"),
+                    "evidence_kind": "tenant_historical_frequency",
+                    "selection_authority": False,
+                }],
+                rule_version="accounting-knowledge-core/1.0",
+            ))
 
 
 def _adapt_candidates(row: dict[str, Any], evidence_text: str) -> list[GLCandidate]:

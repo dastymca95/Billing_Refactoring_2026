@@ -156,7 +156,8 @@ def _source_support(source: str, weights: dict, base_score: float) -> dict[str, 
     source_key = source.lower()
     return {
         "deterministic_rule_support": float(weights.get("deterministic_rule_support", 0)) * base_score if any(key in source_key for key in ("deterministic", "canonical", "utility", "manual")) else 0.0,
-        "historical_support": float(weights.get("historical_support", 0)) * base_score if "historical" in source_key or "learned" in source_key else 0.0,
+        "historical_support": float(weights.get("historical_support", 0)) * base_score
+        if any(key in source_key for key in ("historical", "learned", "learning")) else 0.0,
         "vendor_support": float(weights.get("vendor_support", 0)) * base_score if "vendor" in source_key else 0.0,
         "property_policy": float(weights.get("property_policy", 0)) * base_score if "property" in source_key else 0.0,
     }

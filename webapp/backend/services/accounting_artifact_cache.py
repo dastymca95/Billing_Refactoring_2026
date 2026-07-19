@@ -20,6 +20,14 @@ _DEPENDENCY_FILES = (
     "config/accounting_decision_v2.yaml",
     "config/canonical_rules.yaml",
     "config/tenant_document_policies.yaml",
+    "config/model_profiles.yaml",
+    "webapp/backend/services/canonical_semantics.py",
+    "webapp/backend/services/accounting_knowledge_core.py",
+)
+_MODEL_ENVIRONMENT_KEYS = (
+    "AI_PROVIDER", "AI_MODEL", "AI_VISION_PROVIDER", "AI_VISION_MODEL",
+    "AI_VERIFICATION_PROVIDER", "AI_VERIFICATION_MODEL",
+    "AI_ACCOUNTING_REASONING_PROVIDER", "AI_ACCOUNTING_REASONING_MODEL",
 )
 
 
@@ -31,12 +39,31 @@ def _file_hash(relative: str) -> str:
         return "missing"
 
 
-def dependency_versions() -> dict[str, str]:
+def _path_hash(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "none" if not path.exists() else "unreadable"
+
+
+def dependency_versions(tenant_id: str | None = None) -> dict[str, str]:
     from .gl_catalog import load_gl_catalog
+    from .tenant_accounting_policies import validate_tenant_id
 
     catalog_version, _ = load_gl_catalog()
     values = {"gl_catalog": str(catalog_version)}
     values.update({relative: _file_hash(relative) for relative in _DEPENDENCY_FILES})
+    resolved_tenant = validate_tenant_id(tenant_id) if tenant_id else "unscoped"
+    values["tenant_id"] = resolved_tenant
+    # Model/profile identifiers are not source evidence, but they invalidate
+    # generated semantic/accounting artifacts. Values are hashed to keep cache
+    # metadata private-safe; credentials are deliberately never inspected.
+    import os
+    for key in _MODEL_ENVIRONMENT_KEYS:
+        value = str(os.environ.get(key) or "").strip()
+        values[f"runtime_profile:{key}"] = (
+            hashlib.sha256(value.encode("utf-8")).hexdigest() if value else "unset"
+        )
     operator_rules = settings.WEBAPP_DATA_ROOT / "operator_accounting_rules" / "rules.json"
     if operator_rules.is_file():
         try:
@@ -47,7 +74,24 @@ def dependency_versions() -> dict[str, str]:
             values["operator_accounting_rules"] = "unreadable"
     else:
         values["operator_accounting_rules"] = "none"
+    if tenant_id:
+        tenant_dependencies = {
+            "tenant_policies": settings.WEBAPP_DATA_ROOT / "tenant_accounting" / resolved_tenant / "policies.json",
+            "human_corrections": settings.WEBAPP_DATA_ROOT / "human_adjudication" / resolved_tenant / "revisions.jsonl",
+            "knowledge_governance": settings.WEBAPP_DATA_ROOT / "human_adjudication" / resolved_tenant / "governance_events.jsonl",
+            "historical_profile": settings.WEBAPP_DATA_ROOT / "context_intelligence" / resolved_tenant / "current.json",
+        }
+        values.update({name: _path_hash(path) for name, path in tenant_dependencies.items()})
     return values
+
+
+def _row_dependencies(
+    row: dict[str, Any], dependencies: dict[str, str] | None,
+) -> dict[str, str]:
+    if dependencies is not None:
+        return dependencies
+    from .tenant_accounting_policies import tenant_id_for_row
+    return dependency_versions(tenant_id_for_row(row))
 
 
 def row_fingerprint(row: dict[str, Any], dependencies: dict[str, str] | None = None) -> str:
@@ -55,7 +99,7 @@ def row_fingerprint(row: dict[str, Any], dependencies: dict[str, str] | None = N
     source_text = meta.get("source_text") if isinstance(meta.get("source_text"), dict) else {}
     payload = {
         "version": ARTIFACT_VERSION,
-        "dependencies": dependencies or dependency_versions(),
+        "dependencies": _row_dependencies(row, dependencies),
         "accounting_inputs": {
             "vendor": row.get("Vendor"),
             "property": row.get("Property"),
@@ -99,7 +143,7 @@ def request_fingerprint(
     payload["GL Account"] = str(payload.get("GL Account") or "").strip()
     basis = {
         "version": ARTIFACT_VERSION,
-        "dependencies": dependencies or dependency_versions(),
+        "dependencies": _row_dependencies(row, dependencies),
         "row": payload,
     }
     encoded = json.dumps(basis, sort_keys=True, separators=(",", ":"), default=str).encode(
@@ -116,7 +160,7 @@ def hydrate(row: dict[str, Any], dependencies: dict[str, str] | None = None) -> 
     meta = row.get("_meta") if isinstance(row.get("_meta"), dict) else {}
     if not meta.get("ai_generated"):
         return False
-    deps = dependencies or dependency_versions()
+    deps = _row_dependencies(row, dependencies)
     key = request_fingerprint(row, deps)
     try:
         payload = json.loads(_persistent_path(key).read_text(encoding="utf-8"))
@@ -176,7 +220,7 @@ def mark(
     decision = meta.get("accounting_decision") if isinstance(meta, dict) else None
     if not isinstance(decision, dict):
         return
-    deps = dependencies or dependency_versions()
+    deps = _row_dependencies(row, dependencies)
     meta["accounting_pipeline_artifact"] = {
         "version": ARTIFACT_VERSION,
         "fingerprint": row_fingerprint(row, deps),

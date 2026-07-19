@@ -21398,3 +21398,38 @@ textarea:focus,
   .human-adjudication-evidence,
   .human-adjudication-evidence img { width: 100%; }
 }
+.human-adjudication-knowledge {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+  padding: 9px 11px;
+  border: 1px solid #cbdcf5;
+  border-radius: 9px;
+  background: #f5f9ff;
+  color: #294568;
+}
+.human-adjudication-knowledge > * { display: block; margin: 2px 0; }
+.human-adjudication-knowledge .is-contradiction { color: #9c3d23; font-weight: 600; }
+.human-adjudication-impact {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+  padding: 10px;
+  border-radius: 10px;
+  background: #edf6ff;
+}
+.human-adjudication-impact > strong,
+.human-adjudication-impact > small { grid-column: 1 / -1; }
+.human-adjudication-impact > span { padding: 6px; border-radius: 7px; background: white; }
+.human-adjudication-bulk-confirm { padding: 9px; border: 1px solid #f0b85a; border-radius: 8px; background: #fff9eb; }
+.knowledge-analytics { margin: 14px 0; padding: 14px; border: 1px solid #c9daf5; border-radius: 14px; background: rgba(255,255,255,.72); }
+.knowledge-analytics > header { display: flex; justify-content: space-between; gap: 16px; align-items: end; margin-bottom: 10px; }
+.knowledge-analytics > header span { color: #1769df; font-size: 11px; font-weight: 800; letter-spacing: .08em; }
+.knowledge-analytics > header h2 { margin: 3px 0 0; color: #17355f; }
+.knowledge-distributions { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+.knowledge-distributions section { padding: 10px; border-radius: 9px; background: #f4f8ff; }
+.knowledge-distributions h3 { margin: 0 0 7px; font-size: 13px; }
+.knowledge-distributions p { display: flex; justify-content: space-between; margin: 3px 0; }
+@media (max-width: 1000px) {
+  .human-adjudication-impact,
+  .knowledge-distributions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

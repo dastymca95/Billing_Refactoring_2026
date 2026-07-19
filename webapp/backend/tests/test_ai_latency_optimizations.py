@@ -448,7 +448,7 @@ def test_cached_accounting_decision_never_skips_source_contract(tmp_path, monkey
     monkeypatch.setattr(
         accounting_artifact_cache,
         "dependency_versions",
-        lambda: dependencies,
+        lambda *_: dependencies,
     )
     base = {
         "Vendor": "Observed Vendor",

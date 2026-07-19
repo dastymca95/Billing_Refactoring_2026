@@ -133,8 +133,19 @@ class RowAccountingV2Adapter:
             meta["generated_invoice_description"] = row.get("Invoice Description")
             row_identity[id(row)] = (document_id, line_id)
 
-        dependencies = accounting_artifact_cache.dependency_versions()
+        from .tenant_accounting_policies import tenant_id_for_row
+        tenant_ids = {
+            tenant_id_for_row(row) for row in rows if isinstance(row, dict)
+        }
+        if len(tenant_ids) > 1:
+            raise PermissionError("A grouped accounting bridge cannot cross tenant boundaries.")
+        bridge_tenant_id = next(iter(tenant_ids), None)
+        dependencies_by_row = {
+            id(row): accounting_artifact_cache.dependency_versions(tenant_id_for_row(row))
+            for row in rows if isinstance(row, dict)
+        }
         for row in rows:
+            dependencies = dependencies_by_row.get(id(row))
             if (
                 isinstance(row, dict)
                 and not (row.get("_meta") or {}).get("source_extraction_failed")
@@ -145,12 +156,14 @@ class RowAccountingV2Adapter:
             row for row in rows
             if isinstance(row, dict)
             and not (row.get("_meta") or {}).get("source_extraction_failed")
-            and not accounting_artifact_cache.is_reusable(row, dependencies)
+            and not accounting_artifact_cache.is_reusable(row, dependencies_by_row.get(id(row)))
         ]
         if not pending_rows:
             return rows
         request_keys = {
-            id(row): accounting_artifact_cache.request_fingerprint(row, dependencies)
+            id(row): accounting_artifact_cache.request_fingerprint(
+                row, dependencies_by_row.get(id(row)),
+            )
             for row in pending_rows
         }
         semantic_context = " | ".join(dict.fromkeys(
@@ -205,6 +218,7 @@ class RowAccountingV2Adapter:
                 lines=unresolved,
                 document_id=str(context.get("document_id") or "normalized-row"),
                 document_context=semantic_context,
+                tenant_id=bridge_tenant_id,
             )
             if unresolved else {}
         )
@@ -230,7 +244,7 @@ class RowAccountingV2Adapter:
         for row, _, _, _ in first_pass:
             accounting_artifact_cache.mark(
                 row,
-                dependencies,
+                dependencies_by_row.get(id(row)),
                 request_key=request_keys.get(id(row), ""),
             )
         return rows

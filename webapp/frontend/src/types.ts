@@ -196,6 +196,84 @@ export type HumanAdjudicationOptions = {
   add_to_benchmark: boolean;
   approve_learning_example: boolean;
   propose_reusable_rule: boolean;
+  bulk_scope_confirmed?: boolean;
+  group_equivalent_corrections?: boolean;
+};
+
+export type KnowledgeHistoricalPrior = {
+  dimension: "vendor" | "property" | "vendor_property";
+  gl_code: string;
+  count: number;
+  amount: string;
+  share: number;
+  snapshot_id: string;
+  authoritative: false;
+};
+
+export type KnowledgeLineContext = {
+  contract_version: string;
+  tenant_id: string;
+  line_item_id: string;
+  canonical_concept?: string | null;
+  document_evidence: Record<string, unknown>;
+  historical_profile_state: "ready" | "stale" | "not_generated" | "unavailable";
+  historical_vendor_priors: KnowledgeHistoricalPrior[];
+  historical_property_priors: KnowledgeHistoricalPrior[];
+  vendor_property_joint_priors: KnowledgeHistoricalPrior[];
+  similar_approved_learning_examples: {
+    learning_example_id: string; revision_id: string; canonical_concept: string;
+    document_family: string; line_family: string; trade_family: string; work_mode: string; gl_code: string;
+    evidence_fingerprint: string; candidate_only: true;
+  }[];
+  active_governed_rules: {
+    rule_id: string; version: number; title: string; status: string;
+    allowed_gl_codes: string[]; scope: Record<string, unknown>;
+    candidate_constraint_only: true;
+  }[];
+  contradictions: { code: string; message: string; source_ids: string[]; requires_review: boolean }[];
+  confidence: number;
+  provenance: { store: string; contract_version: string; source_id: string; immutable: boolean; tenant_id: string }[];
+  benchmark_examples_visible_to_production: 0;
+  selection_authority: false;
+  export_authority: false;
+};
+
+export type KnowledgeImpactEstimate = {
+  contract_version: string;
+  invoice_corrections: number;
+  benchmark_examples: number;
+  learning_examples: number;
+  learning_duplicates_avoided: number;
+  rule_proposals: number;
+  affected_rows: number;
+  requires_bulk_scope_confirmation: boolean;
+  statements: string[];
+};
+
+export type KnowledgeAnalytics = {
+  contract_version: string;
+  tenant_id: string;
+  historical_gl_distribution: Record<string, number>;
+  approved_export_gl_distribution: Record<string, number>;
+  posted_gl_distribution: Record<string, number>;
+  final_posted_gl_distribution: Record<string, number>;
+  ai_prediction_distribution: Record<string, number>;
+  human_correction_distribution: Record<string, number>;
+  disagreement_rate: number;
+  approved_benchmark_count: number;
+  approved_learning_count: number;
+  active_rule_count: number;
+  rule_coverage: number;
+  correction_drift_over_time: {
+    window_type: "calendar_month_utc"; window_start: string; month: string; corrections: number;
+  }[];
+  promotion_thresholds?: Record<string, number>;
+  promotion_candidates?: {
+    canonical_concept: string; gl_code: string; correction_count: number;
+    distinct_invoice_count: number; approved_learning_count: number;
+    eligible_for_learning_review: boolean; eligible_for_rule_simulation: boolean;
+    automatic_promotion: false;
+  }[];
 };
 
 export type HumanAdjudicationContext = {

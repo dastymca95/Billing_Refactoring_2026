@@ -3,6 +3,7 @@ import { type Dispatch, type SetStateAction, useCallback, useEffect, useMemo, us
 import { api, getFriendlyErrorMessage } from "../api";
 import type {
   ContextIntelligenceStatus,
+  KnowledgeAnalytics,
   DeterministicBuilderSession,
   DeterministicCoverage,
   PropertyContextProfile,
@@ -28,13 +29,22 @@ export function ContextIntelligenceWorkspace() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [knowledgeAnalytics, setKnowledgeAnalytics] = useState<KnowledgeAnalytics | null>(null);
+  const [knowledgeWarning, setKnowledgeWarning] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
+    setKnowledgeWarning("");
     try {
       const nextStatus = await api.getContextIntelligenceStatus();
       setStatus(nextStatus);
+      try {
+        setKnowledgeAnalytics(await api.accountingKnowledgeAnalytics());
+      } catch {
+        setKnowledgeAnalytics(null);
+        setKnowledgeWarning("Accounting Knowledge Core metrics are temporarily unavailable. The Context Matrix remains available.");
+      }
       if (nextStatus.state === "not_generated") {
         setItems([]);
         setTotal(0);
@@ -49,6 +59,7 @@ export function ContextIntelligenceWorkspace() {
       setStatus(null);
       setItems([]);
       setTotal(0);
+      setKnowledgeAnalytics(null);
       setError(getFriendlyErrorMessage(reason));
     } finally {
       setLoading(false);
@@ -109,6 +120,7 @@ export function ContextIntelligenceWorkspace() {
       </header>
 
       {error && <div className="context-error" role="alert">{error}</div>}
+      {knowledgeWarning && status && <div className="context-stale" role="status">{knowledgeWarning}</div>}
       {status?.missing_datasets.length ? (
         <div className="context-error">Publish these datasets before scanning: {status.missing_datasets.join(", ")}.</div>
       ) : null}
@@ -149,6 +161,24 @@ export function ContextIntelligenceWorkspace() {
             <Metric label="Deterministic candidates" value={snapshot?.deterministic_candidate_count || 0} accent />
             <Metric label="Review candidates" value={snapshot?.review_candidate_count || 0} />
           </section>
+
+          {knowledgeAnalytics && <section className="knowledge-analytics" data-testid="knowledge-analytics">
+            <header><div><span>ACCOUNTING KNOWLEDGE CORE</span><h2>Evidence, corrections and governance</h2></div><small>Historical frequency remains evidence · benchmark remains evaluation-only</small></header>
+            <div className="context-metrics">
+              <Metric label="Disagreement rate" value={Math.round(knowledgeAnalytics.disagreement_rate * 100)} suffix="%" />
+              <Metric label="Approved benchmark" value={knowledgeAnalytics.approved_benchmark_count} />
+              <Metric label="Approved learning" value={knowledgeAnalytics.approved_learning_count} />
+              <Metric label="Active rules" value={knowledgeAnalytics.active_rule_count} />
+              <Metric label="Rule coverage" value={Math.round(knowledgeAnalytics.rule_coverage * 100)} suffix="%" />
+            </div>
+            <div className="knowledge-distributions">
+              <Distribution title="Historical GL" values={knowledgeAnalytics.historical_gl_distribution} />
+              <Distribution title="Approved exports (not ResMan-posted)" values={knowledgeAnalytics.approved_export_gl_distribution} />
+              <Distribution title="ResMan-posted GL" values={knowledgeAnalytics.posted_gl_distribution} />
+              <Distribution title="AI predictions corrected" values={knowledgeAnalytics.ai_prediction_distribution} />
+              <Distribution title="Human corrections" values={knowledgeAnalytics.human_correction_distribution} />
+            </div>
+          </section>}
 
           <div className="context-toolbar">
             <div className="context-dimension-tabs">
@@ -460,8 +490,15 @@ function FrequencyList({ title, items }: { title: string; items: { key: string; 
 }
 
 
-function Metric({ label, value, accent = false }: { label: string; value: number; accent?: boolean }) {
-  return <div className={accent ? "accent" : ""}><strong>{value.toLocaleString()}</strong><span>{label}</span></div>;
+function Metric({ label, value, accent = false, suffix = "" }: { label: string; value: number; accent?: boolean; suffix?: string }) {
+  return <div className={accent ? "accent" : ""}><strong>{value.toLocaleString()}{suffix}</strong><span>{label}</span></div>;
+}
+
+function Distribution({ title, values }: { title: string; values: Record<string, number> }) {
+  const entries = Object.entries(values).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  return <section><h3>{title}</h3>{entries.length
+    ? entries.map(([code, count]) => <p key={code}><strong>{code}</strong><span>{count.toLocaleString()}</span></p>)
+    : <small>No approved observations yet.</small>}</section>;
 }
 
 function ShareBar({ value }: { value: number }) {

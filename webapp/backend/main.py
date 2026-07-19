@@ -24,6 +24,7 @@ from .api import (
     batches,
     canonical_rules,
     context_intelligence,
+    accounting_knowledge_core,
     deterministic_builder,
     cells,
     export,
@@ -95,6 +96,7 @@ def create_app() -> FastAPI:
     app.include_router(tenant_accounting.router)
     app.include_router(resman_context.router)
     app.include_router(context_intelligence.router)
+    app.include_router(accounting_knowledge_core.router)
     app.include_router(deterministic_builder.router)
     # Phase 2K — Cell explain / correct / learn.
     app.include_router(cells.router)
