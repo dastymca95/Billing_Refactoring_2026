@@ -8,27 +8,89 @@ never leave the process.
 
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import itertools
 import logging
 import os
 import re
+import contextvars
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from .. import settings
 from . import ai_runtime_trace, canonical_rules
+from .experiment_spend_controller import (
+    SpendAuthorizationError,
+    current_experiment_spend_gate,
+)
 from .native_pdf_evidence import NativePdfEvidence
+from .local_inference_guard import (
+    LOCAL_PROVIDER_NAMES,
+    LocalInferenceNetworkBlocked,
+    assert_dispatch_allowed,
+)
+from .controlled_external_experiment import (
+    ControlledCallPermit,
+    ControlledCallPermitLifecycle,
+    ControlledCallPurpose,
+    ControlledExternalBlocked,
+    ControlledExternalGateTerminated,
+    ExperimentProviderContext,
+    assert_controlled_external_dispatch_allowed,
+    controlled_external_active,
+    controlled_urlopen,
+    current_document_scope,
+    current_experiment_provider_context,
+    preflight_controlled_provider_route,
+    require_experiment_provider_context,
+    spend_document_context,
+)
+from .gemini_facts_transport import (
+    GeminiTransportError,
+    TRANSPORT_PROMPT_VERSION,
+    TRANSPORT_SCHEMA_VERSION,
+    build_gemini_facts_prompt,
+    build_safe_diagnostic as build_gemini_safe_diagnostic,
+    extract_single_json_object as extract_single_gemini_json_object,
+    gemini_response_format,
+    parse_and_normalize_gemini_facts,
+)
+from .gemini_supplementary_verification import (
+    GeminiSupplementaryObservation,
+    SUPPLEMENTARY_PROMPT_VERSION,
+    SUPPLEMENTARY_SCHEMA_VERSION,
+    SupplementaryTarget,
+    SupplementaryVerificationError,
+    build_minimized_initial_summary,
+    build_supplementary_prompt,
+    parse_supplementary_response,
+    reconciliation_snapshot,
+    supplementary_response_format,
+    validate_observation_crop_references,
+)
+from .intermediate_invoice_observation import (
+    InitialNormalizationCategory,
+    InitialNormalizationOutcome,
+    build_unreconciled_observation,
+)
+from .supplementary_evidence_planner import (
+    EvidenceLocalizationError,
+    SupplementaryEvidencePacket,
+    SupplementaryEvidencePlan,
+    validate_evidence_packet,
+)
 
 
 _LOG = logging.getLogger(__name__)
-_EXTRACTION_CACHE_VERSION = 7
+_EXTRACTION_CACHE_VERSION = 8
 _OPENAI_COMPATIBLE_PROVIDERS = {
     "openai", "openai_compatible", "gemini", "google_gemini",
     "deepseek", "anthropic", "claude",
@@ -48,6 +110,9 @@ _NATIVE_PDF_UNAVAILABLE_MODELS: set[str] = set()
 _PROVIDER_CIRCUIT_LOCK = threading.Lock()
 _PROVIDER_PERMANENT_FAILURES: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 _PERMANENT_PROVIDER_STATUSES = {401, 403, 404}
+_LAST_PROVIDER_RESPONSE_METADATA: contextvars.ContextVar[dict[str, Any]] = (
+    contextvars.ContextVar("innerview_last_provider_response_metadata", default={})
+)
 
 
 def _provider_circuit_key(
@@ -201,6 +266,246 @@ def _estimated_profile_request_cost(profile, payload: dict[str, Any], *, vision:
     return round(estimate, 6)
 
 
+def _update_profile_cost_context(profile, estimated_cost: float, *, vision: bool) -> None:
+    """Expose a private rate card to the experiment transport without secrets."""
+    ai_runtime_trace.update_context(
+        provider=(profile.provider if profile is not None else None),
+        model=(profile.model_id if profile is not None else None),
+        profile_id=(profile.profile_id if profile is not None else None),
+        estimated_cost_usd=max(0.0, float(estimated_cost or 0.0)),
+        input_cost_usd_per_million=(
+            float(profile.input_cost_usd_per_million or 0.0) if profile is not None else 0.0
+        ),
+        output_cost_usd_per_million=(
+            float(profile.output_cost_usd_per_million or 0.0) if profile is not None else 0.0
+        ),
+        fixed_request_cost_usd=(
+            max(0.0, float(os.environ.get("AI_ESTIMATED_VISION_IMAGE_COST_USD", "0.002") or 0.002))
+            if vision else 0.0
+        ),
+    )
+
+
+def _normalized_provider_usage(
+    envelope: dict[str, Any], *, native_anthropic: bool = False,
+) -> dict[str, int]:
+    raw = envelope.get("usage") if isinstance(envelope.get("usage"), dict) else {}
+    input_value = raw.get("input_tokens") if native_anthropic else raw.get("prompt_tokens")
+    output_value = raw.get("output_tokens") if native_anthropic else raw.get("completion_tokens")
+    if input_value is None:
+        input_value = raw.get("input_tokens")
+    if output_value is None:
+        output_value = raw.get("output_tokens")
+    total_value = raw.get("total_tokens")
+    result: dict[str, int] = {}
+    for key, value in (
+        ("input_tokens", input_value),
+        ("output_tokens", output_value),
+        ("total_tokens", total_value),
+    ):
+        try:
+            result[key] = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            result[key] = 0
+    if not result["total_tokens"]:
+        result["total_tokens"] = result["input_tokens"] + result["output_tokens"]
+    details = raw.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        try:
+            result["cached_input_tokens"] = max(0, int(details.get("cached_tokens") or 0))
+        except (TypeError, ValueError):
+            result["cached_input_tokens"] = 0
+    return result
+
+
+def _capture_provider_response_metadata(
+    envelope: dict[str, Any], *, payload: dict[str, Any], native_anthropic: bool,
+) -> dict[str, Any]:
+    """Retain only non-content response metadata in the current request context."""
+
+    usage = _normalized_provider_usage(envelope, native_anthropic=native_anthropic)
+    finish_reason = ""
+    if native_anthropic:
+        finish_reason = str(envelope.get("stop_reason") or "")
+    else:
+        choices = envelope.get("choices") if isinstance(envelope.get("choices"), list) else []
+        first = choices[0] if choices and isinstance(choices[0], dict) else {}
+        finish_reason = str(first.get("finish_reason") or "")
+    requested_limit = int(
+        payload.get("max_output_tokens")
+        or payload.get("max_completion_tokens")
+        or payload.get("max_tokens")
+        or 0
+    )
+    normalized_finish = finish_reason.strip().casefold()
+    metadata = {
+        "finish_reason": finish_reason[:80],
+        "prompt_token_count": usage.get("input_tokens", 0),
+        "output_token_count": usage.get("output_tokens", 0),
+        "output_token_limit_reached": (
+            normalized_finish in {"length", "max_tokens", "max_token", "max_output_tokens"}
+            or bool(requested_limit and usage.get("output_tokens", 0) >= requested_limit)
+        ),
+    }
+    _LAST_PROVIDER_RESPONSE_METADATA.set(metadata)
+    return metadata
+
+
+def _record_gemini_structured_failure(
+    raw_response: str,
+    *,
+    provider: str,
+    model: str,
+    request_profile: str,
+    parser_error_type: str,
+    parser_error_offset: int | None = None,
+) -> dict[str, Any]:
+    diagnostic = build_gemini_safe_diagnostic(
+        raw_response,
+        provider=provider,
+        model=model,
+        request_profile=request_profile,
+        response_metadata=_LAST_PROVIDER_RESPONSE_METADATA.get(),
+        parser_error_type=parser_error_type,
+        parser_error_offset=parser_error_offset,
+    )
+    ai_runtime_trace.record_structured_response_failure(diagnostic)
+    return diagnostic
+
+
+def _experiment_reserve_attempt(*, provider: str, model: str):
+    gate = current_experiment_spend_gate()
+    if gate is None:
+        if str(os.environ.get("INNER_VIEW_EXPERIMENT_MODE") or "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            if controlled_external_active():
+                raise ControlledExternalGateTerminated("experiment_spend_gate_missing")
+            raise AIProviderUnavailable(
+                "Experiment provider dispatch is blocked because no spend authority "
+                "is active in the current execution context.",
+                failure_code="experiment_spend_gate_missing",
+            )
+        return None
+    context = ai_runtime_trace.current_context()
+    ai_runtime_trace.update_context(
+        experiment_id=gate.controller.experiment_id,
+        experiment_phase=gate.phase.value,
+        pricing_version=gate.pricing_version,
+    )
+    if float(context.estimated_cost_usd or 0.0) <= 0:
+        if controlled_external_active():
+            raise ControlledExternalGateTerminated(
+                "controlled_external_cost_estimate_missing"
+            )
+        raise AIProviderUnavailable(
+            "Experiment provider dispatch is blocked because its cost cannot be estimated.",
+            failure_code="experiment_cost_estimate_missing",
+        )
+    try:
+        document_sha256, purpose = spend_document_context()
+        return gate.controller.reserve(
+            phase=gate.phase,
+            estimated_cost_usd=context.estimated_cost_usd,
+            provider=provider,
+            model_id=model,
+            profile_id=context.profile_id or "unscoped-profile",
+            stage=context.stage or "unknown",
+            document_sha256=document_sha256,
+            purpose=purpose,
+        )
+    except SpendAuthorizationError as exc:
+        if controlled_external_active():
+            raise ControlledExternalGateTerminated(str(exc)) from exc
+        raise AIProviderUnavailable(
+            "Experiment provider dispatch was denied by the spend authority.",
+            failure_code=str(exc),
+        ) from exc
+
+
+def _experiment_mark_dispatched(reservation):
+    gate = current_experiment_spend_gate()
+    if gate is not None and reservation is not None:
+        return gate.controller.mark_dispatched(reservation.reservation_id)
+    return reservation
+
+
+def _experiment_abort_before_dispatch(reservation, *, reason: str) -> None:
+    gate = current_experiment_spend_gate()
+    if gate is not None and reservation is not None:
+        gate.controller.release_reserved(reservation.reservation_id, reason=reason)
+
+
+def _experiment_settle_attempt(
+    reservation, *, envelope: dict[str, Any] | None,
+    native_anthropic: bool = False, failure_code: str = "",
+) -> None:
+    gate = current_experiment_spend_gate()
+    if gate is None or reservation is None:
+        return
+    if getattr(reservation, "status", "") == "reserved":
+        gate.controller.release_reserved(
+            reservation.reservation_id, reason=failure_code or "dispatch_not_started",
+        )
+        return
+    usage = (
+        _normalized_provider_usage(envelope, native_anthropic=native_anthropic)
+        if isinstance(envelope, dict) else {}
+    )
+    provider_reported = any(usage.values())
+    context = ai_runtime_trace.current_context()
+    if controlled_external_active() and (
+        not provider_reported
+        or context.input_cost_usd_per_million <= 0
+        or context.output_cost_usd_per_million <= 0
+    ):
+        settled = gate.controller.settle(
+            reservation.reservation_id,
+            actual_cost_usd=None,
+            usage=usage,
+            provider_reported_usage=provider_reported,
+            failure_code=failure_code or "provider_usage_or_pricing_indeterminate",
+        )
+        ai_runtime_trace.record_provider_usage(
+            reservation_id=reservation.reservation_id,
+            usage=usage,
+            actual_cost_usd=(
+                float(settled.actual_cost_usd) if settled.actual_cost_usd else None
+            ),
+            provider_reported=provider_reported,
+            failure_code=failure_code or "provider_usage_or_pricing_indeterminate",
+        )
+        gate.controller.cancel_outstanding(
+            reason="provider_usage_or_pricing_indeterminate"
+        )
+        raise ControlledExternalGateTerminated(
+            "provider_usage_or_pricing_indeterminate"
+        )
+    actual: float | None = None
+    if provider_reported and (
+        context.input_cost_usd_per_million > 0 or context.output_cost_usd_per_million > 0
+    ):
+        actual = (
+            usage.get("input_tokens", 0) * context.input_cost_usd_per_million / 1_000_000
+            + usage.get("output_tokens", 0) * context.output_cost_usd_per_million / 1_000_000
+            + max(0.0, float(context.fixed_request_cost_usd or 0.0))
+        )
+    settled = gate.controller.settle(
+        reservation.reservation_id,
+        actual_cost_usd=actual,
+        usage=usage,
+        provider_reported_usage=provider_reported,
+        failure_code=failure_code or None,
+    )
+    ai_runtime_trace.record_provider_usage(
+        reservation_id=reservation.reservation_id,
+        usage=usage,
+        actual_cost_usd=(float(settled.actual_cost_usd) if settled.actual_cost_usd else None),
+        provider_reported=provider_reported,
+        failure_code=failure_code,
+    )
+
+
 def _reserve_cost_budget(scope_id: str, estimated_cost_usd: float) -> None:
     if estimated_cost_usd <= 0:
         return
@@ -256,7 +561,9 @@ def _verified_cost_routing_profile_ids() -> set[str]:
     return ids
 
 
-def _select_cost_routing_profile(role_value: str):
+def _select_cost_routing_profile(
+    role_value: str, *, experiment_context: ExperimentProviderContext | None = None,
+):
     """Choose the cheapest healthy profile for a role without guessing models.
 
     The four legacy ``runtime-*`` profiles remain eligible for backward
@@ -272,6 +579,28 @@ def _select_cost_routing_profile(role_value: str):
         ]
     except (ImportError, ValueError):
         return None
+    if controlled_external_active():
+        context = require_experiment_provider_context(
+            experiment_context or current_experiment_provider_context()
+        )
+        exact = next((
+            profile for profile in profiles
+            if profile.profile_id == context.authorized_profile_id
+            and str(profile.provider or "").strip().casefold() in {
+                "gemini", "google_gemini",
+            }
+            and str(profile.model_id or "").strip() == context.authorized_model
+            and str(profile.base_url or "").rstrip("/")
+            in {
+                context.allowed_endpoint.rsplit("/chat/completions", 1)[0],
+                context.allowed_endpoint,
+            }
+        ), None)
+        if exact is None:
+            raise ControlledExternalGateTerminated(
+                "controlled_provider_route_blocked"
+            )
+        return exact
     verified = _verified_cost_routing_profile_ids()
     eligible = [
         profile for profile in profiles
@@ -297,7 +626,8 @@ def _select_cost_routing_profile(role_value: str):
 
 
 def extraction_profile_identity(
-    *, vision: bool, model_override: str = "", force_model_override: bool = False
+    *, vision: bool, model_override: str = "", force_model_override: bool = False,
+    experiment_context: ExperimentProviderContext | None = None,
 ) -> tuple[str, str, str]:
     """Return the exact configured request identity without calling a provider.
 
@@ -306,9 +636,19 @@ def extraction_profile_identity(
     only provider/profile/model identifiers; credentials and endpoints never
     leave the provider module.
     """
-    status = _require_vision_configured() if vision else _require_configured()
+    status = (
+        _require_vision_configured(experiment_context)
+        if vision else _require_configured(experiment_context)
+    )
     role = "multimodal_extraction" if vision else "text_extraction"
-    profile = None if force_model_override else _select_cost_routing_profile(role)
+    if controlled_external_active() and (not vision or force_model_override):
+        raise ControlledExternalGateTerminated("controlled_provider_route_blocked")
+    profile = (
+        None if force_model_override
+        else _select_cost_routing_profile(
+            role, experiment_context=experiment_context,
+        )
+    )
     configured_model = (
         (status.vision_model or status.model or "") if vision else (status.model or "")
     ).strip()
@@ -369,6 +709,12 @@ def _frozen_cache_payload(profile_id: str, request: dict[str, Any]) -> dict[str,
 
 def _load_extraction_cache(payload: dict[str, Any], *, vision: bool) -> dict[str, Any] | None:
     key = _extraction_cache_key(payload, vision=vision)
+    if controlled_external_active():
+        # The operator authorized one-shot Gemini facts extraction, not an
+        # explicit request/response cache. Observed facts are persisted by the
+        # private experiment result contract after validation instead.
+        ai_runtime_trace.record_cache(key, hit=False, layer="provider_request_disabled")
+        return None
     path = settings.WEBAPP_DATA_ROOT / "cache" / "ai_invoice" / f"{key}.json"
     try:
         cached = json.loads(path.read_text(encoding="utf-8"))
@@ -385,6 +731,8 @@ def _load_extraction_cache(payload: dict[str, Any], *, vision: bool) -> dict[str
 
 
 def _save_extraction_cache(payload: dict[str, Any], result: dict[str, Any], *, vision: bool) -> None:
+    if controlled_external_active():
+        return
     path = settings.WEBAPP_DATA_ROOT / "cache" / "ai_invoice" / f"{_extraction_cache_key(payload, vision=vision)}.json"
     tmp = path.with_suffix(".tmp")
     try:
@@ -410,6 +758,7 @@ class AIProviderError(RuntimeError):
         provider_error_type: str = "",
         provider_error_code: str = "",
         provider_error_param: str = "",
+        structured_diagnostic: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.failure_code = failure_code
@@ -417,16 +766,20 @@ class AIProviderError(RuntimeError):
         self.provider_error_type = provider_error_type
         self.provider_error_code = provider_error_code
         self.provider_error_param = provider_error_param
+        self.structured_diagnostic = dict(structured_diagnostic or {})
 
     def safe_diagnostic(self) -> dict[str, Any]:
         """Return allow-listed diagnostics that can be persisted without secrets."""
-        return {
+        safe = {
             "failure_code": self.failure_code,
             "http_status": self.http_status,
             "provider_error_type": self.provider_error_type or None,
             "provider_error_code": self.provider_error_code or None,
             "provider_error_param": self.provider_error_param or None,
         }
+        if self.structured_diagnostic:
+            safe["structured_response"] = dict(self.structured_diagnostic)
+        return safe
 
 
 class AIProviderNotConfigured(AIProviderError):
@@ -467,7 +820,25 @@ class AIProviderStatus:
     message: str
 
 
-def provider_status() -> AIProviderStatus:
+def provider_status(
+    experiment_context: ExperimentProviderContext | None = None,
+) -> AIProviderStatus:
+    if controlled_external_active():
+        context = require_experiment_provider_context(
+            experiment_context or current_experiment_provider_context()
+        )
+        return AIProviderStatus(
+            enabled=True,
+            provider=context.authorized_provider,
+            model=context.authorized_model,
+            configured=True,
+            supports_vision=True,
+            vision_enabled=True,
+            vision_provider=context.authorized_provider,
+            vision_model=context.authorized_model,
+            vision_mode="always",
+            message="Controlled external Gemini facts-only profile is configured.",
+        )
     provider = (settings.AI_PROVIDER or "").strip().lower()
     model = (settings.AI_MODEL or "").strip()
     key = (settings.AI_API_KEY or "").strip()
@@ -510,6 +881,26 @@ def provider_status() -> AIProviderStatus:
                 "AI invoice processing is configured with the mock provider."
                 if not vision_enabled
                 else "AI invoice processing and mock vision assist are configured."
+            ),
+        )
+    if provider in LOCAL_PROVIDER_NAMES:
+        local_base = base_url or "http://127.0.0.1:11434"
+        configured = bool(model and local_base)
+        vision_enabled = bool(vision_requested and configured_vision_model and configured)
+        return AIProviderStatus(
+            enabled=True,
+            provider="local_ollama",
+            model=model or None,
+            configured=configured,
+            supports_vision=bool(configured_vision_model and configured),
+            vision_enabled=vision_enabled,
+            vision_provider="local_ollama" if configured_vision_model else None,
+            vision_model=configured_vision_model or None,
+            vision_mode=vision_mode,
+            message=(
+                "Local-only AI invoice processing is configured."
+                if configured and (not vision_requested or vision_enabled)
+                else "Local-only AI is enabled but the local model/profile is incomplete."
             ),
         )
     missing: list[str] = []
@@ -605,15 +996,19 @@ def status_payload() -> dict[str, Any]:
     }
 
 
-def _require_configured() -> AIProviderStatus:
-    status = provider_status()
+def _require_configured(
+    experiment_context: ExperimentProviderContext | None = None,
+) -> AIProviderStatus:
+    status = provider_status(experiment_context)
     if not status.enabled or not status.configured:
         raise AIProviderNotConfigured(status.message)
     return status
 
 
-def _require_vision_configured() -> AIProviderStatus:
-    status = _require_configured()
+def _require_vision_configured(
+    experiment_context: ExperimentProviderContext | None = None,
+) -> AIProviderStatus:
+    status = _require_configured(experiment_context)
     if not getattr(settings, "AI_VISION_ENABLED", False):
         raise AIProviderNotConfigured(
             "Vision assist is not enabled. Configure AI_VISION_ENABLED and a vision-capable model."
@@ -768,8 +1163,19 @@ def _send_chat_completion(
     max_attempts_override: int | None = None,
     endpoint_surface_override: str | None = None,
     capability_override: str | None = None,
+    experiment_context: ExperimentProviderContext | None = None,
+    controlled_call_purpose: ControlledCallPurpose = ControlledCallPurpose.OTHER_VISUAL,
+    request_profile_id: str = "",
+    controlled_call_permit: ControlledCallPermit | None = None,
 ) -> str:
+    _LAST_PROVIDER_RESPONSE_METADATA.set({})
+    controlled_context = None
+    if controlled_external_active():
+        controlled_context = require_experiment_provider_context(experiment_context)
     request_provider = (
+        controlled_context.authorized_provider
+        if controlled_context is not None
+        else
         provider
         if api_key_override is not None or base_url_override is not None
         else (
@@ -778,10 +1184,14 @@ def _send_chat_completion(
             else provider
         )
     )
-    request_base_url = base_url_override or (
+    request_base_url = (
+        controlled_context.allowed_endpoint.rsplit("/chat/completions", 1)[0]
+        if controlled_context is not None
+        else base_url_override or (
         (getattr(settings, "AI_VISION_BASE_URL", "") or settings.AI_BASE_URL).strip()
         if vision
         else settings.AI_BASE_URL
+        )
     )
     request_key = api_key_override or (
         (getattr(settings, "AI_VISION_API_KEY", "") or settings.AI_API_KEY).strip()
@@ -793,6 +1203,48 @@ def _send_chat_completion(
         if vision
         else settings.AI_TIMEOUT_SECONDS
     )
+    if str(request_provider or "").strip().lower() in LOCAL_PROVIDER_NAMES:
+        from .local_multimodal_provider import (
+            LocalMultimodalProvider,
+            LocalMultimodalProviderError,
+        )
+
+        local_provider = LocalMultimodalProvider(
+            model=str(payload.get("model") or ""),
+            base_url=request_base_url or "http://127.0.0.1:11434",
+            profile_id=ai_runtime_trace.current_context().profile_id or "phase-a-local",
+            timeout_seconds=int(request_timeout or 180),
+        )
+        try:
+            with ai_runtime_trace.provider_attempt("local_ollama", 1):
+                result = local_provider.chat_completion(payload)
+        except LocalInferenceNetworkBlocked as exc:
+            raise AIProviderUnavailable(
+                "Local-only inference rejected a non-loopback dispatch.",
+                failure_code=str(exc),
+            ) from exc
+        except LocalMultimodalProviderError as exc:
+            raise AIProviderUnavailable(
+                "Local multimodal inference did not return a usable structured response.",
+                failure_code=exc.failure_code,
+            ) from exc
+        ai_runtime_trace.record_schema_result("valid")
+        output = dict(result.structured_output)
+        output["_local_provider_runtime"] = {
+            "contract_version": result.contract_version,
+            "request_id": result.request_id,
+            "provider": result.provider,
+            "model": result.model,
+            "model_version": result.model_version,
+            "execution_profile": result.execution_profile,
+            "response_channel": result.response_channel,
+            "page_identifiers": list(result.page_identifiers),
+            "latency_ms": result.latency_ms,
+            "resources": result.resources.model_dump(mode="json"),
+            "warnings": list(result.warnings),
+            "failure_reason": result.failure_reason,
+        }
+        return json.dumps(output, separators=(",", ":"))
     if not request_key:
         label = "AI vision provider" if vision else "AI provider"
         raise AIProviderNotConfigured(f"{label} API key is not configured.")
@@ -811,38 +1263,98 @@ def _send_chat_completion(
         capability=capability,
     )
     request_payload = _anthropic_payload(payload) if native_anthropic else payload
-    raw = json.dumps(request_payload).encode("utf-8")
-    response_char_limit = _response_char_limit(payload)
     url = (
         _anthropic_messages_url(request_base_url)
         if native_anthropic else _chat_completions_url(request_provider, request_base_url)
     )
+    try:
+        assert_dispatch_allowed(
+            provider=request_provider,
+            url=url,
+            stage=endpoint_surface_override or ("vision" if vision else "text"),
+        )
+    except LocalInferenceNetworkBlocked as exc:
+        if controlled_external_active():
+            preflight_controlled_provider_route(
+                provider_context=experiment_context,
+                provider=request_provider,
+                model=str(payload.get("model") or ""),
+                profile_id=(
+                    request_profile_id
+                    or ai_runtime_trace.current_context().profile_id
+                ),
+                endpoint=url,
+                call_purpose=ControlledCallPurpose.OTHER_VISUAL,
+                stage=(
+                    endpoint_surface_override
+                    or ("vision" if vision else "text")
+                ),
+            )
+            raise ControlledExternalGateTerminated(
+                "controlled_provider_route_blocked"
+            ) from exc  # pragma: no cover - preflight always terminates
+        raise AIProviderUnavailable(
+            "Remote provider dispatch is disabled in local-only experiment mode.",
+            failure_code=str(exc),
+        ) from exc
+    try:
+        assert_controlled_external_dispatch_allowed(
+            provider=request_provider,
+            url=url,
+            stage=endpoint_surface_override or ("vision" if vision else "text"),
+            payload=request_payload,
+            provider_context=experiment_context,
+            call_purpose=controlled_call_purpose,
+            profile_id=request_profile_id or ai_runtime_trace.current_context().profile_id,
+            call_permit=controlled_call_permit,
+        )
+    except ControlledExternalGateTerminated:
+        raise
+    except ControlledExternalBlocked as exc:
+        ai_runtime_trace.record_blocked_network_attempt(
+            provider=request_provider,
+            stage=endpoint_surface_override or ("vision" if vision else "text"),
+            failure_code=exc.failure_code,
+        )
+        raise ControlledExternalGateTerminated(exc.failure_code) from exc
+    raw = json.dumps(request_payload).encode("utf-8")
+    response_char_limit = _response_char_limit(payload)
     label = "AI vision provider" if vision else "AI provider"
     retryable_statuses = {429, 500, 502, 503, 504}
-    max_attempts = max_attempts_override or 3
+    max_attempts = 1 if controlled_external_active() else (max_attempts_override or 3)
     last_http_error: tuple[int, str] | None = None
+    successful_reservation = None
     for attempt in range(max_attempts):
-        headers = {"Content-Type": "application/json"}
-        if native_anthropic:
-            headers.update({"x-api-key": request_key, "anthropic-version": "2023-06-01"})
-        else:
-            headers["Authorization"] = f"Bearer {request_key}"
-        req = urllib.request.Request(
-            url,
-            data=raw,
-            headers=headers,
-            method="POST",
-        )
+        reservation = _experiment_reserve_attempt(provider=request_provider, model=model)
+        try:
+            headers = {"Content-Type": "application/json"}
+            if native_anthropic:
+                headers.update({"x-api-key": request_key, "anthropic-version": "2023-06-01"})
+            else:
+                headers["Authorization"] = f"Bearer {request_key}"
+            req = urllib.request.Request(
+                url,
+                data=raw,
+                headers=headers,
+                method="POST",
+            )
+        except Exception:
+            _experiment_abort_before_dispatch(
+                reservation, reason="request_construction_failed",
+            )
+            raise
         try:
             with ai_runtime_trace.provider_attempt(request_provider, attempt + 1):
-                with urllib.request.urlopen(
-                    req,
-                    timeout=request_timeout,
-                ) as resp:
+                reservation = _experiment_mark_dispatched(reservation)
+                with controlled_urlopen(req, timeout=request_timeout) as resp:
                     body = resp.read(response_char_limit * 3).decode("utf-8", "replace")
+            successful_reservation = reservation
             break
         except urllib.error.HTTPError as exc:
             safe_body = exc.read(1000).decode("utf-8", "replace")
+            _experiment_settle_attempt(
+                reservation, envelope=None, failure_code=f"http_{int(exc.code)}",
+            )
             last_http_error = (exc.code, safe_body)
             # Provider error bodies can echo masked or partial credentials.
             # Preserve the body only in-process for capability/error handling;
@@ -896,12 +1408,20 @@ def _send_chat_completion(
                 ) from exc
             time.sleep(1.5 * (attempt + 1))
         except (urllib.error.URLError, TimeoutError) as exc:
+            _experiment_settle_attempt(
+                reservation, envelope=None, failure_code="transport_error",
+            )
             if attempt >= max_attempts - 1:
                 raise AIProviderUnavailable(
                     f"{label} request failed or timed out.",
                     failure_code="vision_transport_error" if vision else "text_transport_error",
                 ) from exc
             time.sleep(1.5 * (attempt + 1))
+        except Exception as exc:
+            _experiment_settle_attempt(
+                reservation, envelope=None, failure_code=type(exc).__name__,
+            )
+            raise
     else:
         code, _ = last_http_error or (0, "")
         raise AIProviderUnavailable(
@@ -910,8 +1430,12 @@ def _send_chat_completion(
             http_status=code or None,
         )
 
+    envelope: dict[str, Any] | None = None
     try:
         envelope = json.loads(body)
+        _capture_provider_response_metadata(
+            envelope, payload=payload, native_anthropic=native_anthropic,
+        )
         content = (
             envelope.get("content") if native_anthropic
             else envelope["choices"][0]["message"]["content"]
@@ -925,16 +1449,68 @@ def _send_chat_completion(
                     parts.append(str(item))
             content = "\n".join(parts)
     except Exception as exc:
+        _experiment_settle_attempt(
+            successful_reservation, envelope=envelope,
+            native_anthropic=native_anthropic,
+            failure_code="invalid_response_shape",
+        )
         label = "AI vision provider" if vision else "AI provider"
+        diagnostic = None
+        if request_provider in {"gemini", "google_gemini"}:
+            diagnostic = _record_gemini_structured_failure(
+                body if isinstance(body, str) else "",
+                provider=request_provider,
+                model=model,
+                request_profile=ai_runtime_trace.current_context().profile_id,
+                parser_error_type="UnexpectedProviderResponseShape",
+            )
         raise AIProviderInvalidJSON(
-            f"{label} returned an unexpected response shape."
+            f"{label} returned an unexpected response shape.",
+            structured_diagnostic=diagnostic,
         ) from exc
     if not isinstance(content, str) or not content.strip():
+        _experiment_settle_attempt(
+            successful_reservation, envelope=envelope,
+            native_anthropic=native_anthropic,
+            failure_code="empty_response_content",
+        )
         label = "AI vision provider" if vision else "AI provider"
-        raise AIProviderInvalidJSON(f"{label} response content was empty.")
+        diagnostic = None
+        if request_provider in {"gemini", "google_gemini"}:
+            diagnostic = _record_gemini_structured_failure(
+                content if isinstance(content, str) else "",
+                provider=request_provider,
+                model=model,
+                request_profile=ai_runtime_trace.current_context().profile_id,
+                parser_error_type="EmptyResponseContent",
+            )
+        raise AIProviderInvalidJSON(
+            f"{label} response content was empty.", structured_diagnostic=diagnostic,
+        )
     if len(content) > response_char_limit:
+        _experiment_settle_attempt(
+            successful_reservation, envelope=envelope,
+            native_anthropic=native_anthropic,
+            failure_code="response_content_limit_exceeded",
+        )
         label = "AI vision provider" if vision else "AI provider"
-        raise AIProviderInvalidJSON(f"{label} response exceeded the configured output limit.")
+        diagnostic = None
+        if request_provider in {"gemini", "google_gemini"}:
+            diagnostic = _record_gemini_structured_failure(
+                content,
+                provider=request_provider,
+                model=model,
+                request_profile=ai_runtime_trace.current_context().profile_id,
+                parser_error_type="ResponseCharacterLimitExceeded",
+            )
+        raise AIProviderInvalidJSON(
+            f"{label} response exceeded the configured output limit.",
+            structured_diagnostic=diagnostic,
+        )
+    _experiment_settle_attempt(
+        successful_reservation, envelope=envelope,
+        native_anthropic=native_anthropic,
+    )
     return content
 
 
@@ -978,25 +1554,62 @@ def _send_openai_response(
     )
     response_char_limit = _response_char_limit(payload)
     url = _responses_url(base_url)
+    try:
+        assert_dispatch_allowed(
+            provider="openai", url=url, stage="responses_native_pdf",
+        )
+    except LocalInferenceNetworkBlocked as exc:
+        raise AIProviderUnavailable(
+            "Remote native-PDF dispatch is disabled in local-only experiment mode.",
+            failure_code=str(exc),
+        ) from exc
+    try:
+        assert_controlled_external_dispatch_allowed(
+            provider="openai", url=url, stage="responses_native_pdf", payload=payload,
+        )
+    except ControlledExternalBlocked as exc:
+        ai_runtime_trace.record_blocked_network_attempt(
+            provider="openai", stage="responses_native_pdf",
+            failure_code=exc.failure_code,
+        )
+        raise AIProviderUnavailable(
+            "Controlled external native-PDF dispatch is not authorized.",
+            failure_code=exc.failure_code,
+        ) from exc
     retryable_statuses = {429, 500, 502, 503, 504}
     body = ""
+    successful_reservation = None
     for attempt in range(max(1, int(max_attempts or 1))):
-        req = urllib.request.Request(
-            url,
-            data=raw,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
+        reservation = _experiment_reserve_attempt(provider="openai", model=model)
+        try:
+            req = urllib.request.Request(
+                url,
+                data=raw,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                method="POST",
+            )
+        except Exception:
+            _experiment_abort_before_dispatch(
+                reservation, reason="request_construction_failed",
+            )
+            raise
         try:
             with ai_runtime_trace.provider_attempt("openai", attempt + 1):
-                with urllib.request.urlopen(req, timeout=max(30, int(timeout_seconds or 240))) as resp:
+                reservation = _experiment_mark_dispatched(reservation)
+                with controlled_urlopen(
+                    req, timeout=max(30, int(timeout_seconds or 240))
+                ) as resp:
                     body = resp.read(response_char_limit * 4).decode("utf-8", "replace")
+            successful_reservation = reservation
             break
         except urllib.error.HTTPError as exc:
             safe_body = exc.read(1000).decode("utf-8", "replace")
+            _experiment_settle_attempt(
+                reservation, envelope=None, failure_code=f"http_{int(exc.code)}",
+            )
             error_type, error_code, error_param = _safe_http_error_fields(safe_body)
             _LOG.warning(
                 "Native document vision HTTP error %s type=%s code=%s param=%s",
@@ -1029,6 +1642,9 @@ def _send_openai_response(
                 ) from exc
             time.sleep(1.5 * (attempt + 1))
         except (urllib.error.URLError, TimeoutError) as exc:
+            _experiment_settle_attempt(
+                reservation, envelope=None, failure_code="transport_error",
+            )
             if attempt >= max_attempts - 1:
                 _mark_native_pdf_surface_unavailable(model)
                 raise AIProviderUnavailable(
@@ -1036,16 +1652,33 @@ def _send_openai_response(
                     failure_code="native_pdf_transport_error",
                 ) from exc
             time.sleep(1.5 * (attempt + 1))
+        except Exception as exc:
+            _experiment_settle_attempt(
+                reservation, envelope=None, failure_code=type(exc).__name__,
+            )
+            raise
     try:
         envelope = json.loads(body)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        _experiment_settle_attempt(
+            successful_reservation, envelope=None,
+            failure_code="invalid_response_shape",
+        )
         raise AIProviderInvalidJSON(
             "Native document vision returned an unexpected response shape."
         ) from exc
     content = _extract_responses_text(envelope)
     if not content:
+        _experiment_settle_attempt(
+            successful_reservation, envelope=envelope,
+            failure_code="empty_response_content",
+        )
         raise AIProviderInvalidJSON("Native document vision response content was empty.")
     if len(content) > response_char_limit:
+        _experiment_settle_attempt(
+            successful_reservation, envelope=envelope,
+            failure_code="response_content_limit_exceeded",
+        )
         raise AIProviderInvalidJSON(
             "Native document vision response exceeded the configured output limit."
         )
@@ -1056,6 +1689,7 @@ def _send_openai_response(
             usage[key] = max(0, int(raw_usage.get(key) or 0))
         except (TypeError, ValueError):
             usage[key] = 0
+    _experiment_settle_attempt(successful_reservation, envelope=envelope)
     return content, usage
 
 
@@ -1457,7 +2091,9 @@ def _native_vision_json_schema() -> dict[str, Any]:
     }
 
 
-def _validate_visual_line_structure(payload: dict[str, Any]) -> dict[str, Any]:
+def _validate_visual_line_structure(
+    payload: dict[str, Any], *, require_generated_description: bool = True,
+) -> dict[str, Any]:
     """Reject visually lossy table extractions before they reach accounting."""
     payload = _expand_reconciled_matrix_rows(payload)
     extraction_status = str(payload.get("visual_extraction_status") or "unknown").strip().lower()
@@ -1520,11 +2156,11 @@ def _validate_visual_line_structure(payload: dict[str, Any]) -> dict[str, Any]:
     for index, item in enumerate(items, start=1):
         raw_description = str(item.get("raw_description") or item.get("description") or "").strip()
         generated_description = str(item.get("generated_description") or "").strip()
-        if raw_description and not generated_description:
+        if require_generated_description and raw_description and not generated_description:
             raise AIProviderInvalidSchema(
                 f"Visual line item {index} is missing generated_description. Preserve raw_description and add a separate 3-to-8-word plain-language item identification."
             )
-        if len(generated_description.split()) > 10:
+        if require_generated_description and len(generated_description.split()) > 10:
             raise AIProviderInvalidSchema(
                 f"Visual line item {index} generated_description is too long. Use a concise 3-to-8-word identification."
             )
@@ -1550,6 +2186,207 @@ def _validate_visual_line_structure(payload: dict[str, Any]) -> dict[str, Any]:
                 "A page was marked reconciled even though its component difference is non-zero."
             )
     return payload
+
+
+def _internal_schema_failure_path(exc: AIProviderInvalidSchema) -> str:
+    """Classify an internal validation failure without persisting its message."""
+
+    message = str(exc).casefold()
+    if "no payable line items" in message:
+        return "line_items"
+    if "no payable invoice total" in message:
+        return "total_amount"
+    if "aggregate fallback" in message:
+        return "visual_extraction_status"
+    if "total column" in message or "matrix row" in message:
+        return "line_items.activity"
+    if "component row" in message:
+        return "line_items.matrix_expansion_status"
+    if "component amounts do not reconcile" in message:
+        return "reconciliation.line_items_to_invoice_total"
+    if "page was marked reconciled" in message:
+        return "page_reconciliations.status"
+    if "missing generated_description" in message:
+        return "line_items.generated_description"
+    if "generated_description is too long" in message:
+        return "line_items.generated_description"
+    if "line_items must be a list" in message:
+        return "line_items"
+    if "line item" in message and "must be an object" in message:
+        return "line_items.item"
+    if "warnings must be a list" in message:
+        return "warnings"
+    if "missing required field" in message:
+        return "required_fields"
+    return "strict_internal_contract"
+
+
+def normalize_gemini_initial_observation(
+    transport_payload: dict[str, Any], *, opaque_document_id: str,
+    provider: str, profile_id: str, model_id: str,
+) -> InitialNormalizationOutcome:
+    """Return a typed boundary outcome after valid Gemini transport.
+
+    A line-items-to-total mismatch is an evidence-backed unresolved
+    observation, not malformed provider transport.  Every other strict
+    structural failure retains the existing exception behavior.
+    """
+
+    try:
+        strict_input = _validate_invoice_schema(copy.deepcopy(transport_payload))
+        strict = _validate_visual_line_structure(
+            strict_input, require_generated_description=False,
+        )
+    except AIProviderInvalidSchema as exc:
+        validation_path = _internal_schema_failure_path(exc)
+        if validation_path == "reconciliation.line_items_to_invoice_total":
+            observation = build_unreconciled_observation(
+                strict_input,
+                opaque_document_id=opaque_document_id,
+                provider=provider,
+                profile_id=profile_id,
+                model_id=model_id,
+            )
+            return InitialNormalizationOutcome.supplementary_required(
+                observation, validation_path=validation_path,
+            )
+        return InitialNormalizationOutcome.unsupported(
+            validation_path=validation_path,
+            failure_code="initial_structured_response_invalid",
+        )
+    return InitialNormalizationOutcome.facts_ready(strict)
+
+
+def normalize_gemini_supplementary_observation(
+    initial_outcome: InitialNormalizationOutcome,
+    merged_payload: dict[str, Any],
+) -> InitialNormalizationOutcome:
+    """Validate a new supplementary revision without mutating the initial one."""
+
+    initial = initial_outcome.observation
+    if (
+        initial_outcome.category is not InitialNormalizationCategory.SUPPLEMENTARY_REQUIRED
+        or initial is None
+    ):
+        raise ValueError("supplementary_normalization_requires_initial_observation")
+    candidate = copy.deepcopy(merged_payload)
+    before = initial.deterministic_reconciliation_delta
+    after_snapshot = reconciliation_snapshot(candidate)
+    after = _decimal_or_none(after_snapshot.get("difference"))
+    candidate["initial_observation_revision"] = initial.model_dump(mode="json")
+    candidate["observation_line_item_revisions"] = {
+        "before": [item.model_dump(mode="json") for item in initial.line_items],
+        "after": copy.deepcopy(list(candidate.get("line_items") or [])),
+    }
+    candidate["reconciliation_delta_before"] = (
+        str(before) if before is not None else None
+    )
+    candidate["reconciliation_delta_after"] = (
+        str(after) if after is not None else None
+    )
+    try:
+        strict = _validate_visual_line_structure(
+            _validate_invoice_schema(candidate),
+            require_generated_description=False,
+        )
+    except AIProviderInvalidSchema as exc:
+        validation_path = _internal_schema_failure_path(exc)
+        if validation_path != "reconciliation.line_items_to_invoice_total":
+            raise
+        effective = build_unreconciled_observation(
+            candidate,
+            opaque_document_id=initial.opaque_document_id,
+            provider=initial.provenance.provider,
+            profile_id=initial.provenance.profile_id,
+            model_id=initial.provenance.model_id,
+        )
+        candidate.update({
+            "reconciliation_state": "ran_unreconciled",
+            "reconciliation_ran": True,
+            "reconciliation_status": "unreconciled",
+            "reconciliation_source_stage": "supplementary_visual_verification",
+            "reconciliation_before": "unreconciled",
+            "reconciliation_after": "unreconciled",
+            "needs_manual_review": True,
+            "visual_extraction_status": "partial",
+        })
+        return InitialNormalizationOutcome(
+            category=InitialNormalizationCategory.SUPPLEMENTARY_REQUIRED,
+            validation_path=validation_path,
+            failure_code=_supplementary_outcome_reason(candidate),
+            working_observation_payload=candidate,
+            observation=effective,
+        )
+    supplementary_status = _supplementary_visual_status(candidate)
+    unresolved_visual = supplementary_status != "resolved"
+    strict.update({
+        "reconciliation_state": "ran_reconciled",
+        "reconciliation_ran": True,
+        "reconciliation_status": "reconciled",
+        "reconciliation_source_stage": "supplementary_visual_verification",
+        "reconciliation_before": "unreconciled",
+        "reconciliation_after": "reconciled",
+        "reconciliation_delta_before": str(before) if before is not None else None,
+        "reconciliation_delta_after": str(after) if after is not None else None,
+        "supplementary_visual_status": supplementary_status,
+        "needs_manual_review": bool(
+            strict.get("needs_manual_review") or unresolved_visual
+        ),
+        "visual_extraction_status": (
+            "partial" if unresolved_visual else strict.get("visual_extraction_status", "complete")
+        ),
+    })
+    return InitialNormalizationOutcome.facts_ready(strict)
+
+
+def _supplementary_outcome_reason(payload: dict[str, Any]) -> str:
+    revisions = [
+        item for item in payload.get("supplementary_evidence_revisions") or []
+        if isinstance(item, dict)
+    ]
+    observations = [
+        item.get("observation") for item in revisions
+        if isinstance(item.get("observation"), dict)
+    ]
+    warnings = {str(item or "").strip() for item in payload.get("warnings") or []}
+    if "supplementary_evidence_localization_unavailable" in warnings:
+        return "supplementary_evidence_localization_unavailable"
+    if "supplementary_request_limit_reached" in warnings:
+        return "supplementary_request_limit_reached"
+    if any(item.get("contradiction_flag") is True for item in observations):
+        return "supplementary_visual_evidence_contradiction"
+    return "supplementary_visual_evidence_unresolved"
+
+
+def _supplementary_visual_status(payload: dict[str, Any]) -> str:
+    """Return visual status independently from arithmetic reconciliation."""
+
+    revisions = [
+        item for item in payload.get("supplementary_evidence_revisions") or []
+        if isinstance(item, dict)
+    ]
+    observations = [
+        item.get("observation") for item in revisions
+        if isinstance(item.get("observation"), dict)
+    ]
+    warnings = {str(item or "").strip() for item in payload.get("warnings") or []}
+    if any(item.get("contradiction_flag") is True for item in observations):
+        return "contradiction"
+    if "supplementary_request_limit_reached" in warnings:
+        return "request_limit_reached"
+    if any(item.get("unresolved_flag") is True for item in observations):
+        return "unresolved"
+    return "resolved"
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        result = Decimal(str(value).replace("$", "").replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    return result if result.is_finite() else None
 
 
 def _expand_reconciled_matrix_rows(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1729,17 +2566,31 @@ def extract_invoice_structured(
     model_override: str = "",
     force_model_override: bool = False,
     cost_scope_id: str = "",
+    experiment_context: ExperimentProviderContext | None = None,
 ) -> dict[str, Any]:
     """Call an OpenAI-compatible provider and return strict JSON.
 
     Vision payloads are intentionally not sent in Phase AI-1. The parameter is
     accepted so later providers can add image support without changing callers.
     """
-    status = _require_configured()
+    controlled_permit: ControlledCallPermit | None = None
+    if controlled_external_active():
+        context = require_experiment_provider_context(experiment_context)
+        controlled_permit = preflight_controlled_provider_route(
+            provider_context=context, provider=context.authorized_provider,
+            model=context.authorized_model,
+            profile_id=context.authorized_profile_id,
+            endpoint=context.allowed_endpoint,
+            call_purpose=ControlledCallPurpose.OTHER_VISUAL,
+            stage="text_extraction",
+        )
+    status = _require_configured(experiment_context)
     profile = (
         None
         if force_model_override
-        else _select_cost_routing_profile("text_extraction")
+        else _select_cost_routing_profile(
+            "text_extraction", experiment_context=experiment_context,
+        )
     )
     configured_model = (status.model or "").strip()
     if model_override and (force_model_override or model_override != configured_model):
@@ -1757,14 +2608,19 @@ def extract_invoice_structured(
     if provider == "mock":
         return _mock_extract_invoice_structured(document_text=document_text)
     safe_text, input_truncated = _safe_document_text(document_text)
-    prompt = _build_prompt(
-        vendor_hint=vendor_hint,
-        document_text=safe_text,
-        template_schema=template_schema,
-        property_reference=property_reference or [],
-        gl_reference=gl_reference or [],
-        vendor_reference=vendor_reference or [],
-        has_page_refs=bool(page_images_or_refs),
+    local_facts_only = str(provider or "").strip().lower() in LOCAL_PROVIDER_NAMES
+    prompt = (
+        _build_facts_only_vision_prompt(safe_text)
+        if local_facts_only
+        else _build_prompt(
+            vendor_hint=vendor_hint,
+            document_text=safe_text,
+            template_schema=template_schema,
+            property_reference=property_reference or [],
+            gl_reference=gl_reference or [],
+            vendor_reference=vendor_reference or [],
+            has_page_refs=bool(page_images_or_refs),
+        )
     )
     payload = {
         "model": model,
@@ -1784,14 +2640,20 @@ def extract_invoice_structured(
             int(getattr(settings, "AI_MAX_RESPONSE_TOKENS", 4096) or 4096),
         ),
     }
-    cache_payload = _frozen_cache_payload(
-        (
+    effective_profile_id = (
+        f"{profile.profile_id}:facts-only-v1"
+        if profile and local_facts_only
+        else (
             profile.profile_id
             if profile
-            else ("runtime-text-forced" if force_model_override else "runtime-text")
-        ),
-        payload,
+            else (
+                "runtime-text:facts-only-v1"
+                if local_facts_only
+                else ("runtime-text-forced" if force_model_override else "runtime-text")
+            )
+        )
     )
+    cache_payload = _frozen_cache_payload(effective_profile_id, payload)
     cached = _load_extraction_cache(cache_payload, vision=False)
     if cached is not None:
         return cached
@@ -1799,8 +2661,9 @@ def extract_invoice_structured(
     budget_scope = cost_scope_id or f"document:{hashlib.sha256(safe_text.encode()).hexdigest()[:20]}"
     last_parse_error: AIProviderError | None = None
     parsed: dict[str, Any] | None = None
-    for attempt in range(2):
-        ai_runtime_trace.update_context(estimated_cost_usd=estimated_cost)
+    attempts = 1 if controlled_external_active() else 2
+    for attempt in range(attempts):
+        _update_profile_cost_context(profile, estimated_cost, vision=False)
         _reserve_cost_budget(budget_scope, estimated_cost)
         content = _send_chat_completion(
             provider=provider,
@@ -1812,6 +2675,8 @@ def extract_invoice_structured(
         )
         try:
             parsed = _parse_invoice_content(content)
+            if local_facts_only:
+                parsed = _validate_visual_line_structure(parsed)
             break
         except (AIProviderInvalidJSON, AIProviderInvalidSchema) as exc:
             last_parse_error = exc
@@ -1830,14 +2695,18 @@ def extract_invoice_structured(
             ]
     if parsed is None:
         raise last_parse_error or AIProviderInvalidJSON("AI response was not valid JSON.")
+    if local_facts_only:
+        for item in parsed.get("line_items") or []:
+            if isinstance(item, dict):
+                item["gl_account_candidate"] = ""
+                item["expense_type"] = "General"
+                item["is_replacement_reserve"] = False
+                item["reason"] = "observed_document_fact"
+        parsed["_facts_only"] = True
     if input_truncated:
         warnings = parsed.get("warnings") if isinstance(parsed.get("warnings"), list) else []
         parsed["warnings"] = [*warnings, "ai_input_truncated"]
-    parsed["_provider_profile_id"] = (
-        profile.profile_id
-        if profile
-        else ("runtime-text-forced" if force_model_override else "runtime-text")
-    )
+    parsed["_provider_profile_id"] = effective_profile_id
     parsed["_provider_name"] = provider
     parsed["_provider_model_id"] = model
     parsed["_estimated_cost_usd"] = estimated_cost
@@ -1857,6 +2726,7 @@ def extract_invoice_vision_structured(
     model_override: str = "",
     force_model_override: bool = False,
     cost_scope_id: str = "",
+    experiment_context: ExperimentProviderContext | None = None,
 ) -> dict[str, Any]:
     """Run a vision-capable extraction call and return strict JSON.
 
@@ -1864,11 +2734,15 @@ def extract_invoice_vision_structured(
     accepts image refs after the status layer has confirmed that vision is
     explicitly enabled and supported.
     """
-    status = _require_vision_configured()
+    status = _require_vision_configured(experiment_context)
+    if controlled_external_active() and force_model_override:
+        raise ControlledExternalGateTerminated("controlled_provider_route_blocked")
     profile = (
         None
         if force_model_override
-        else _select_cost_routing_profile("multimodal_extraction")
+        else _select_cost_routing_profile(
+            "multimodal_extraction", experiment_context=experiment_context,
+        )
     )
     configured_vision_model = (status.vision_model or status.model or "").strip()
     # An explicit escalation model belongs to the configured legacy vision
@@ -1891,7 +2765,33 @@ def extract_invoice_vision_structured(
         return _mock_extract_invoice_vision_structured(document_text=document_text)
     if not page_images_or_refs:
         raise AIProviderNotConfigured("No page images were supplied for vision assist.")
+    if (
+        str(provider or "").strip().lower() in LOCAL_PROVIDER_NAMES
+        or (
+            controlled_external_active()
+            and str(provider or "").strip().lower() in {"gemini", "google_gemini"}
+        )
+    ):
+        # The local Phase A runtime is deliberately an observation-only
+        # extractor.  Do not send catalogs, tenant policy, or accounting
+        # references to a small local vision model: those inputs both exhaust
+        # its bounded context and blur the extraction/accounting authority
+        # boundary.  Downstream semantic reasoning and AccountingDecisionEngine
+        # remain responsible for candidate generation and final GL selection.
+        return extract_invoice_facts_only_vision_structured(
+            document_text=document_text,
+            page_images_or_refs=page_images_or_refs,
+            model_override=model,
+            cost_scope_id=cost_scope_id,
+            experiment_context=experiment_context,
+        )
     safe_text, input_truncated = _safe_document_text(document_text)
+    if controlled_external_active():
+        # The controlled Phase A contract authorizes source pixels plus the
+        # typed facts schema only. OCR/helper text is intentionally retained
+        # locally and merged after extraction.
+        safe_text = ""
+        input_truncated = False
     prompt = _build_vision_prompt(
         vendor_hint=vendor_hint,
         document_text=safe_text,
@@ -1948,7 +2848,7 @@ def extract_invoice_vision_structured(
     estimated_cost = _estimated_profile_request_cost(profile, payload, vision=True)
     budget_scope = cost_scope_id or f"document:{hashlib.sha256(safe_text.encode()).hexdigest()[:20]}"
     for attempt in range(2):
-        ai_runtime_trace.update_context(estimated_cost_usd=estimated_cost)
+        _update_profile_cost_context(profile, estimated_cost, vision=True)
         _reserve_cost_budget(budget_scope, estimated_cost)
         content_text = _send_chat_completion(
             provider=provider,
@@ -1958,6 +2858,9 @@ def extract_invoice_vision_structured(
             base_url_override=profile_base,
             timeout_seconds_override=profile.timeout_seconds if profile is not None else None,
             max_attempts_override=(profile.max_retries + 1) if profile is not None else None,
+            experiment_context=experiment_context,
+            controlled_call_purpose=ControlledCallPurpose.INITIAL_EXTRACTION,
+            request_profile_id=(profile.profile_id if profile else "runtime-vision"),
         )
         try:
             parsed = _validate_visual_line_structure(_parse_invoice_content(content_text))
@@ -1999,16 +2902,91 @@ def extract_invoice_facts_only_vision_structured(
     page_images_or_refs: list[str],
     model_override: str = "",
     cost_scope_id: str = "",
-) -> dict[str, Any]:
+    experiment_context: ExperimentProviderContext | None = None,
+) -> dict[str, Any] | InitialNormalizationOutcome:
     """Fast primary pass that observes document facts and never reasons about GL."""
-    status = _require_vision_configured()
-    profile = _select_cost_routing_profile("multimodal_extraction")
+    status = _require_vision_configured(experiment_context)
+    profile = _select_cost_routing_profile(
+        "multimodal_extraction", experiment_context=experiment_context,
+    )
     configured_model = (status.vision_model or status.model or "").strip()
     if model_override and model_override != configured_model:
         profile = None
     provider = profile.provider if profile is not None else (status.vision_provider or status.provider)
     model = (profile.model_id if profile is not None else (model_override or configured_model)).strip()
-    profile_id = (profile.profile_id if profile else "runtime-vision") + ":facts-only-v1"
+    gemini_transport = str(provider or "").strip().lower() in {"gemini", "google_gemini"}
+    profile_id = (profile.profile_id if profile else "runtime-vision") + (
+        f":facts-only:{TRANSPORT_SCHEMA_VERSION}:{TRANSPORT_PROMPT_VERSION}"
+        if gemini_transport else ":facts-only-v1"
+    )
+    permit_lifecycle: (
+        ControlledCallPermitLifecycle | _UncontrolledCallPermitLifecycle
+    )
+    if controlled_external_active():
+        context = require_experiment_provider_context(experiment_context)
+        provider = context.authorized_provider
+        model = context.authorized_model
+        profile_id = (
+            f"{context.authorized_profile_id}:facts-only:"
+            f"{TRANSPORT_SCHEMA_VERSION}:{TRANSPORT_PROMPT_VERSION}"
+        )
+        reserved_permit = preflight_controlled_provider_route(
+            provider_context=context, provider=provider, model=model,
+            profile_id=profile_id, endpoint=context.allowed_endpoint,
+            call_purpose=ControlledCallPurpose.INITIAL_EXTRACTION,
+            stage="rendered_visual_facts",
+        )
+        if reserved_permit is None:  # pragma: no cover - controlled preflight is strict
+            raise ControlledExternalGateTerminated(
+                "controlled_local_execution_error"
+            )
+        permit_lifecycle = ControlledCallPermitLifecycle(
+            context.call_budget, reserved_permit
+        )
+    else:
+        permit_lifecycle = _UncontrolledCallPermitLifecycle()
+
+    with permit_lifecycle as active_permit:
+        return _extract_invoice_facts_only_with_permit(
+            document_text=document_text,
+            page_images_or_refs=page_images_or_refs,
+            cost_scope_id=cost_scope_id,
+            experiment_context=experiment_context,
+            provider=provider,
+            model=model,
+            profile=profile,
+            profile_id=profile_id,
+            gemini_transport=gemini_transport,
+            permit_lifecycle=active_permit,
+        )
+
+
+class _UncontrolledCallPermitLifecycle:
+    """Explicit no-op state for production calls without experiment permits."""
+
+    def __enter__(self) -> "_UncontrolledCallPermitLifecycle":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        return False
+
+    def release_for_cache_hit(self) -> None:
+        return None
+
+    def permit_for_dispatch(self) -> None:
+        return None
+
+
+def _extract_invoice_facts_only_with_permit(
+    *, document_text: str, page_images_or_refs: list[str], cost_scope_id: str,
+    experiment_context: ExperimentProviderContext | None, provider: str,
+    model: str, profile: Any, profile_id: str, gemini_transport: bool,
+    permit_lifecycle: (
+        ControlledCallPermitLifecycle | _UncontrolledCallPermitLifecycle
+    ),
+) -> dict[str, Any] | InitialNormalizationOutcome:
+    """Execute one facts-only request under an explicit permit lifecycle."""
+
     if provider == "mock":
         result = _mock_extract_invoice_vision_structured(document_text=document_text)
         for item in result.get("line_items") or []:
@@ -2018,19 +2996,29 @@ def extract_invoice_facts_only_vision_structured(
     if not page_images_or_refs:
         raise AIProviderNotConfigured("No page images were supplied for facts-only extraction.")
     safe_text, input_truncated = _safe_document_text(document_text)
-    prompt = _build_facts_only_vision_prompt(safe_text)
+    if controlled_external_active():
+        # External Phase A sees only pixels and the facts-only schema. Local
+        # OCR text is merged after the provider response and never transmitted.
+        safe_text = ""
+        input_truncated = False
+    prompt = (
+        build_gemini_facts_prompt()
+        if gemini_transport else _build_facts_only_vision_prompt(safe_text)
+    )
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     max_visual_refs = max(1, int(getattr(settings, "AI_VISION_MAX_PAGES", 2) or 2)) * 2
     for ref in page_images_or_refs[:max_visual_refs]:
         content.append({"type": "image_url", "image_url": {"url": ref}})
     payload = {
         "model": model,
-        "response_format": {"type": "json_object"},
+        "response_format": (
+            gemini_response_format() if gemini_transport else {"type": "json_object"}
+        ),
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "Extract observable invoice facts into strict JSON. "
+                    "Extract observable document facts using the response schema. "
                     "Do not classify accounting, choose GL, or authorize readiness."
                 ),
             },
@@ -2044,13 +3032,36 @@ def extract_invoice_facts_only_vision_structured(
     cache_payload = _frozen_cache_payload(profile_id, payload)
     cached = _load_extraction_cache(cache_payload, vision=True)
     if cached is not None:
+        permit_lifecycle.release_for_cache_hit()
+        if gemini_transport and controlled_external_active():
+            scope = current_document_scope()
+            outcome = normalize_gemini_initial_observation(
+                cached,
+                opaque_document_id=(
+                    scope.opaque_document_id if scope is not None
+                    else hashlib.sha256(
+                        json.dumps(
+                            cache_payload, sort_keys=True, separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()[:24]
+                ),
+                provider=provider,
+                profile_id=profile_id,
+                model_id=model,
+            )
+            return (
+                outcome.facts_payload
+                if outcome.category is InitialNormalizationCategory.FACTS_READY
+                else outcome
+            )
         return _validate_visual_line_structure(cached)
     estimated_cost = _estimated_profile_request_cost(profile, payload, vision=True)
     budget_scope = cost_scope_id or f"facts:{hashlib.sha256(safe_text.encode()).hexdigest()[:20]}"
     parsed: dict[str, Any] | None = None
+    normalization_outcome: InitialNormalizationOutcome | None = None
     last_error: AIProviderError | None = None
     for attempt in range(2):
-        ai_runtime_trace.update_context(estimated_cost_usd=estimated_cost)
+        _update_profile_cost_context(profile, estimated_cost, vision=True)
         _reserve_cost_budget(budget_scope, estimated_cost)
         content_text = _send_chat_completion(
             provider=provider,
@@ -2063,10 +3074,117 @@ def extract_invoice_facts_only_vision_structured(
             ),
             base_url_override=profile.base_url if profile is not None else None,
             timeout_seconds_override=profile.timeout_seconds if profile is not None else None,
-            max_attempts_override=(profile.max_retries + 1) if profile is not None else None,
+            max_attempts_override=(
+                1 if controlled_external_active()
+                else (profile.max_retries + 1) if profile is not None else None
+            ),
+            experiment_context=experiment_context,
+            controlled_call_purpose=ControlledCallPurpose.INITIAL_EXTRACTION,
+            request_profile_id=profile_id,
+            controlled_call_permit=permit_lifecycle.permit_for_dispatch(),
         )
         try:
-            parsed = _validate_visual_line_structure(_parse_invoice_content(content_text))
+            if gemini_transport:
+                try:
+                    transport_result = parse_and_normalize_gemini_facts(
+                        content_text,
+                        provider=str(provider or "gemini"),
+                        model=model,
+                        request_profile=profile_id,
+                        response_metadata=_LAST_PROVIDER_RESPONSE_METADATA.get(),
+                    )
+                except GeminiTransportError as exc:
+                    ai_runtime_trace.record_structured_response_failure(exc.diagnostic)
+                    error_type = (
+                        AIProviderInvalidSchema
+                        if exc.failure_code == "gemini_transport_invalid_schema"
+                        else AIProviderInvalidJSON
+                    )
+                    raise error_type(
+                        "Gemini facts-only transport validation failed.",
+                        failure_code=(
+                            "initial_structured_response_invalid"
+                            if controlled_external_active() else exc.failure_code
+                        ),
+                        structured_diagnostic=exc.diagnostic,
+                    ) from exc
+                try:
+                    scope = current_document_scope()
+                    normalization_outcome = normalize_gemini_initial_observation(
+                        transport_result,
+                        opaque_document_id=(
+                            scope.opaque_document_id if scope is not None
+                            else hashlib.sha256(
+                                f"{budget_scope}:{profile_id}".encode()
+                            ).hexdigest()[:24]
+                        ),
+                        provider=str(provider or "gemini"),
+                        profile_id=profile_id,
+                        model_id=model,
+                    )
+                    if (
+                        normalization_outcome.category
+                        is InitialNormalizationCategory.SUPPLEMENTARY_REQUIRED
+                    ):
+                        ai_runtime_trace.record_schema_result(
+                            "escalated",
+                            retry_reason=(
+                                normalization_outcome.validation_path
+                                or "supplementary_required"
+                            ),
+                        )
+                        break
+                    if (
+                        normalization_outcome.category
+                        is InitialNormalizationCategory.UNSUPPORTED
+                    ):
+                        diagnostic = build_gemini_safe_diagnostic(
+                            content_text,
+                            provider=str(provider or "gemini"),
+                            model=model,
+                            request_profile=profile_id,
+                            response_metadata=_LAST_PROVIDER_RESPONSE_METADATA.get(),
+                            parsed=extract_single_gemini_json_object(content_text),
+                            parser_error_type="StrictInternalContractValidationError",
+                            schema_validation_error_path=(
+                                normalization_outcome.validation_path
+                                or "strict_internal_contract"
+                            ),
+                        )
+                        ai_runtime_trace.record_structured_response_failure(diagnostic)
+                        raise AIProviderInvalidSchema(
+                            "Gemini facts passed transport but failed the strict internal contract.",
+                            failure_code=(
+                                normalization_outcome.failure_code
+                                if controlled_external_active()
+                                else "gemini_internal_contract_invalid"
+                            ),
+                            structured_diagnostic=diagnostic,
+                        )
+                    parsed = copy.deepcopy(normalization_outcome.facts_payload or {})
+                except AIProviderInvalidSchema as exc:
+                    diagnostic = build_gemini_safe_diagnostic(
+                        content_text,
+                        provider=str(provider or "gemini"),
+                        model=model,
+                        request_profile=profile_id,
+                        response_metadata=_LAST_PROVIDER_RESPONSE_METADATA.get(),
+                        parsed=extract_single_gemini_json_object(content_text),
+                        parser_error_type="StrictInternalContractValidationError",
+                        schema_validation_error_path=_internal_schema_failure_path(exc),
+                    )
+                    ai_runtime_trace.record_structured_response_failure(diagnostic)
+                    raise AIProviderInvalidSchema(
+                        "Gemini facts passed transport but failed the strict internal contract.",
+                        failure_code=(
+                            "initial_structured_response_invalid"
+                            if controlled_external_active()
+                            else "gemini_internal_contract_invalid"
+                        ),
+                        structured_diagnostic=diagnostic,
+                    ) from exc
+            else:
+                parsed = _validate_visual_line_structure(_parse_invoice_content(content_text))
             ai_runtime_trace.record_schema_result("valid")
             break
         except (AIProviderInvalidJSON, AIProviderInvalidSchema) as exc:
@@ -2074,12 +3192,17 @@ def extract_invoice_facts_only_vision_structured(
                 "invalid", retry_reason=type(exc).__name__
             )
             last_error = exc
-            if attempt:
+            if attempt or controlled_external_active():
                 raise
             payload["messages"][0]["content"] = (
                 "Repair the prior response into the required facts-only JSON schema. "
                 "Do not add accounting or GL judgments."
             )
+    if normalization_outcome is not None and (
+        normalization_outcome.category
+        is InitialNormalizationCategory.SUPPLEMENTARY_REQUIRED
+    ):
+        return normalization_outcome
     if parsed is None:
         raise last_error or AIProviderInvalidJSON("Facts-only response was not valid JSON.")
     for item in parsed.get("line_items") or []:
@@ -2101,12 +3224,178 @@ def extract_invoice_facts_only_vision_structured(
     return parsed
 
 
+def controlled_gemini_supplementary_profile_identity(
+    target: SupplementaryTarget,
+    *, experiment_context: ExperimentProviderContext | None = None,
+) -> tuple[str, str, str]:
+    """Return the explicit Gemini experiment profile without runtime fallback."""
+
+    if not controlled_external_active():
+        raise AIProviderUnavailable(
+            "Targeted Gemini verification is available only inside CONTROLLED_EXTERNAL.",
+            failure_code="supplementary_experiment_scope_required",
+        )
+    context = require_experiment_provider_context(experiment_context)
+    profile = _select_cost_routing_profile(
+        "multimodal_extraction", experiment_context=context,
+    )
+    provider = str(getattr(profile, "provider", "") or "").strip().casefold()
+    if profile is None or provider not in {"gemini", "google_gemini"}:
+        raise AIProviderUnavailable(
+            "The controlled supplementary profile is not an authorized Gemini profile.",
+            failure_code="controlled_supplementary_gemini_profile_required",
+        )
+    model = str(profile.model_id or "").strip()
+    if not model or not profile.credentials_present:
+        raise AIProviderUnavailable(
+            "The controlled supplementary Gemini profile is incomplete.",
+            failure_code="controlled_supplementary_profile_incomplete",
+        )
+    profile_id = (
+        f"{profile.profile_id}:supplementary:{target.target_type.value}:"
+        f"{SUPPLEMENTARY_SCHEMA_VERSION}:{SUPPLEMENTARY_PROMPT_VERSION}"
+    )
+    return "gemini", profile_id, model
+
+
+def extract_gemini_supplementary_facts_structured(
+    *, initial_facts: dict[str, Any], target: SupplementaryTarget,
+    evidence_plan: SupplementaryEvidencePlan,
+    evidence_packet: SupplementaryEvidencePacket,
+    cost_scope_id: str = "",
+    experiment_context: ExperimentProviderContext | None = None,
+) -> GeminiSupplementaryObservation:
+    """Ask Gemini one bounded, target-specific visual question.
+
+    This function has intentionally no provider/model fallback and no repair
+    retry.  Spend and host authorization are enforced by the shared controlled
+    transport before bytes leave the process.
+    """
+
+    context = require_experiment_provider_context(experiment_context)
+    provider, profile_id, model = controlled_gemini_supplementary_profile_identity(
+        target, experiment_context=context,
+    )
+    profile = _select_cost_routing_profile(
+        "multimodal_extraction", experiment_context=context,
+    )
+    if profile is None or not profile_id.startswith(f"{profile.profile_id}:"):
+        raise AIProviderUnavailable(
+            "The controlled supplementary Gemini profile changed during request construction.",
+            failure_code="controlled_supplementary_profile_changed",
+        )
+    if evidence_plan.target_id != target.target_id:
+        raise AIProviderInvalidSchema(
+            "The supplementary evidence plan does not match its target.",
+            failure_code="supplementary_evidence_target_mismatch",
+        )
+    try:
+        validate_evidence_packet(evidence_plan, evidence_packet)
+    except EvidenceLocalizationError as exc:
+        raise AIProviderInvalidSchema(
+            "The supplementary visual evidence packet failed local validation.",
+            failure_code=exc.failure_code,
+        ) from exc
+    document_scope = current_document_scope()
+    if document_scope is None:
+        raise AIProviderUnavailable(
+            "Controlled document scope is required for supplementary verification.",
+            failure_code="controlled_external_document_scope_missing",
+        )
+    if evidence_plan.opaque_document_id != document_scope.opaque_document_id:
+        raise AIProviderInvalidSchema(
+            "The supplementary evidence plan belongs to another document scope.",
+            failure_code="supplementary_evidence_document_scope_mismatch",
+        )
+    stage = f"controlled_gemini_supplementary:{target.target_type.value}"
+    controlled_permit = preflight_controlled_provider_route(
+        provider_context=context, provider=provider, model=model,
+        profile_id=profile_id, endpoint=context.allowed_endpoint,
+        call_purpose=ControlledCallPurpose.SUPPLEMENTARY_VERIFICATION,
+        stage=stage,
+    )
+    minimized = build_minimized_initial_summary(initial_facts, target)
+    prompt = build_supplementary_prompt(
+        opaque_document_id=document_scope.opaque_document_id,
+        target=target,
+        minimized_summary=minimized,
+        evidence_plan_summary=evidence_plan.provider_summary(),
+    )
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for image in evidence_packet.images:
+        content.append({
+            "type": "text",
+            "text": (
+                f"Evidence image crop_id={image.crop_id}; role={image.role.value}; "
+                f"category={image.category.value}; page={image.page_number}."
+            ),
+        })
+        content.append({"type": "image_url", "image_url": {"url": image.data_url}})
+    payload = {
+        "model": model,
+        "response_format": supplementary_response_format(target),
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Verify one observable visual fact using the typed schema. "
+                    "Never provide accounting, GL, readiness, export, or policy decisions."
+                ),
+            },
+            {"role": "user", "content": content},
+        ],
+        **_completion_controls(provider, 2048),
+    }
+    estimated_cost = _estimated_profile_request_cost(profile, payload, vision=True)
+    budget_scope = cost_scope_id or f"supplementary:{document_scope.opaque_document_id}"
+    ai_runtime_trace.update_context(
+        stage=stage, provider=provider, model=model, profile_id=profile_id,
+    )
+    _update_profile_cost_context(profile, estimated_cost, vision=True)
+    _reserve_cost_budget(budget_scope, estimated_cost)
+    content_text = _send_chat_completion(
+        provider=provider,
+        payload=payload,
+        vision=True,
+        api_key_override=profile.api_key.get_secret_value() if profile.api_key else None,
+        base_url_override=profile.base_url,
+        timeout_seconds_override=profile.timeout_seconds,
+        max_attempts_override=1,
+        endpoint_surface_override=stage,
+        capability_override="visual_document_understanding",
+        experiment_context=context,
+        controlled_call_purpose=ControlledCallPurpose.SUPPLEMENTARY_VERIFICATION,
+        request_profile_id=profile_id,
+        controlled_call_permit=controlled_permit,
+    )
+    try:
+        observation = parse_supplementary_response(content_text, target=target)
+        validate_observation_crop_references(
+            observation,
+            allowed_crop_ids={image.crop_id for image in evidence_packet.images},
+        )
+    except SupplementaryVerificationError as exc:
+        ai_runtime_trace.record_schema_result("invalid", retry_reason=exc.failure_code)
+        error_type = (
+            AIProviderInvalidJSON
+            if exc.failure_code == "supplementary_invalid_json"
+            else AIProviderInvalidSchema
+        )
+        raise error_type(
+            "Gemini supplementary verification failed its typed local contract.",
+            failure_code=exc.failure_code,
+        ) from exc
+    ai_runtime_trace.record_schema_result("valid")
+    return observation
+
+
 def extract_invoice_critical_fields_vision_structured(
     *,
     page_images_or_refs: list[str],
     property_reference: list[dict[str, Any]] | None,
     model_override: str = "",
     cost_scope_id: str = "",
+    experiment_context: ExperimentProviderContext | None = None,
 ) -> dict[str, Any]:
     """Verify only ambiguous header facts from a bounded detail crop.
 
@@ -2116,8 +3405,10 @@ def extract_invoice_critical_fields_vision_structured(
     of a financial table that has already reconciled.
     """
 
-    status = _require_vision_configured()
-    profile = _select_cost_routing_profile("multimodal_extraction")
+    status = _require_vision_configured(experiment_context)
+    profile = _select_cost_routing_profile(
+        "multimodal_extraction", experiment_context=experiment_context,
+    )
     configured_model = (status.vision_model or status.model or "").strip()
     if model_override and model_override != configured_model:
         profile = None
@@ -2131,6 +3422,18 @@ def extract_invoice_critical_fields_vision_structured(
         profile.api_key.get_secret_value() if profile is not None and profile.api_key else None
     )
     profile_base = profile.base_url if profile is not None else None
+    if controlled_external_active():
+        context = require_experiment_provider_context(experiment_context)
+        preflight_controlled_provider_route(
+            provider_context=context, provider=provider, model=model,
+            profile_id=(
+                profile.profile_id + ":critical-fields"
+                if profile else "runtime-vision-critical-fields"
+            ),
+            endpoint=context.allowed_endpoint,
+            call_purpose=ControlledCallPurpose.OTHER_VISUAL,
+            stage="critical_header_verification",
+        )
     if not page_images_or_refs:
         raise AIProviderNotConfigured("No header/detail image was supplied for critical-field verification.")
 
@@ -2142,6 +3445,10 @@ def extract_invoice_critical_fields_vision_structured(
         for item in (property_reference or [])[:160]
         if isinstance(item, dict)
     ]
+    if controlled_external_active():
+        # Phase A authorizes pixels and a facts-only schema. ResMan reference
+        # data remains local and is applied only by the resolver after return.
+        property_names = []
     schema = {
         "invoice_date": "",
         "service_date": "",
@@ -2197,7 +3504,7 @@ def extract_invoice_critical_fields_vision_structured(
         return cached
     estimated_cost = _estimated_profile_request_cost(profile, payload, vision=True)
     budget_scope = cost_scope_id or "critical-fields"
-    ai_runtime_trace.update_context(estimated_cost_usd=estimated_cost)
+    _update_profile_cost_context(profile, estimated_cost, vision=True)
     _reserve_cost_budget(budget_scope, estimated_cost)
     response_text = _send_chat_completion(
         provider=provider,
@@ -2241,6 +3548,7 @@ def extract_handwritten_row_identities_vision_structured(
     expected_visible_rows: int | None = None,
     model_override: str = "",
     cost_scope_id: str = "",
+    experiment_context: ExperimentProviderContext | None = None,
 ) -> dict[str, Any]:
     """Transcribe only visible row identifiers from an enlarged Apt. # crop.
 
@@ -2249,8 +3557,10 @@ def extract_handwritten_row_identities_vision_structured(
     independently after the call.
     """
 
-    status = _require_vision_configured()
-    profile = _select_cost_routing_profile("multimodal_extraction")
+    status = _require_vision_configured(experiment_context)
+    profile = _select_cost_routing_profile(
+        "multimodal_extraction", experiment_context=experiment_context,
+    )
     configured_model = (status.vision_model or status.model or "").strip()
     if model_override and model_override != configured_model:
         profile = None
@@ -2264,6 +3574,18 @@ def extract_handwritten_row_identities_vision_structured(
         profile.api_key.get_secret_value() if profile is not None and profile.api_key else None
     )
     profile_base = profile.base_url if profile is not None else None
+    if controlled_external_active():
+        context = require_experiment_provider_context(experiment_context)
+        preflight_controlled_provider_route(
+            provider_context=context, provider=provider, model=model,
+            profile_id=(
+                profile.profile_id + ":row-identities"
+                if profile else "runtime-vision-row-identities"
+            ),
+            endpoint=context.allowed_endpoint,
+            call_purpose=ControlledCallPurpose.OTHER_VISUAL,
+            stage="row_identity_verification",
+        )
     if not apt_column_image_ref:
         raise AIProviderNotConfigured("No Apt. # crop was supplied for row-identity verification.")
 
@@ -2324,7 +3646,7 @@ def extract_handwritten_row_identities_vision_structured(
     if cached is not None:
         return cached
     estimated_cost = _estimated_profile_request_cost(profile, payload, vision=True)
-    ai_runtime_trace.update_context(estimated_cost_usd=estimated_cost)
+    _update_profile_cost_context(profile, estimated_cost, vision=True)
     _reserve_cost_budget(cost_scope_id or "row-identities", estimated_cost)
     response_text = _send_chat_completion(
         provider=provider,
@@ -2424,6 +3746,7 @@ def extract_invoice_native_pdf_structured(
     vendor_reference: list[dict[str, Any]] | None,
     model_override: str = "",
     cost_scope_id: str = "",
+    experiment_context: ExperimentProviderContext | None = None,
 ) -> dict[str, Any]:
     """Extract source facts from the original PDF through OpenAI Responses.
 
@@ -2432,7 +3755,17 @@ def extract_invoice_native_pdf_structured(
     output, and an independently versioned cache identity.
     """
 
-    status = _require_vision_configured()
+    if controlled_external_active():
+        context = require_experiment_provider_context(experiment_context)
+        preflight_controlled_provider_route(
+            provider_context=context, provider="openai",
+            model=(model_override or context.authorized_model),
+            profile_id="runtime-vision-native-pdf",
+            endpoint="https://api.openai.com/v1/responses",
+            call_purpose=ControlledCallPurpose.OTHER_VISUAL,
+            stage="native_pdf_visual_facts",
+        )
+    status = _require_vision_configured(experiment_context)
     provider = (status.vision_provider or status.provider or "").strip().lower()
     if provider != "openai":
         raise AIProviderNotConfigured(
@@ -2518,7 +3851,19 @@ def extract_invoice_native_pdf_structured(
         )
     except ValueError:
         reserved_cost = 0.05
-    ai_runtime_trace.update_context(estimated_cost_usd=reserved_cost)
+    escalation_model = os.environ.get("AI_VISION_ESCALATION_MODEL", "").strip()
+    cost_prefix = "AI_VISION_ESCALATION" if escalation_model and model == escalation_model else "AI_VISION"
+    try:
+        input_rate = float(os.environ.get(f"{cost_prefix}_INPUT_COST_USD_PER_MILLION", "0") or 0)
+        output_rate = float(os.environ.get(f"{cost_prefix}_OUTPUT_COST_USD_PER_MILLION", "0") or 0)
+    except ValueError:
+        input_rate = output_rate = 0.0
+    ai_runtime_trace.update_context(
+        estimated_cost_usd=reserved_cost,
+        input_cost_usd_per_million=max(0.0, input_rate),
+        output_cost_usd_per_million=max(0.0, output_rate),
+        fixed_request_cost_usd=0.0,
+    )
     _reserve_cost_budget(
         cost_scope_id or f"document:{pdf_evidence.content_sha256[:20]}",
         reserved_cost,
@@ -3117,6 +4462,8 @@ __all__ = [
     "AIProviderNotConfigured",
     "AIProviderStatus",
     "AIProviderUnavailable",
+    "controlled_gemini_supplementary_profile_identity",
+    "extract_gemini_supplementary_facts_structured",
     "extract_invoice_native_pdf_structured",
     "extract_invoice_critical_fields_vision_structured",
     "extract_handwritten_row_identities_vision_structured",

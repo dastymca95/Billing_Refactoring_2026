@@ -1,9 +1,15 @@
 from decimal import Decimal
 
-from webapp.backend.services.accounting_contracts import LineItemFacts
+from webapp.backend.services.accounting_contracts import (
+    GLAccountMetadata,
+    LineItemFacts,
+)
+from webapp.backend.services import controlled_external_experiment
+from webapp.backend.services import semantic_reasoning_gateway as gateway
 from webapp.backend.services.gl_catalog import load_gl_catalog
 from webapp.backend.services.semantic_classifier import classify_line
 from webapp.backend.services.semantic_reasoning_gateway import (
+    InvoiceSemanticLineRequest,
     SemanticReasoningProposal,
     _validate_and_adapt,
 )
@@ -70,3 +76,65 @@ def test_no_safe_decision_escalation_may_correct_known_semantics_but_remains_can
     assert resolved.work_mode == "renewal"
     assert [candidate.gl_code for candidate in candidates] == ["6118"]
     assert all(candidate.source == "ai_semantic_reasoning_candidate" for candidate in candidates)
+
+
+def test_controlled_external_semantics_are_local_candidate_only(monkeypatch):
+    facts = LineItemFacts(
+        line_item_id="line-local",
+        raw_description="Bath tub refinishing",
+        amount=Decimal("350"),
+    )
+    original = classify_line(facts, document_id="doc-local")
+    local_account = GLAccountMetadata(
+        gl_code="7001",
+        gl_name="Synthetic Surface Service",
+        gl_family="tub_refinishing",
+        trade_families=["tub_refinishing"],
+        compatible_work_modes=["labor_service"],
+        incompatible_work_modes=["material_purchase"],
+        payable=True,
+        metadata_source="synthetic_test_catalog",
+        metadata_confidence=1.0,
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("controlled local semantics must not select or call a provider")
+
+    monkeypatch.setattr(gateway, "controlled_external_active", lambda: True)
+    monkeypatch.setattr(gateway, "_select_accounting_profile", forbidden)
+    monkeypatch.setattr(gateway.ai_provider, "_send_chat_completion", forbidden)
+    monkeypatch.setattr(gateway.ai_provider, "_experiment_reserve_attempt", forbidden)
+    monkeypatch.setattr(
+        controlled_external_experiment, "build_deepseek_minimized_facts", forbidden,
+    )
+    monkeypatch.setattr(gateway, "load_gl_catalog", lambda: (
+        "synthetic-catalog/1.0", {"7001": local_account},
+    ))
+
+    result = gateway.enrich_invoice_semantics(
+        lines=[InvoiceSemanticLineRequest(
+            facts=facts,
+            semantics=original,
+            candidate_gl_codes=["7001"],
+        )],
+        document_id="doc-local",
+        document_context="",
+        tenant_id="exp-tenant-a",
+    )["line-local"]
+
+    assert result.trace == {
+        "route": "controlled_local_semantics",
+        "called": False,
+        "provider": "local",
+        "profile_id": None,
+        "model_id": None,
+        "estimated_cost_usd": 0.0,
+        "canonical_concept": "surface.bathtub_refinishing",
+        "version": "controlled-local-canonical-semantics/1.0",
+        "authority": "candidate_only",
+    }
+    assert result.semantics.trade_family == "tub_refinishing"
+    assert [candidate.gl_code for candidate in result.candidates] == ["7001"]
+    assert result.candidates[0].source == "local_canonical_semantic_candidate"
+    assert not hasattr(result, "selected_gl")
+    assert not hasattr(result, "export_allowed")

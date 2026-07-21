@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import copy
+import contextvars
 import difflib
 import hashlib
 import json
@@ -33,7 +34,13 @@ from . import ai_mapping_review
 from . import canonical_rules
 from . import document_ingestion
 from . import fast_first_facts
+from . import gemini_supplementary_verification
+from . import supplementary_evidence_planner
 from . import invoice_format_rules
+from .intermediate_invoice_observation import (
+    InitialNormalizationCategory,
+    InitialNormalizationOutcome,
+)
 from .local_processing_guard import LOCAL_DOCUMENT_PREPROCESS_LOCK
 from . import native_pdf_evidence
 from . import page_facts_cache
@@ -42,6 +49,13 @@ from . import support_documents
 from . import resman_context_data
 from . import tenant_document_policies
 from .tenant_accounting_policies import default_tenant_id
+from .controlled_external_experiment import (
+    ControlledExternalGateTerminated,
+    ExperimentProviderContext,
+    current_experiment_provider_context,
+    current_document_scope,
+    require_experiment_provider_context,
+)
 from .accounting_contracts import (
     CropCoordinates,
     DateFieldProvenance,
@@ -53,6 +67,13 @@ from .accounting_contracts import (
 )
 from .description_builder import build_invoice_description, build_line_item_description
 from .review_taxonomy import categorize_warning
+from .reconciliation_observability import (
+    ReconciliationObservation,
+    ReconciliationState,
+    ReconciliationStatus,
+    SupplementaryVisualStatus,
+    observe_reconciliation,
+)
 from .template_rules import get_template_rules
 
 
@@ -67,6 +88,14 @@ AI_VISION_REQUIRED_MESSAGE = (
     "This screenshot or photo does not contain readable embedded text. "
     "Enable AI Vision or upload a text-based PDF."
 )
+
+
+class IntermediateObservationReviewRequired(RuntimeError):
+    """Internal control signal; it never crosses the API/provider boundary."""
+
+    def __init__(self, outcome: InitialNormalizationOutcome) -> None:
+        super().__init__(outcome.failure_code or "supplementary_visual_evidence_unresolved")
+        self.outcome = outcome
 
 
 def _deduplicate_source_files(
@@ -323,6 +352,7 @@ def _extract_scanned_pages_independently(
     template_schema: dict[str, Any],
     prompt_references: dict[str, list[dict[str, Any]]],
     vision_model: str,
+    experiment_context: ExperimentProviderContext | None = None,
 ) -> dict[str, Any]:
     """Extract each scanned page as facts, then merge their accounting scope.
 
@@ -353,6 +383,7 @@ def _extract_scanned_pages_independently(
             vendor_reference=prompt_references["vendors"],
             model_override=vision_model,
             cost_scope_id=batch_id,
+            experiment_context=experiment_context,
         )
         page_payload = _reconcile_high_confidence_vision_candidates(page_payload)
         if _payload_is_lossy_matrix_aggregate(
@@ -383,6 +414,7 @@ def _extract_scanned_pages_independently(
                         vendor_reference=prompt_references["vendors"],
                         model_override=vision_model,
                         cost_scope_id=batch_id,
+                        experiment_context=experiment_context,
                     )
                     band_recovery = _reconcile_high_confidence_vision_candidates(band_recovery)
                     page_payload = _select_more_specific_cross_page_payload(
@@ -423,6 +455,7 @@ def _extract_scanned_pages_independently(
                 vendor_reference=prompt_references["vendors"],
                 model_override=vision_model,
                 cost_scope_id=batch_id,
+                experiment_context=experiment_context,
             )
             recovery = _reconcile_high_confidence_vision_candidates(recovery)
             merged = _select_more_specific_cross_page_payload(merged, recovery)
@@ -652,7 +685,15 @@ def _run_ai_file_workers_bounded(
         max_workers=min(len(files), max(1, max_workers)),
         thread_name_prefix="ai-invoice",
     ) as executor:
-        futures = [executor.submit(worker, source_file) for source_file in files]
+        # Context variables carry the experiment spend authority and the
+        # request-level trace. ThreadPoolExecutor does not propagate them by
+        # default, so each independent worker receives its own copied context.
+        # Without this boundary a paid experiment request could reach the
+        # transport without the fail-closed budget gate.
+        futures = [
+            executor.submit(contextvars.copy_context().run, worker, source_file)
+            for source_file in files
+        ]
         results: list[tuple[Path, dict[str, Any] | None, Exception | None]] = []
         for source_file, future in zip(files, futures):
             try:
@@ -824,15 +865,18 @@ def process_ai_vendor_files(
     dry_run: bool = False,
     _parallel_child: bool = False,
     _reset_cost_budget: bool = True,
+    experiment_provider_context: ExperimentProviderContext | None = None,
 ) -> dict[str, Any]:
     """Process unknown / variable supplier files through the AI path.
 
     Returns a vendor-like payload that ``batch_processor`` can merge into the
     normal webapp result shape.
     """
+    if ai_provider.controlled_external_active():
+        require_experiment_provider_context(experiment_provider_context)
     original_files = list(files)
     files, duplicate_source_aliases = _deduplicate_source_files(original_files)
-    status = ai_provider.provider_status()
+    status = ai_provider.provider_status(experiment_provider_context)
     invoices: list[dict[str, Any]] = []
     manual_review: list[dict[str, Any]] = []
     unsupported: list[dict[str, Any]] = []
@@ -888,12 +932,15 @@ def process_ai_vendor_files(
                     dry_run=dry_run,
                     _parallel_child=True,
                     _reset_cost_budget=False,
+                    experiment_provider_context=experiment_provider_context,
                 )
 
         child_payloads: list[dict[str, Any]] = []
         for source_file, payload, exc in _run_ai_file_workers_bounded(
             files, process_one, max_workers=workers
         ):
+            if isinstance(exc, ControlledExternalGateTerminated):
+                raise exc
             if exc is not None:  # one invoice cannot erase siblings
                 failure_code = _safe_failure_code(exc)
                 failure_invoice = _failed_extraction_invoice(
@@ -1006,6 +1053,11 @@ def process_ai_vendor_files(
         native_cache_identities: list[page_facts_cache.VisualPageIdentity] = []
         raster_cache_context: page_facts_cache.PageFactsCacheContext | None = None
         native_cache_context: page_facts_cache.PageFactsCacheContext | None = None
+        processing_stage = "initialization"
+        document_facts_created = False
+        reconciliation_completed = False
+        provenance_attached = False
+        persistence_attempted = False
         try:
             _tracker_update(
                 tracker,
@@ -1028,7 +1080,7 @@ def process_ai_vendor_files(
                     )
             document_text = document_candidate.document_text
             invoice_groups = _segment_document_invoice_groups(document_candidate)
-            if len(invoice_groups) > 1:
+            if len(invoice_groups) > 1 and not ai_provider.controlled_external_active():
                 segmented_vendor_hint = _document_vendor_hint(
                     document_candidate,
                     fallback=vendor_hint,
@@ -1046,6 +1098,7 @@ def process_ai_vendor_files(
                     dry_run=dry_run,
                     tracker=tracker,
                     should_cancel=should_cancel,
+                    experiment_provider_context=experiment_provider_context,
                 )
                 invoices.extend(segmented["invoices"])
                 manual_review.extend(segmented["manual_review"])
@@ -1120,6 +1173,7 @@ def process_ai_vendor_files(
                         ai_provider.extraction_profile_identity(
                             vision=True,
                             model_override=planned_vision_model,
+                            experiment_context=experiment_provider_context,
                         )
                     )
                     if fast_first_facts.production_enabled():
@@ -1308,6 +1362,7 @@ def process_ai_vendor_files(
                                         vendor_reference=prompt_references["vendors"],
                                         model_override=native_pdf_model,
                                         cost_scope_id=batch_id,
+                                        experiment_context=experiment_provider_context,
                                     )
                                     extraction_mode = "ai_vision_native_pdf"
                                 except ai_provider.AIProviderError as exc:
@@ -1326,6 +1381,7 @@ def process_ai_vendor_files(
                                                 vendor_reference=prompt_references["vendors"],
                                                 model_override=native_pdf_escalation_model,
                                                 cost_scope_id=batch_id,
+                                                experiment_context=experiment_provider_context,
                                             )
                                             extraction_mode = "ai_vision_native_pdf_escalated"
                                             raw["warnings"] = list(dict.fromkeys([
@@ -1354,9 +1410,12 @@ def process_ai_vendor_files(
                                 )
                                 # A document is one accounting unit. Rendered
                                 # evidence remains the provider-agnostic fallback.
-                                if _should_extract_scanned_pages_independently(
+                                if (
+                                    not ai_provider.controlled_external_active()
+                                    and _should_extract_scanned_pages_independently(
                                     document_candidate,
                                     vision_evidence_groups,
+                                    )
                                 ):
                                     raw = _extract_scanned_pages_independently(
                                         batch_id=batch_id,
@@ -1367,6 +1426,7 @@ def process_ai_vendor_files(
                                         template_schema=template_schema,
                                         prompt_references=prompt_references,
                                         vision_model=vision_model,
+                                        experiment_context=experiment_provider_context,
                                     )
                                 else:
                                     raw = _extract_fast_first_or_standard(
@@ -1379,6 +1439,9 @@ def process_ai_vendor_files(
                                         vendor_reference=prompt_references["vendors"],
                                         model_override=vision_model,
                                         cost_scope_id=batch_id,
+                                        _source_page_numbers=planned_page_numbers,
+                                        _document_candidate=document_candidate.to_dict(),
+                                        experiment_context=experiment_provider_context,
                                     )
                                 extraction_mode = "ai_vision"
                             if native_pdf_failure:
@@ -1389,6 +1452,7 @@ def process_ai_vendor_files(
                         if (
                             _requires_critical_header_verification(raw, document_candidate)
                             and vision_evidence_groups
+                            and not ai_provider.controlled_external_active()
                         ):
                             header_refs = [
                                 refs[-1]
@@ -1425,7 +1489,10 @@ def process_ai_vendor_files(
                                     if safe_warning not in warnings:
                                         warnings.append(safe_warning)
                                     raw["warnings"] = warnings
-                        if _requires_row_identity_verification(raw, document_candidate):
+                        if (
+                            _requires_row_identity_verification(raw, document_candidate)
+                            and not ai_provider.controlled_external_active()
+                        ):
                             try:
                                 apt_crop, apt_coordinates = ai_vision.render_pdf_apt_column_crop(
                                     batch_id=batch_id,
@@ -1460,6 +1527,24 @@ def process_ai_vendor_files(
                                 if safe_warning not in warnings:
                                     warnings.append(safe_warning)
                                 raw["warnings"] = warnings
+                        if ai_provider.controlled_external_active() and (
+                            _requires_critical_header_verification(raw, document_candidate)
+                            or _requires_row_identity_verification(raw, document_candidate)
+                        ):
+                            context = require_experiment_provider_context(
+                                experiment_provider_context
+                            )
+                            remaining = context.remaining_call_budget
+                            reason_code = (
+                                "supplementary_request_limit_reached"
+                                if remaining["supplementary_remaining"] == 0
+                                else "visual_evidence_unavailable"
+                            )
+                            raw["warnings"] = list(dict.fromkeys([
+                                *list(raw.get("warnings") or []), reason_code,
+                            ]))
+                            raw["needs_manual_review"] = True
+                            raw["visual_extraction_status"] = "partial"
                         ai_vision.save_vision_trace_regions(
                             batch_id=batch_id,
                             source_file=f.name,
@@ -1470,6 +1555,11 @@ def process_ai_vendor_files(
                         extraction_model = vision_model or status.vision_model or status.model
                         extraction_mode = extraction_mode or "ai_vision"
                     except ai_provider.AIProviderError as exc:
+                        if ai_provider.controlled_external_active():
+                            # Phase A authorizes Gemini visual facts only. A
+                            # failed/invalid visual response terminates the
+                            # document; OCR text may not be sent as a fallback.
+                            raise
                         if not document_text.strip():
                             raise
                         diagnostic = exc.safe_diagnostic()
@@ -1505,6 +1595,10 @@ def process_ai_vendor_files(
                         extraction_model = status.model
                         extraction_mode = "ai_text_after_vision_fallback"
                 else:
+                    if ai_provider.controlled_external_active():
+                        _require_controlled_visual_evidence(
+                            {}, route="single", source_available=False,
+                        )
                     with perf_timer.perf_step(
                         "ai.text_call",
                         batch_id=batch_id,
@@ -1572,7 +1666,12 @@ def process_ai_vendor_files(
                             if "ai_vision_retry_failed_text_result_retained" not in warnings:
                                 warnings.append("ai_vision_retry_failed_text_result_retained")
                             raw["warnings"] = warnings
+            if ai_provider.controlled_external_active() and extraction_mode.startswith("ai_vision"):
+                _require_controlled_visual_evidence(
+                    raw, route="single", source_available=True,
+                )
             if extraction_mode.startswith("ai_vision") and "exact_facts_cache" not in extraction_mode:
+                processing_stage = "reconciliation"
                 raw = _reconcile_high_confidence_vision_candidates(raw)
                 selected_cache_context = raster_cache_context
                 if extraction_mode.startswith("ai_vision_native_pdf"):
@@ -1609,12 +1708,22 @@ def process_ai_vendor_files(
                     observed_raw_for_cache = copy.deepcopy(raw)
                     observed_cache_context = selected_cache_context
                     observed_cache_identities = selected_cache_identities
+            processing_stage = "local_observation_merge"
             raw = _apply_vendor_hint_to_payload(raw, vendor_hint)
             raw = _repair_ai_payload_from_ocr(raw, document_text, source_file=f.name)
             raw["_document_text"] = document_text
             raw["_source_file"] = f.name
             raw["_source_type"] = document_candidate.source_type if document_candidate else ""
             raw["_document_candidate"] = document_candidate.to_dict() if document_candidate else {}
+            provenance_attached = bool(
+                raw.get("evidence")
+                or raw.get("transport_evidence")
+                or any(
+                    item.get("evidence") or item.get("transport_evidence")
+                    for item in list(raw.get("line_items") or [])
+                    if isinstance(item, dict)
+                )
+            )
             extraction_provider, extraction_model = _actual_provider_identity(
                 raw,
                 fallback_provider=extraction_provider,
@@ -1642,7 +1751,22 @@ def process_ai_vendor_files(
                 batch_id=batch_id,
                 meta={"file": f.name},
             ):
+                processing_stage = "normalization"
                 normalized = validate_ai_extraction(raw, references=references)
+            validation_summary = (
+                normalized.get("validation_summary")
+                if isinstance(normalized.get("validation_summary"), dict)
+                else {}
+            )
+            reconciliation_completed = bool(
+                normalized.get("reconciliation_status")
+                or validation_summary.get("reconciliation_status")
+                or "total_reconciliation_passed" in validation_summary
+            )
+            provenance_attached = provenance_attached or bool(
+                normalized.get("transport_evidence")
+                or normalized.get("date_provenance")
+            )
             normalized_cache_artifact = facts_cache_artifact
             if (
                 observed_raw_for_cache is not None
@@ -1660,6 +1784,8 @@ def process_ai_vendor_files(
                     or observed_raw_for_cache.get("excluded_paid_rows")
                     or []
                 )
+                processing_stage = "observed_facts_persistence"
+                persistence_attempted = True
                 normalized_cache_artifact = _save_page_facts(
                     batch_id=batch_id,
                     identities=observed_cache_identities,
@@ -1679,9 +1805,11 @@ def process_ai_vendor_files(
             normalized["ai_provider_request_surface"] = raw.get("_provider_request_surface")
             normalized["ai_provider_usage"] = dict(raw.get("_provider_usage") or {})
             normalized["ai_estimated_cost_usd"] = raw.get("_estimated_cost_usd")
+            processing_stage = "mapping_review"
             normalized = ai_mapping_review.apply_learned_mappings_to_normalized(
                 normalized
             )
+            processing_stage = "support_document_link"
             support_link = support_documents.upload_source_document_to_dropbox(
                 batch_id=batch_id,
                 source_file=f.name,
@@ -1700,6 +1828,7 @@ def process_ai_vendor_files(
                 batch_id=batch_id,
                 stage="accounting_pipeline",
             ):
+                processing_stage = "accounting_pipeline"
                 inv = ai_result_to_invoice(
                     normalized,
                     batch_id=batch_id,
@@ -1708,6 +1837,11 @@ def process_ai_vendor_files(
                     support_document_url=support_link.url,
                     support_document_status=support_link.status,
                     support_document_dropbox_path=support_link.dropbox_path,
+                )
+                document_facts_created = any(
+                    isinstance((row.get("_meta") or {}).get("document_facts"), dict)
+                    for row in list(inv.get("rows") or [])
+                    if isinstance(row, dict)
                 )
             invoices.append(inv)
             if normalized["manual_review_reasons"]:
@@ -1743,6 +1877,35 @@ def process_ai_vendor_files(
                 invoices_created=len(invoices),
                 warnings_count=len(manual_review),
             )
+        except IntermediateObservationReviewRequired as exc:
+            processing_stage = "reconciliation"
+            review = _intermediate_observation_review_item(
+                source_file=f.name,
+                vendor_name=vendor_hint,
+                outcome=exc.outcome,
+            )
+            manual_review.append(review)
+            processed_files += 1
+            reconciliation_completed = True
+            provenance_attached = bool(review.get("provenance_exists"))
+            page_facts_cache.finalize_document_manifest(
+                batch_id=batch_id,
+                filename=f.name,
+                expected_group_count=1,
+            )
+            _tracker_update(
+                tracker,
+                percent=_range_pct(index, len(files), 82),
+                stage="Awaiting reconciliation review",
+                current_file=f.name,
+                files_done=index,
+                invoices_created=len(invoices),
+                warnings_count=len(manual_review),
+            )
+        except ControlledExternalGateTerminated:
+            # Gate-fatal conditions are persisted and stop scheduling in the
+            # Phase A runner. They must never become a local OCR/text fallback.
+            raise
         except ai_provider.AIProviderNotConfigured as exc:
             provider_message = str(exc) or AI_MANUAL_REVIEW_MESSAGE
             is_vision_required = "Vision" in provider_message or "screenshot" in provider_message
@@ -1767,13 +1930,20 @@ def process_ai_vendor_files(
                 "reason": reason,
                 "message": message,
                 "detection": detection.get(f.name),
+                "safe_terminal_stage": processing_stage,
+                "provenance_exists": provenance_attached,
+                "reconciliation_ran": reconciliation_completed,
             })
         except (ai_provider.AIProviderInvalidJSON, ai_provider.AIProviderInvalidSchema) as exc:
             output_limit = "exceeded the configured output limit" in str(exc).lower()
             reason = (
                 "ai_response_output_limit_exceeded"
                 if output_limit
-                else "ai_response_invalid_json"
+                else (
+                    "initial_structured_response_invalid"
+                    if ai_provider.controlled_external_active()
+                    else "ai_response_invalid_json"
+                )
             )
             failure_message = (
                 "AI returned more structured extraction data than the configured response budget allowed."
@@ -1795,10 +1965,34 @@ def process_ai_vendor_files(
                 "reason": reason,
                 "message": failure_message,
                 "detection": detection.get(f.name),
+                "safe_terminal_stage": processing_stage,
+                "provenance_exists": provenance_attached,
+                "reconciliation_ran": reconciliation_completed,
             })
         except Exception as exc:
             reason, safe_message = _safe_processing_failure(exc)
-            _LOG.warning("AI invoice processing failed for %s: %s", f.name, exc)
+            with ai_runtime_trace.operation(
+                batch_id=batch_id,
+                stage="single_invoice_processing_failure",
+            ):
+                ai_runtime_trace.record_processing_stage_failure(
+                    processing_stage=processing_stage,
+                    exception_type=type(exc).__name__,
+                    failure_code=str(getattr(exc, "failure_code", "") or reason),
+                    document_facts_created=document_facts_created,
+                    reconciliation_completed=reconciliation_completed,
+                    provenance_attached=provenance_attached,
+                    persistence_attempted=persistence_attempted,
+                    final_disposition_written=False,
+                )
+            if ai_provider.controlled_external_active():
+                _LOG.warning(
+                    "Controlled single-invoice processing failed at stage %s (%s).",
+                    processing_stage,
+                    type(exc).__name__,
+                )
+            else:
+                _LOG.warning("AI invoice processing failed for %s: %s", f.name, exc)
             fallback = _try_local_ocr_fallback_invoice(
                 batch_id=batch_id,
                 source_file=f.name,
@@ -1846,6 +2040,9 @@ def process_ai_vendor_files(
                 "reason": reason,
                 "message": safe_message,
                 "detection": detection.get(f.name),
+                "safe_terminal_stage": processing_stage,
+                "provenance_exists": provenance_attached,
+                "reconciliation_ran": reconciliation_completed,
             })
         finally:
             if raster_cache_context is not None and facts_cache_identities:
@@ -1976,6 +2173,7 @@ def _process_segmented_invoice_groups_bounded(
             isolated_group = copy.deepcopy(group)
             isolated_group["_stable_group_index"] = stable_index
             future = executor.submit(
+                contextvars.copy_context().run,
                 _process_segmented_invoice_groups,
                 invoice_groups=[isolated_group],
                 tracker=None,
@@ -1987,6 +2185,11 @@ def _process_segmented_invoice_groups_bounded(
             stable_index = futures[future]
             try:
                 ordered[stable_index] = future.result()
+            except ControlledExternalGateTerminated:
+                for pending in futures:
+                    if pending is not future:
+                        pending.cancel()
+                raise
             except Exception as exc:
                 # Defensive isolation: the per-group worker already converts
                 # normal failures into review rows, but one unexpected worker
@@ -2031,6 +2234,7 @@ def _process_segmented_invoice_groups(
     tracker: Any = None,
     should_cancel: Any = None,
     support_link_coordinator: _SupportLinkCoordinator | None = None,
+    experiment_provider_context: ExperimentProviderContext | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     invoices: list[dict[str, Any]] = []
     reviews: list[dict[str, Any]] = []
@@ -2068,6 +2272,12 @@ def _process_segmented_invoice_groups(
         observed_raw_for_cache: dict[str, Any] | None = None
         cache_identities: list[page_facts_cache.VisualPageIdentity] = []
         cache_context: page_facts_cache.PageFactsCacheContext | None = None
+        processing_stage = "initialization"
+        document_facts_created = False
+        reconciliation_completed = False
+        provenance_attached = False
+        persistence_attempted = False
+        final_disposition_written = False
         try:
             _tracker_update(
                 tracker,
@@ -2116,6 +2326,7 @@ def _process_segmented_invoice_groups(
                         ai_provider.extraction_profile_identity(
                             vision=True,
                             model_override=vision_model,
+                            experiment_context=experiment_provider_context,
                         )
                     )
                     if fast_first_facts.production_enabled():
@@ -2160,6 +2371,7 @@ def _process_segmented_invoice_groups(
                             ai_provider.extraction_profile_identity(
                                 vision=True,
                                 model_override=vision_model,
+                                experiment_context=experiment_provider_context,
                             )
                         )
                         use_fast_first = fast_first_facts.production_enabled()
@@ -2180,38 +2392,54 @@ def _process_segmented_invoice_groups(
                                     page_images_or_refs=vision_images,
                                     model_override=vision_model,
                                     cost_scope_id=batch_id,
+                                    experiment_context=experiment_provider_context,
                                 )
                                 escalation = fast_first_facts.escalation_reasons(raw)
                             else:
                                 raw = {}
                                 escalation = ["fast_first_not_enabled"]
                             if escalation:
-                                if use_fast_first:
-                                    full_profile = planned_profile.removesuffix(":facts-only-v1")
-                                    ai_runtime_trace.update_context(profile_id=full_profile)
-                                raw = _extract_vision_with_reduced_retry(
-                                    vendor_hint=vendor_hint,
-                                    document_text=prompt_text,
-                                    page_images_or_refs=vision_images,
-                                    template_schema=template_schema,
-                                    property_reference=prompt_references["properties"],
-                                    gl_reference=prompt_references["gl_accounts"],
-                                    vendor_reference=prompt_references["vendors"],
-                                    model_override=vision_model,
-                                    cost_scope_id=batch_id,
-                                )
-                                if use_fast_first:
-                                    raw["warnings"] = list(dict.fromkeys([
-                                        *list(raw.get("warnings") or []),
-                                        *[f"fast_first_escalated:{reason}" for reason in escalation],
-                                    ]))
-                                    planned_profile = full_profile
-                                    if cache_context is not None:
-                                        cache_context = cache_context.model_copy(
-                                            update={"profile_id": planned_profile}
-                                        ) if hasattr(cache_context, "model_copy") else page_facts_cache.PageFactsCacheContext(
-                                            **{**cache_context.dict(), "profile_id": planned_profile}
-                                        )
+                                if use_fast_first and ai_provider.controlled_external_active():
+                                    raw = _run_controlled_gemini_supplementary(
+                                        initial_facts=raw,
+                                        escalation_reasons=escalation,
+                                        page_images_or_refs=vision_images,
+                                        page_numbers=page_numbers,
+                                        document_layout=group_candidate.to_dict(),
+                                        cost_scope_id=batch_id,
+                                        experiment_context=experiment_provider_context,
+                                    )
+                                    planned_profile = str(
+                                        raw.get("_provider_profile_id") or planned_profile
+                                    )
+                                else:
+                                    if use_fast_first:
+                                        full_profile = planned_profile.removesuffix(":facts-only-v1")
+                                        ai_runtime_trace.update_context(profile_id=full_profile)
+                                    raw = _extract_vision_with_reduced_retry(
+                                        vendor_hint=vendor_hint,
+                                        document_text=prompt_text,
+                                        page_images_or_refs=vision_images,
+                                        template_schema=template_schema,
+                                        property_reference=prompt_references["properties"],
+                                        gl_reference=prompt_references["gl_accounts"],
+                                        vendor_reference=prompt_references["vendors"],
+                                        model_override=vision_model,
+                                        cost_scope_id=batch_id,
+                                        experiment_context=experiment_provider_context,
+                                    )
+                                    if use_fast_first:
+                                        raw["warnings"] = list(dict.fromkeys([
+                                            *list(raw.get("warnings") or []),
+                                            *[f"fast_first_escalated:{reason}" for reason in escalation],
+                                        ]))
+                                        planned_profile = full_profile
+                                        if cache_context is not None:
+                                            cache_context = cache_context.model_copy(
+                                                update={"profile_id": planned_profile}
+                                            ) if hasattr(cache_context, "model_copy") else page_facts_cache.PageFactsCacheContext(
+                                                **{**cache_context.dict(), "profile_id": planned_profile}
+                                            )
                             ai_runtime_trace.record_schema_result("valid")
                         extraction_provider = planned_provider
                         extraction_model = planned_model
@@ -2221,8 +2449,15 @@ def _process_segmented_invoice_groups(
                             else "ai_vision_segmented"
                         )
                     else:
+                        if ai_provider.controlled_external_active():
+                            _require_controlled_visual_evidence(
+                                {}, route="segmented", source_available=False,
+                            )
                         planned_provider, planned_profile, planned_model = (
-                            ai_provider.extraction_profile_identity(vision=False)
+                            ai_provider.extraction_profile_identity(
+                                vision=False,
+                                experiment_context=experiment_provider_context,
+                            )
                         )
                         with ai_runtime_trace.operation(
                             batch_id=batch_id,
@@ -2240,16 +2475,26 @@ def _process_segmented_invoice_groups(
                                 gl_reference=prompt_references["gl_accounts"],
                                 vendor_reference=prompt_references["vendors"],
                                 cost_scope_id=batch_id,
+                                experiment_context=experiment_provider_context,
                             )
                             ai_runtime_trace.record_schema_result("valid")
                         extraction_provider = planned_provider
                         extraction_model = planned_model
                         extraction_mode = "ai_text_segmented"
+                    if (
+                        ai_provider.controlled_external_active()
+                        and extraction_mode.startswith("ai_vision")
+                    ):
+                        _require_controlled_visual_evidence(
+                            raw, route="segmented", source_available=True,
+                        )
                     if extraction_mode.startswith("ai_vision"):
+                        processing_stage = "vision_candidate_reconciliation"
                         raw = _reconcile_high_confidence_vision_candidates(raw)
                         if cache_context is not None and cache_identities:
                             observed_raw_for_cache = copy.deepcopy(raw)
 
+            processing_stage = "local_observation_merge"
             raw = _apply_vendor_hint_to_payload(raw, vendor_hint)
             raw = _repair_ai_payload_from_ocr(raw, group_text, source_file=source_file.name)
             raw["_document_text"] = group_text
@@ -2262,7 +2507,18 @@ def _process_segmented_invoice_groups(
                 fallback_provider=extraction_provider,
                 fallback_model=extraction_model,
             )
+            processing_stage = "normalization"
             normalized = validate_ai_extraction(raw, references=references)
+            reconciliation_completed = bool(normalized.get("reconciliation_status"))
+            provenance_attached = bool(
+                normalized.get("transport_evidence")
+                or normalized.get("date_provenance")
+                or any(
+                    item.get("transport_evidence") or item.get("evidence")
+                    for item in list(normalized.get("line_items") or [])
+                    if isinstance(item, dict)
+                )
+            )
             normalized_cache_artifact = cache_artifact
             if observed_raw_for_cache is not None and cache_context is not None and cache_identities:
                 observed_raw_for_cache["date_provenance"] = list(
@@ -2276,6 +2532,8 @@ def _process_segmented_invoice_groups(
                     or observed_raw_for_cache.get("excluded_paid_rows")
                     or []
                 )
+                processing_stage = "observed_facts_persistence"
+                persistence_attempted = True
                 normalized_cache_artifact = _save_page_facts(
                     batch_id=batch_id,
                     identities=cache_identities,
@@ -2289,6 +2547,7 @@ def _process_segmented_invoice_groups(
                 page_facts_cache.save_normalized_facts(
                     normalized_cache_artifact.cache_key, normalized
                 )
+            processing_stage = "mapping_review"
             normalized["ai_provider"] = extraction_provider
             normalized["ai_model"] = extraction_model
             normalized["ai_extraction_mode"] = extraction_mode
@@ -2303,6 +2562,7 @@ def _process_segmented_invoice_groups(
                     dry_run=dry_run,
                 )
 
+            processing_stage = "support_document_link"
             if support_link_coordinator is not None:
                 support_link = support_link_coordinator.obtain(
                     stable_group_index, create_support_link
@@ -2320,6 +2580,7 @@ def _process_segmented_invoice_groups(
                 batch_id=batch_id,
                 stage=f"accounting_pipeline:{stable_group_index}",
             ):
+                processing_stage = "accounting_pipeline"
                 invoice = ai_result_to_invoice(
                     normalized,
                     batch_id=batch_id,
@@ -2329,6 +2590,11 @@ def _process_segmented_invoice_groups(
                     support_document_url=support_link.url,
                     support_document_status=support_link.status,
                     support_document_dropbox_path=support_link.dropbox_path,
+                )
+                document_facts_created = any(
+                    isinstance((row.get("_meta") or {}).get("document_facts"), dict)
+                    for row in list(invoice.get("rows") or [])
+                    if isinstance(row, dict)
                 )
             invoices.append(invoice)
             if normalized.get("manual_review_reasons"):
@@ -2348,15 +2614,36 @@ def _process_segmented_invoice_groups(
                     message=f"Invoice on source page {source_page} needs operator review.",
                 ))
         except Exception as exc:
+            reason, safe_message = _safe_processing_failure(exc)
+            with ai_runtime_trace.operation(
+                batch_id=batch_id,
+                stage=f"segmented_processing_failure:{stable_group_index}",
+            ):
+                ai_runtime_trace.record_processing_stage_failure(
+                    processing_stage=processing_stage,
+                    exception_type=type(exc).__name__,
+                    failure_code=str(getattr(exc, "failure_code", "") or reason),
+                    document_facts_created=document_facts_created,
+                    reconciliation_completed=reconciliation_completed,
+                    provenance_attached=provenance_attached,
+                    persistence_attempted=persistence_attempted,
+                    final_disposition_written=final_disposition_written,
+                )
             if support_link_coordinator is not None:
                 support_link_coordinator.fail(stable_group_index)
-            reason, safe_message = _safe_processing_failure(exc)
-            _LOG.warning(
-                "Segmented AI invoice processing failed for %s page %s: %s",
-                source_file.name,
-                source_page,
-                exc,
-            )
+            if ai_provider.controlled_external_active():
+                _LOG.warning(
+                    "Controlled segmented processing failed at stage %s (%s).",
+                    processing_stage,
+                    type(exc).__name__,
+                )
+            else:
+                _LOG.warning(
+                    "Segmented AI invoice processing failed for %s page %s: %s",
+                    source_file.name,
+                    source_page,
+                    exc,
+                )
             if reason == "ai_processing_failed":
                 reason = "segmented_invoice_processing_failed"
                 safe_message = f"Invoice on source page {source_page} could not be processed."
@@ -2705,6 +2992,11 @@ def _extract_vision_with_reduced_retry(**kwargs: Any) -> dict[str, Any]:
     """
     refs = list(kwargs.get("page_images_or_refs") or [])
 
+    if ai_provider.controlled_external_active():
+        # Controlled Phase A has one initial Gemini call and no runtime fallback
+        # or repair retry. Supplementary calls use their own typed route.
+        return ai_provider.extract_invoice_vision_structured(**kwargs)
+
     def runtime_fallback(prior_error: ai_provider.AIProviderError) -> dict[str, Any]:
         status = ai_provider.provider_status()
         runtime_model = _clean(status.vision_model or status.model)
@@ -2755,6 +3047,12 @@ def _extract_vision_with_reduced_retry(**kwargs: Any) -> dict[str, Any]:
 def _extract_text_with_runtime_fallback(**kwargs: Any) -> dict[str, Any]:
     """Use the configured runtime text deployment after one routed-provider failure."""
 
+    if ai_provider.controlled_external_active():
+        raise ai_provider.AIProviderUnavailable(
+            "Controlled Phase A does not authorize text-provider extraction.",
+            failure_code="controlled_text_extraction_not_authorized",
+        )
+
     try:
         return ai_provider.extract_invoice_structured(**kwargs)
     except ai_provider.AIProviderError as primary_error:
@@ -2781,17 +3079,62 @@ def _extract_text_with_runtime_fallback(**kwargs: Any) -> dict[str, Any]:
 
 def _extract_fast_first_or_standard(**kwargs: Any) -> dict[str, Any]:
     """Run facts-only first only after both production safety gates approve it."""
+    page_numbers = list(kwargs.pop("_source_page_numbers", []) or [])
+    document_layout = dict(kwargs.pop("_document_candidate", {}) or {})
+    experiment_context = kwargs.get("experiment_context")
     if not fast_first_facts.production_enabled():
         return _extract_vision_with_reduced_retry(**kwargs)
-    facts = ai_provider.extract_invoice_facts_only_vision_structured(
+    facts_result = ai_provider.extract_invoice_facts_only_vision_structured(
         document_text=str(kwargs.get("document_text") or ""),
         page_images_or_refs=list(kwargs.get("page_images_or_refs") or []),
         model_override=str(kwargs.get("model_override") or ""),
         cost_scope_id=str(kwargs.get("cost_scope_id") or ""),
+        experiment_context=experiment_context,
     )
+    if isinstance(facts_result, InitialNormalizationOutcome):
+        if (
+            facts_result.category
+            is not InitialNormalizationCategory.SUPPLEMENTARY_REQUIRED
+            or facts_result.observation is None
+        ):
+            raise ai_provider.AIProviderInvalidSchema(
+                "The initial observation could not enter a safe supplementary route.",
+                failure_code=facts_result.failure_code or "visual_evidence_unavailable",
+            )
+        initial_payload = (
+            copy.deepcopy(facts_result.working_observation_payload)
+            if facts_result.working_observation_payload is not None
+            else facts_result.observation.to_supplementary_payload()
+        )
+        merged = _run_controlled_gemini_supplementary(
+            initial_facts=initial_payload,
+            escalation_reasons=["invoice_reconciliation_failed"],
+            page_images_or_refs=list(kwargs.get("page_images_or_refs") or []),
+            page_numbers=page_numbers,
+            document_layout=document_layout,
+            cost_scope_id=str(kwargs.get("cost_scope_id") or ""),
+            experiment_context=experiment_context,
+        )
+        final_outcome = ai_provider.normalize_gemini_supplementary_observation(
+            facts_result, merged,
+        )
+        if final_outcome.category is InitialNormalizationCategory.FACTS_READY:
+            return copy.deepcopy(final_outcome.facts_payload or {})
+        raise IntermediateObservationReviewRequired(final_outcome)
+    facts = facts_result
     reasons = fast_first_facts.escalation_reasons(facts)
     if not reasons:
         return facts
+    if ai_provider.controlled_external_active():
+        return _run_controlled_gemini_supplementary(
+            initial_facts=facts,
+            escalation_reasons=reasons,
+            page_images_or_refs=list(kwargs.get("page_images_or_refs") or []),
+            page_numbers=page_numbers,
+            document_layout=document_layout,
+            cost_scope_id=str(kwargs.get("cost_scope_id") or ""),
+            experiment_context=experiment_context,
+        )
     ai_runtime_trace.record_schema_result(
         "escalated", retry_reason=";".join(reasons)
     )
@@ -2801,6 +3144,331 @@ def _extract_fast_first_or_standard(**kwargs: Any) -> dict[str, Any]:
         *[f"fast_first_escalated:{reason}" for reason in reasons],
     ]))
     return full
+
+
+def _run_controlled_gemini_supplementary(
+    *, initial_facts: dict[str, Any], escalation_reasons: list[str],
+    page_images_or_refs: list[str], page_numbers: list[int], cost_scope_id: str,
+    document_layout: dict[str, Any] | None = None,
+    experiment_context: ExperimentProviderContext | None = None,
+) -> dict[str, Any]:
+    """Verify deterministic visual targets without inheriting normal routing."""
+
+    ai_runtime_trace.record_schema_result(
+        "escalated", retry_reason=";".join(escalation_reasons)[:160],
+    )
+    targets = gemini_supplementary_verification.select_supplementary_targets(
+        initial_facts, escalation_reasons,
+    )
+    if not targets:
+        result = copy.deepcopy(initial_facts)
+        result["warnings"] = list(dict.fromkeys([
+            *list(result.get("warnings") or []),
+            "controlled_supplementary_target_unavailable",
+        ]))
+        result["visual_extraction_status"] = "partial"
+        result["needs_manual_review"] = True
+        return result
+
+    limiter = gemini_supplementary_verification.SupplementaryRequestLimiter()
+    observations: list[tuple[
+        gemini_supplementary_verification.SupplementaryTarget,
+        gemini_supplementary_verification.GeminiSupplementaryObservation,
+    ]] = []
+    working = copy.deepcopy(initial_facts)
+    batch_id = ai_runtime_trace.current_context().batch_id or cost_scope_id
+    document_scope = current_document_scope()
+    opaque_document_id = (
+        document_scope.opaque_document_id if document_scope is not None
+        else hashlib.sha256(str(cost_scope_id or "offline-document").encode()).hexdigest()[:24]
+    )
+    page_images = supplementary_evidence_planner.page_image_mapping(
+        page_images_or_refs, page_numbers=page_numbers,
+    )
+    previous_plan: supplementary_evidence_planner.SupplementaryEvidencePlan | None = None
+    for target in targets:
+        plan: supplementary_evidence_planner.SupplementaryEvidencePlan | None = None
+        try:
+            plan = supplementary_evidence_planner.build_supplementary_evidence_plan(
+                opaque_document_id=opaque_document_id,
+                target=target,
+                initial_facts=working,
+                document_layout=document_layout or {},
+            )
+            packet = supplementary_evidence_planner.build_evidence_packet(
+                plan, page_images=page_images,
+            )
+            supplementary_evidence_planner.validate_evidence_packet(plan, packet)
+        except supplementary_evidence_planner.EvidenceLocalizationError as exc:
+            ai_runtime_trace.record_supplementary_evidence_plan(
+                target_category=target.target_type.value,
+                target_subtype=(plan.target_subtype.value if plan is not None else "unknown"),
+                outcome=(
+                    "packet_rejected_locally" if plan is not None
+                    else "plan_rejected_locally"
+                ),
+                crop_count=(len(plan.crops) if plan is not None else 0),
+                crop_roles=(
+                    [item.role.value for item in plan.crops] if plan is not None else []
+                ),
+                plan_id=(plan.plan_id if plan is not None else ""),
+                failure_code=exc.failure_code,
+            )
+            return _supplementary_localization_review_result(
+                working, failure_code=exc.failure_code,
+                target=target,
+            )
+        second_slot_reason = ""
+        if previous_plan is not None:
+            justification = supplementary_evidence_planner.second_plan_justification(
+                previous_plan, plan,
+            )
+            if not justification:
+                return _supplementary_localization_review_result(
+                    working,
+                    failure_code="supplementary_second_plan_not_justified",
+                    target=target,
+                )
+            second_slot_reason = justification
+            ai_runtime_trace.record_schema_result(
+                "supplementary_slot_2_justified", retry_reason=justification,
+            )
+        ai_runtime_trace.record_supplementary_evidence_plan(
+            target_category=target.target_type.value,
+            target_subtype=plan.target_subtype.value,
+            outcome="packet_validated",
+            crop_count=len(packet.images),
+            crop_roles=[item.role.value for item in packet.images],
+            combined_pixels=packet.combined_pixels,
+            plan_id=plan.plan_id,
+            second_slot_reason=second_slot_reason,
+        )
+        limiter.authorize(target)
+        provider, profile_id, model = (
+            ai_provider.controlled_gemini_supplementary_profile_identity(
+                target, experiment_context=experiment_context,
+            )
+        )
+        packet_refs = [image.data_url for image in packet.images]
+        media_bytes, media_pixels = ai_runtime_trace.media_stats(packet_refs)
+        before = gemini_supplementary_verification.reconciliation_snapshot(working)
+        stage = f"controlled_gemini_supplementary:{target.target_type.value}"
+        with ai_runtime_trace.operation(
+            batch_id=batch_id,
+            stage=stage,
+            provider=provider,
+            model=model,
+            profile_id=profile_id,
+            media_bytes=media_bytes,
+            media_pixels=media_pixels,
+        ):
+            try:
+                observation = ai_provider.extract_gemini_supplementary_facts_structured(
+                    initial_facts=initial_facts,
+                    target=target,
+                    evidence_plan=plan,
+                    evidence_packet=packet,
+                    cost_scope_id=cost_scope_id,
+                    experiment_context=experiment_context,
+                )
+            except ai_provider.AIProviderError as exc:
+                ai_runtime_trace.record_supplementary_verification(
+                    target_category=target.target_type.value,
+                    request_count=limiter.request_count,
+                    schema_valid=False,
+                    reconciliation_before=(
+                        "reconciled" if before["reconciled"] else "mismatch"
+                    ),
+                    reconciliation_after="not_computed",
+                    resolved=False,
+                    evidence_reference_count=0,
+                    failure_code=str(getattr(exc, "failure_code", "") or type(exc).__name__),
+                )
+                raise
+            observations.append((target, observation))
+            working = gemini_supplementary_verification.merge_supplementary_observations(
+                initial_facts, observations,
+            )
+            after = gemini_supplementary_verification.reconciliation_snapshot(working)
+            evidence_count = int(bool(
+                observation.evidence_reference
+                and (
+                    observation.evidence_reference.bbox
+                    or observation.evidence_reference.page_number
+                )
+            ))
+            ai_runtime_trace.record_supplementary_verification(
+                target_category=target.target_type.value,
+                request_count=limiter.request_count,
+                schema_valid=True,
+                reconciliation_before=(
+                    "reconciled" if before["reconciled"] else "mismatch"
+                ),
+                reconciliation_after=(
+                    "reconciled" if after["reconciled"] else "mismatch"
+                ),
+                resolved=bool(
+                    not observation.unresolved_flag
+                    and not observation.contradiction_flag
+                    and after["reconciled"]
+                ),
+                evidence_reference_count=evidence_count,
+            )
+        previous_plan = plan
+    return working
+
+
+def _supplementary_localization_review_result(
+    initial_facts: dict[str, Any], *, failure_code: str,
+    target: gemini_supplementary_verification.SupplementaryTarget,
+) -> dict[str, Any]:
+    """Fail closed before dispatch when no valid target packet can be built."""
+
+    code = "supplementary_evidence_localization_unavailable"
+    result = copy.deepcopy(initial_facts)
+    result["warnings"] = list(dict.fromkeys([*list(result.get("warnings") or []), code]))
+    result.setdefault("unresolved_visual_regions", []).append({
+        "page": target.page_number,
+        "field": target.field_name or target.target_type.value,
+        "bbox": None,
+        "reason": code,
+        "confidence": None,
+    })
+    result["visual_extraction_status"] = "partial"
+    result["needs_manual_review"] = True
+    result["supplementary_localization_failure_subtype"] = str(failure_code or "unknown")
+    result["accepted"] = False
+    result["export_allowed"] = False
+    return result
+
+
+def _controlled_visual_evidence_diagnostic(
+    payload: dict[str, Any], *, route: str, source_available: bool,
+) -> dict[str, Any]:
+    canonical: list[dict[str, Any]] = []
+    for item in payload.get("evidence") or []:
+        if isinstance(item, dict):
+            canonical.append(item)
+    for line_item in payload.get("line_items") or []:
+        if not isinstance(line_item, dict):
+            continue
+        canonical.extend(
+            item for item in line_item.get("evidence") or []
+            if isinstance(item, dict)
+        )
+
+    initial_count = 0
+    supplementary_count = 0
+    source_kinds: list[str] = []
+    missing: set[str] = set()
+    usable_count = 0
+    page_count = 0
+    bbox_count = 0
+    text_count = 0
+    for item in canonical:
+        method = str(item.get("extraction_method") or "").strip()
+        source_type = str(item.get("source_type") or "").strip()
+        supplementary = (
+            method == "gemini_supplementary_verification"
+            or source_type == "supplementary_visual_observation"
+        )
+        if supplementary:
+            supplementary_count += 1
+            source_kinds.append("gemini_supplementary_verification")
+        else:
+            initial_count += 1
+            source_kinds.append(
+                "gemini_facts_transport"
+                if method == "gemini_facts_transport" else "other"
+            )
+        if not source_type:
+            missing.add("source_type")
+        if not method:
+            missing.add("extraction_method")
+        page_present = item.get("page") is not None
+        bbox_present = isinstance(item.get("bbox"), list) and bool(item.get("bbox"))
+        text_present = bool(str(item.get("text") or "").strip())
+        page_count += int(page_present)
+        bbox_count += int(bbox_present)
+        text_count += int(text_present)
+        if not (page_present or bbox_present or text_present):
+            missing.add("visual_anchor")
+        elif source_type and method:
+            usable_count += 1
+
+    revisions = [
+        item for item in payload.get("supplementary_evidence_revisions") or []
+        if isinstance(item, dict)
+    ]
+    evidence_reference_count = 0
+    for revision in revisions:
+        observation = revision.get("observation")
+        if not isinstance(observation, dict):
+            continue
+        reference = observation.get("evidence_reference")
+        if not isinstance(reference, dict):
+            continue
+        evidence_reference_count += 1
+        page_count += int(reference.get("page_number") is not None)
+        bbox_count += int(
+            isinstance(reference.get("bbox"), list) and bool(reference.get("bbox"))
+        )
+
+    if not canonical:
+        missing.add("canonical_evidence")
+    valid = bool(source_available and usable_count)
+    if not source_available:
+        raise_branch = f"{route}_visual_source_absent"
+    elif not valid:
+        raise_branch = f"{route}_visual_payload_insufficient"
+    else:
+        raise_branch = "not_raised"
+    return {
+        "evidence_object_count": len(canonical),
+        "initial_evidence_count": initial_count,
+        "supplementary_evidence_count": supplementary_count,
+        "evidence_reference_count": evidence_reference_count,
+        "page_reference_count": page_count,
+        "bounding_region_present_count": bbox_count,
+        "observed_text_present_count": text_count,
+        "source_kind_categories": source_kinds,
+        "missing_required_evidence_fields": sorted(missing),
+        "merge_stage_outcome": (
+            "supplementary_merged" if revisions
+            else "initial_only" if canonical else "not_available"
+        ),
+        "evidence_validation_outcome": (
+            "valid" if valid else "missing_required_evidence"
+        ),
+        "raise_branch": raise_branch,
+    }
+
+
+def _require_controlled_visual_evidence(
+    payload: dict[str, Any], *, route: str, source_available: bool,
+) -> None:
+    diagnostic = _controlled_visual_evidence_diagnostic(
+        payload, route=route, source_available=source_available,
+    )
+    ai_runtime_trace.record_visual_evidence_contract(**diagnostic)
+    if diagnostic["evidence_validation_outcome"] != "valid":
+        raise ai_provider.AIProviderUnavailable(
+            "Controlled Phase A requires canonical visual evidence.",
+            failure_code="visual_evidence_unavailable",
+        )
+
+
+def _supplementary_page_refs(
+    refs: list[str], *, page_numbers: list[int], target_page: int | None,
+) -> list[str]:
+    """Select a bounded source-page/full-detail pair without rerendering."""
+
+    if len(refs) <= 2 or not page_numbers or target_page not in page_numbers:
+        return list(refs[:2])
+    page_index = page_numbers.index(target_page)
+    per_page = max(1, len(refs) // len(page_numbers))
+    start = page_index * per_page
+    return list(refs[start:start + min(2, per_page)]) or list(refs[:2])
 
 
 def _safe_vision_failure_warning(exc: ai_provider.AIProviderError) -> str:
@@ -2813,6 +3481,19 @@ def _safe_vision_failure_warning(exc: ai_provider.AIProviderError) -> str:
 def _safe_processing_failure(exc: Exception) -> tuple[str, str]:
     """Return an auditable failure code without provider response bodies."""
     if not isinstance(exc, ai_provider.AIProviderError):
+        if ai_provider.controlled_external_active():
+            return (
+                "controlled_local_execution_error",
+                "Controlled local processing failed before provider dispatch completed.",
+            )
+        if str(os.environ.get("INNER_VIEW_LOCAL_INFERENCE_ONLY") or "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            safe_type = re.sub(r"[^a-z0-9]+", "_", type(exc).__name__.casefold()).strip("_")
+            return (
+                f"local_processing_{safe_type or 'error'}",
+                "Local document processing failed before a usable extraction was produced.",
+            )
         return "ai_processing_failed", "AI invoice processing failed. Review this file manually."
     if (
         isinstance(exc, ai_provider.AIProviderInvalidJSON)
@@ -4024,6 +4705,10 @@ def validate_ai_extraction(
             "reason": _clean(item.get("reason")),
             "aggregate_fallback": aggregate_fallback,
             "row_identity_evidence": dict(item.get("row_identity_evidence") or {}),
+            "transport_evidence": [
+                dict(evidence) for evidence in (item.get("evidence") or [])
+                if isinstance(evidence, dict)
+            ],
         })
         if aggregate_fallback:
             add_issue(
@@ -4173,7 +4858,93 @@ def validate_ai_extraction(
         )
 
     typed_warning_evidence: list[dict[str, Any]] = []
+    supplementary_revisions = [
+        item
+        for item in payload.get("supplementary_evidence_revisions") or []
+        if isinstance(item, dict)
+    ]
+    supplementary_reconciliation = payload.get("supplementary_reconciliation")
+    supplementary_observation_contradiction = any(
+        isinstance(revision.get("observation"), dict)
+        and revision["observation"].get("contradiction_flag") is True
+        for revision in supplementary_revisions
+    )
+    supplementary_observation_unresolved = any(
+        isinstance(revision.get("observation"), dict)
+        and (
+            revision["observation"].get("unresolved_flag") is True
+            or revision["observation"].get("contradiction_flag") is True
+        )
+        for revision in supplementary_revisions
+    )
+    supplementary_localization_unavailable = (
+        "supplementary_evidence_localization_unavailable" in warnings
+    )
+    if supplementary_localization_unavailable:
+        add_issue(
+            "supplementary_evidence_localization_unavailable",
+            "The required visual evidence region could not be localized into a valid bounded packet. Operator review is required.",
+            "high",
+        )
+    if (
+        not supplementary_localization_unavailable
+        and supplementary_revisions
+        and (
+            supplementary_observation_unresolved
+            or (
+                isinstance(supplementary_reconciliation, dict)
+                and supplementary_reconciliation.get("resolved") is False
+            )
+        )
+    ):
+        # The supplementary contract already owns this canonical reason.  Keep
+        # the provider's observations immutable and expose only their typed
+        # unresolved outcome to downstream review/disposition reporting.
+        if supplementary_observation_contradiction:
+            add_issue(
+                "supplementary_visual_evidence_contradiction",
+                "Targeted supplementary visual evidence contradicts another observation. Operator review is required.",
+                "high",
+            )
+        else:
+            add_issue(
+                "supplementary_visual_evidence_unresolved",
+                "Targeted supplementary visual verification did not resolve the disputed evidence. Operator review is required.",
+                "high",
+            )
+    handled_canonical_warnings = {
+        "supplementary_evidence_localization_unavailable",
+        "supplementary_request_limit_reached",
+        "supplementary_visual_evidence_contradiction",
+        "supplementary_visual_evidence_unresolved",
+        "visual_evidence_unavailable",
+    }
+    for canonical_warning in (
+        "supplementary_request_limit_reached",
+        "visual_evidence_unavailable",
+    ):
+        if canonical_warning in warnings:
+            add_issue(
+                canonical_warning,
+                "The controlled visual evidence budget could not resolve this field. Operator review is required.",
+                "high",
+            )
+    if not supplementary_localization_unavailable:
+        if "supplementary_visual_evidence_contradiction" in warnings:
+            add_issue(
+                "supplementary_visual_evidence_contradiction",
+                "Targeted supplementary visual evidence contradicts another observation. Operator review is required.",
+                "high",
+            )
+        elif "supplementary_visual_evidence_unresolved" in warnings:
+            add_issue(
+                "supplementary_visual_evidence_unresolved",
+                "Targeted supplementary visual verification did not resolve the disputed evidence. Operator review is required.",
+                "high",
+            )
     for warning in warnings:
+        if warning in handled_canonical_warnings:
+            continue
         warning_lower = warning.lower()
         if (
             total_reconciliation_passed
@@ -4321,6 +5092,15 @@ def validate_ai_extraction(
         ),
     )))
 
+    reconciliation_input = dict(payload)
+    reconciliation_input["validation_summary"] = {
+        "total_reconciliation_passed": total_reconciliation_passed,
+    }
+    reconciliation_observation = observe_reconciliation(
+        reconciliation_input, facts_exist=True,
+    )
+    reconciliation_fields = reconciliation_observation.model_dump(mode="json")
+
     result = {
         "vendor_name": vendor_for_rows,
         "raw_vendor_name": vendor_name,
@@ -4357,6 +5137,41 @@ def validate_ai_extraction(
         "property_match": property_match,
         "property_identity_evidence": property_identity,
         "invoice_description": _clean(payload.get("invoice_description")),
+        "transport_evidence": [
+            dict(evidence) for evidence in (payload.get("evidence") or [])
+            if isinstance(evidence, dict)
+        ],
+        "observed_date_candidates": list(payload.get("observed_date_candidates") or []),
+        "transport_schema_version": _clean(payload.get("transport_schema_version")),
+        "transport_prompt_version": _clean(payload.get("transport_prompt_version")),
+        "reconciliation_observation": reconciliation_fields,
+        "reconciliation_state": reconciliation_observation.state.value,
+        "reconciliation_ran": reconciliation_observation.reconciliation_ran,
+        "reconciliation_status": reconciliation_observation.reconciliation_status.value,
+        "reconciliation_source_stage": (
+            reconciliation_observation.reconciliation_source_stage
+        ),
+        "reconciliation_before": (
+            reconciliation_observation.reconciliation_before.value
+            if reconciliation_observation.reconciliation_before else None
+        ),
+        "reconciliation_after": (
+            reconciliation_observation.reconciliation_after.value
+            if reconciliation_observation.reconciliation_after else None
+        ),
+        "reconciliation_delta_before": (
+            str(reconciliation_observation.reconciliation_delta_before)
+            if reconciliation_observation.reconciliation_delta_before is not None
+            else None
+        ),
+        "reconciliation_delta_after": (
+            str(reconciliation_observation.reconciliation_delta_after)
+            if reconciliation_observation.reconciliation_delta_after is not None
+            else None
+        ),
+        "supplementary_visual_status": (
+            reconciliation_observation.supplementary_visual_status.value
+        ),
         "_document_text": document_text,
         "composed_invoice_description": "",
         "line_items": normalized_items,
@@ -4395,6 +5210,34 @@ def validate_ai_extraction(
             "line_item_count": len(normalized_items),
             "dates_valid": dates_valid,
             "total_reconciliation_passed": total_reconciliation_passed,
+            "reconciliation_observation": reconciliation_fields,
+            "reconciliation_state": reconciliation_observation.state.value,
+            "reconciliation_ran": reconciliation_observation.reconciliation_ran,
+            "reconciliation_status": reconciliation_observation.reconciliation_status.value,
+            "reconciliation_source_stage": (
+                reconciliation_observation.reconciliation_source_stage
+            ),
+            "reconciliation_before": (
+                reconciliation_observation.reconciliation_before.value
+                if reconciliation_observation.reconciliation_before else None
+            ),
+            "reconciliation_after": (
+                reconciliation_observation.reconciliation_after.value
+                if reconciliation_observation.reconciliation_after else None
+            ),
+            "reconciliation_delta_before": (
+                str(reconciliation_observation.reconciliation_delta_before)
+                if reconciliation_observation.reconciliation_delta_before is not None
+                else None
+            ),
+            "reconciliation_delta_after": (
+                str(reconciliation_observation.reconciliation_delta_after)
+                if reconciliation_observation.reconciliation_delta_after is not None
+                else None
+            ),
+            "supplementary_visual_status": (
+                reconciliation_observation.supplementary_visual_status.value
+            ),
             "reconciled_total": reconciled_total,
             "invoice_total": total_amount,
             "confidence": confidence,
@@ -6846,6 +7689,33 @@ def ai_result_to_invoice(
                 "ai_line_section_header": item.get("section_header"),
                 "ai_line_row_label": item.get("row_label"),
                 "ai_row_identity_evidence": item.get("row_identity_evidence") or {},
+                "ai_transport_evidence": item.get("transport_evidence") or [],
+                "ai_document_transport_evidence": normalized.get("transport_evidence") or [],
+                "ai_observed_date_candidates": normalized.get("observed_date_candidates") or [],
+                "ai_transport_schema_version": normalized.get("transport_schema_version"),
+                "ai_transport_prompt_version": normalized.get("transport_prompt_version"),
+                "ai_initial_observation_revision": normalized.get(
+                    "initial_observation_revision"
+                ),
+                "ai_supplementary_evidence_revisions": normalized.get(
+                    "supplementary_evidence_revisions"
+                ) or [],
+                "ai_observation_line_item_revisions": normalized.get(
+                    "observation_line_item_revisions"
+                ) or {},
+                "ai_reconciliation_observation": normalized.get(
+                    "reconciliation_observation"
+                ) or {},
+                "ai_reconciliation_state": normalized.get("reconciliation_state"),
+                "ai_reconciliation_delta_before": normalized.get(
+                    "reconciliation_delta_before"
+                ),
+                "ai_reconciliation_delta_after": normalized.get(
+                    "reconciliation_delta_after"
+                ),
+                "ai_supplementary_visual_status": normalized.get(
+                    "supplementary_visual_status"
+                ),
                 "row_identity_needs_confirmation": bool(
                     normalized.get("row_identity_needs_confirmation")
                 ),
@@ -7231,6 +8101,135 @@ def _payload(
         "unsupported_files": unsupported,
         "duplicate_source_aliases": duplicate_source_aliases,
     }
+
+
+def _intermediate_observation_review_item(
+    *, source_file: str, vendor_name: str,
+    outcome: InitialNormalizationOutcome,
+) -> dict[str, Any]:
+    observation = outcome.observation
+    if observation is None:
+        raise ValueError("intermediate_review_requires_observation")
+    working = copy.deepcopy(outcome.working_observation_payload or {})
+    revisions = [
+        copy.deepcopy(item)
+        for item in working.get("supplementary_evidence_revisions") or []
+        if isinstance(item, dict)
+    ]
+    supplementary_observations = [
+        item.get("observation") for item in revisions
+        if isinstance(item.get("observation"), dict)
+    ]
+    warnings = {
+        str(item or "").strip() for item in working.get("warnings") or []
+        if str(item or "").strip()
+    }
+    localization_unavailable = (
+        outcome.failure_code == "supplementary_evidence_localization_unavailable"
+        or "supplementary_evidence_localization_unavailable" in warnings
+    )
+    contradiction = any(
+        item.get("contradiction_flag") is True
+        for item in supplementary_observations
+    )
+    limit_reached = "supplementary_request_limit_reached" in warnings
+    if contradiction:
+        supplementary_status = SupplementaryVisualStatus.CONTRADICTION
+    elif limit_reached:
+        supplementary_status = SupplementaryVisualStatus.REQUEST_LIMIT_REACHED
+    else:
+        supplementary_status = SupplementaryVisualStatus.UNRESOLVED
+
+    reason_codes: list[str] = []
+    if localization_unavailable:
+        reason_codes.append("supplementary_evidence_localization_unavailable")
+    if limit_reached:
+        reason_codes.append("supplementary_request_limit_reached")
+    if contradiction:
+        reason_codes.append("supplementary_visual_evidence_contradiction")
+    if not reason_codes:
+        reason_codes.append("supplementary_visual_evidence_unresolved")
+
+    delta_before = working.get("reconciliation_delta_before")
+    if delta_before is None:
+        delta_before = (
+            str(observation.deterministic_reconciliation_delta)
+            if observation.deterministic_reconciliation_delta is not None
+            else None
+        )
+    delta_after = working.get("reconciliation_delta_after")
+    reconciliation_state = ReconciliationState.RAN_UNRECONCILED
+    reconciliation_status = ReconciliationStatus.UNRECONCILED
+    if delta_after is None:
+        reconciliation_state = ReconciliationState.RAN_INCONCLUSIVE
+        reconciliation_status = ReconciliationStatus.INCONCLUSIVE
+    typed = ReconciliationObservation(
+        state=reconciliation_state,
+        reconciliation_ran=True,
+        reconciliation_status=reconciliation_status,
+        reconciliation_source_stage="supplementary_visual_verification",
+        reconciliation_before=ReconciliationStatus.UNRECONCILED,
+        reconciliation_after=reconciliation_status,
+        reconciliation_delta_before=_decimal_or_none(delta_before),
+        reconciliation_delta_after=_decimal_or_none(delta_after),
+        supplementary_visual_status=supplementary_status,
+    )
+    provenance_exists = bool(
+        observation.evidence
+        or any(item.evidence for item in observation.line_items)
+        or any(item.paid_marker_evidence for item in observation.excluded_paid_rows)
+    )
+    review = _manual_review_item(
+        source_file=source_file,
+        vendor_name=vendor_name,
+        account_number=observation.header.account_number or "",
+        invoice_number=observation.header.invoice_number or "",
+        invoice_date=observation.header.invoice_date or "",
+        property_abbreviation=observation.header.property_abbreviation or "",
+        location=observation.header.location_candidate or "",
+        service_address=observation.header.service_address or "",
+        total_amount=float(observation.financial_candidates.total_amount or 0),
+        line_count=len(observation.line_items),
+        reasons=reason_codes,
+        reason_codes=reason_codes,
+        message=(
+            "The required visual evidence region could not be localized into a valid "
+            "bounded packet. Review the preserved initial evidence before further processing."
+            if localization_unavailable else
+            "Observed invoice components remain unreconciled after bounded visual "
+            "verification. Review the preserved evidence before further processing."
+        ),
+    )
+    review.update({
+        "normalization_outcome": InitialNormalizationCategory.SUPPLEMENTARY_REQUIRED.value,
+        "intermediate_observation_exists": True,
+        "intermediate_observation": observation.model_dump(mode="json"),
+        "initial_observation_revision": copy.deepcopy(
+            working.get("initial_observation_revision")
+            or observation.model_dump(mode="json")
+        ),
+        "supplementary_evidence_revisions": revisions,
+        "observation_line_item_revisions": copy.deepcopy(
+            working.get("observation_line_item_revisions") or {}
+        ),
+        "eligible_supplementary_targets": [
+            item.value for item in observation.eligible_supplementary_targets
+        ],
+        "provenance_exists": provenance_exists,
+        "reconciliation_observation": typed.model_dump(mode="json"),
+        "reconciliation_state": typed.state.value,
+        "reconciliation_ran": typed.reconciliation_ran,
+        "reconciliation_status": typed.reconciliation_status.value,
+        "reconciliation_source_stage": typed.reconciliation_source_stage,
+        "reconciliation_before": typed.reconciliation_before.value,
+        "reconciliation_after": typed.reconciliation_after.value,
+        "reconciliation_delta_before": delta_before,
+        "reconciliation_delta_after": delta_after,
+        "supplementary_visual_status": typed.supplementary_visual_status.value,
+        "accepted": False,
+        "export_allowed": False,
+    })
+    return review
 
 
 def _manual_review_item(

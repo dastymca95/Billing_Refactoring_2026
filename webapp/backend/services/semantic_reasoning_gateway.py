@@ -21,6 +21,7 @@ from .canonical_semantics import (
 )
 from .gl_catalog import load_gl_catalog
 from .provider_capabilities import ModelProfileRole, ProfileLoader
+from .controlled_external_experiment import controlled_external_active
 
 
 SEMANTIC_REASONING_VERSION = "semantic-context-reasoning/1.2"
@@ -72,6 +73,14 @@ def enrich_unknown_semantics(*, facts: LineItemFacts, semantics: SemanticClassif
                              force_no_safe_decision: bool = False,
                              tenant_id: str | None = None) -> SemanticReasoningResult:
     """Escalate only unresolved semantics and fail closed to the original result."""
+    if controlled_external_active():
+        return _controlled_local_result(
+            facts=facts,
+            semantics=semantics,
+            document_id=document_id,
+            allowed_candidate_gl_codes=None,
+            force_replace=force_no_safe_decision,
+        )
     if not _enabled() or (not force_no_safe_decision and not _needs_escalation(semantics)):
         return SemanticReasoningResult(semantics=semantics, trace={"route": "deterministic", "called": False})
     profile = next((item for item in ProfileLoader().load()
@@ -139,6 +148,16 @@ def enrich_invoice_semantics(
     """
     if not lines:
         return {}
+    if controlled_external_active():
+        return {
+            item.facts.line_item_id: _controlled_local_result(
+                facts=item.facts,
+                semantics=item.semantics,
+                document_id=document_id,
+                allowed_candidate_gl_codes=item.candidate_gl_codes,
+            )
+            for item in lines
+        }
     if not _enabled():
         return _manual_results(lines, "semantic_reasoning_disabled")
     profile = _select_accounting_profile()
@@ -197,7 +216,10 @@ def enrich_invoice_semantics(
     started = time.perf_counter()
     try:
         envelope = (_group_from_canonical_cache(cached, concepts, request_lines) if cached
-                    else _request_invoice_group(profile, request_lines, context, catalog))
+                    else _request_invoice_group(
+                        profile, request_lines, context, catalog,
+                        estimated_cost_usd=estimated_cost,
+                    ))
         if not cached and cache_path:
             _write_cache(cache_path, {
                 "cache_contract": "canonical-semantic-candidates/1.0",
@@ -253,7 +275,8 @@ def enrich_invoice_semantics(
 
 
 def _request_invoice_group(profile, request_lines: list[dict[str, Any]],
-                           context: str, catalog: dict) -> InvoiceSemanticProposalEnvelope:
+                           context: str, catalog: dict, *,
+                           estimated_cost_usd: float | None = None) -> InvoiceSemanticProposalEnvelope:
     allowed_codes = sorted({code for line in request_lines
                             for code in line["allowed_candidate_gl_codes"]})
     accounts = [{"gl_code": code, "name": catalog[code].gl_name,
@@ -303,6 +326,10 @@ def _request_invoice_group(profile, request_lines: list[dict[str, Any]],
             ).strip() or "medium"
     max_tokens = min(4000, max(800, 300 + len(request_lines) * 220))
     payload.update(ai_provider._completion_controls(profile.provider, max_tokens))
+    if estimated_cost_usd is None:
+        estimated_cost_usd = _estimate_profile_cost(
+            profile, payload, len(request_lines)
+        )
     ai_runtime_trace.update_context(
         stage="accounting_semantic_reasoning",
         provider=profile.provider,
@@ -310,6 +337,10 @@ def _request_invoice_group(profile, request_lines: list[dict[str, Any]],
         profile_id=profile.profile_id,
         media_bytes=0,
         media_pixels=0,
+        estimated_cost_usd=estimated_cost_usd,
+        input_cost_usd_per_million=float(profile.input_cost_usd_per_million or 0.0),
+        output_cost_usd_per_million=float(profile.output_cost_usd_per_million or 0.0),
+        fixed_request_cost_usd=0.0,
     )
     content = ai_provider._send_chat_completion(
         provider=profile.provider, payload=payload,
@@ -444,6 +475,107 @@ def _request(profile, source: str, context: str, facts: LineItemFacts, catalog: 
         base_url_override=profile.base_url, timeout_seconds_override=profile.timeout_seconds,
         max_attempts_override=profile.max_retries + 1)
     return SemanticReasoningProposal(**ai_provider._extract_json_object(content))
+
+
+def _controlled_local_result(
+    *,
+    facts: LineItemFacts,
+    semantics: SemanticClassification,
+    document_id: str,
+    allowed_candidate_gl_codes: list[str] | None,
+    force_replace: bool = False,
+) -> SemanticReasoningResult:
+    """Build candidate-only semantics without selecting or contacting a provider."""
+
+    _, catalog = load_gl_catalog()
+    source = _source_text(facts)
+    concept = resolve_canonical_concept(
+        source,
+        line_family=semantics.line_family,
+        trade_family=semantics.trade_family,
+        work_mode=semantics.work_mode,
+    )
+    quote = ""
+    if concept.matched_phrase and concept.matched_phrase.casefold() in source.casefold():
+        start = source.casefold().index(concept.matched_phrase.casefold())
+        quote = source[start:start + len(concept.matched_phrase)]
+    updates: dict[str, Any] = {}
+    if concept.concept_id:
+        if force_replace or semantics.line_family == "unknown":
+            updates["line_family"] = concept.line_family
+        if force_replace or semantics.trade_family == "unknown":
+            updates["trade_family"] = concept.trade_family
+        if force_replace or semantics.work_mode == "unknown":
+            updates["work_mode"] = concept.work_mode
+        if quote:
+            updates["positive_evidence"] = list(semantics.positive_evidence) + [
+                EvidenceReference(
+                    document_id=document_id,
+                    text=quote,
+                    source_type="document_fact",
+                    extraction_method="controlled-local-canonical-semantics/1.0",
+                    confidence=1.0,
+                )
+            ]
+    resolved = semantics.model_copy(update=updates) if updates else semantics
+    allowed = (
+        [str(code) for code in dict.fromkeys(allowed_candidate_gl_codes)]
+        if allowed_candidate_gl_codes is not None
+        else list(catalog)
+    )
+    candidates: list[GLCandidate] = []
+    for code in allowed:
+        account = catalog.get(code)
+        if not account or not account.payable:
+            continue
+        trade_match = (
+            resolved.trade_family != "unknown"
+            and (
+                resolved.trade_family in account.trade_families
+                or resolved.trade_family == account.gl_family
+            )
+        )
+        family_match = (
+            resolved.line_family != "unknown"
+            and resolved.line_family == account.gl_family
+        )
+        mode_match = (
+            resolved.work_mode != "unknown"
+            and resolved.work_mode in account.compatible_work_modes
+        )
+        incompatible = resolved.work_mode in account.incompatible_work_modes
+        if incompatible or not (trade_match or family_match or mode_match):
+            continue
+        candidates.append(GLCandidate(
+            gl_code=code,
+            gl_name=account.gl_name,
+            source="local_canonical_semantic_candidate",
+            source_id="controlled-local-canonical-semantics/1.0",
+            base_score=0.45,
+            positive_evidence=[{
+                "canonical_concept": concept.concept_id,
+                "trade_match": trade_match,
+                "family_match": family_match,
+                "work_mode_match": mode_match,
+            }],
+            rule_version="controlled-local-canonical-semantics/1.0",
+        ))
+    candidates.sort(key=lambda item: item.gl_code)
+    return SemanticReasoningResult(
+        semantics=resolved,
+        candidates=candidates[:8],
+        trace={
+            "route": "controlled_local_semantics",
+            "called": False,
+            "provider": "local",
+            "profile_id": None,
+            "model_id": None,
+            "estimated_cost_usd": 0.0,
+            "canonical_concept": concept.concept_id,
+            "version": "controlled-local-canonical-semantics/1.0",
+            "authority": "candidate_only",
+        },
+    )
 
 
 def _validate_and_adapt(proposal: SemanticReasoningProposal, original: SemanticClassification,

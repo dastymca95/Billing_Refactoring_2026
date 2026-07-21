@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, SecretStr
 
 from . import ai_provider
 from .model_registry import ModelRegistry, ModelRole, ModelSpec
+from .local_inference_guard import LOCAL_PROVIDER_NAMES, local_inference_only
 
 
 class ModelCapability(str, Enum):
@@ -121,6 +122,8 @@ class ProfileLoader:
 
     @staticmethod
     def _environment_profiles() -> list[ModelProfile]:
+        if local_inference_only():
+            return _local_environment_profiles()
         provider = os.environ.get("AI_PROVIDER", "").strip().lower()
         key = os.environ.get("AI_API_KEY", "").strip()
         base = os.environ.get("AI_BASE_URL", "").strip()
@@ -216,7 +219,8 @@ class ProviderCapabilityValidator:
         reasons = []
         evidence: list[CapabilityProbeEvidence] = []
         if not profile.enabled: reasons.append("profile_disabled")
-        if not profile.credentials_present: reasons.append("credentials_missing")
+        if not profile.credentials_present and profile.provider not in LOCAL_PROVIDER_NAMES:
+            reasons.append("credentials_missing")
         if profile.provider != "openai" and not profile.base_url_configured: reasons.append("endpoint_missing")
         if reasons:
             return ModelProfileCapabilityReport(provider=profile.provider, profile_id=profile.profile_id,
@@ -503,6 +507,89 @@ def _provider_family_profiles() -> list[ModelProfile]:
                              else _float_env(f"{prefix}_OUTPUT_COST_USD_PER_MILLION")),
                 **common,
             ))
+    return profiles
+
+
+def _local_environment_profiles() -> list[ModelProfile]:
+    """Load loopback profiles only; remote environment profiles are ignored."""
+
+    model = os.environ.get("LOCAL_MULTIMODAL_MODEL", "").strip()
+    if not model:
+        return []
+    evaluation_profile_id = os.environ.get(
+        "LOCAL_MULTIMODAL_PROFILE_ID", "",
+    ).strip()
+    base_url = os.environ.get(
+        "LOCAL_MULTIMODAL_BASE_URL", "http://127.0.0.1:11434",
+    ).strip()
+    timeout = _int_env("LOCAL_MULTIMODAL_TIMEOUT_SECONDS", 180)
+    common = {
+        "provider": "local_ollama",
+        "model_id": model,
+        "api_key": "",
+        "base_url": base_url,
+        "timeout": timeout,
+        "model_family": os.environ.get(
+            "LOCAL_MULTIMODAL_MODEL_FAMILY", "qwen3-vl",
+        ).strip(),
+        "input_cost": 0.0,
+        "output_cost": 0.0,
+        "routing_priority": 0,
+    }
+    specs = [
+        (
+            (
+                f"{evaluation_profile_id}-text"
+                if evaluation_profile_id else "local-text"
+            ),
+            ModelProfileRole.TEXT_EXTRACTION,
+            [ModelCapability.TEXT_EXTRACTION, ModelCapability.STRUCTURED_OUTPUT,
+             ModelCapability.LONG_DOCUMENT_PROCESSING], False,
+        ),
+        (
+            evaluation_profile_id or "local-vision",
+            ModelProfileRole.MULTIMODAL_EXTRACTION,
+            [ModelCapability.TEXT_EXTRACTION,
+             ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
+             ModelCapability.HANDWRITING_INTERPRETATION,
+             ModelCapability.STRUCTURED_OUTPUT], True,
+        ),
+        (
+            (
+                f"{evaluation_profile_id}-verification"
+                if evaluation_profile_id else "local-verification"
+            ),
+            ModelProfileRole.INDEPENDENT_VERIFICATION,
+            [ModelCapability.INDEPENDENT_VERIFICATION,
+             ModelCapability.VISUAL_DOCUMENT_UNDERSTANDING,
+             ModelCapability.STRUCTURED_OUTPUT], True,
+        ),
+        (
+            (
+                f"{evaluation_profile_id}-accounting"
+                if evaluation_profile_id else "local-accounting"
+            ),
+            ModelProfileRole.ACCOUNTING_REASONING,
+            [ModelCapability.ACCOUNTING_REASONING,
+             ModelCapability.STRUCTURED_OUTPUT], False,
+        ),
+    ]
+    profiles = [
+        _environment_profile(
+            profile_id=profile_id,
+            role=role,
+            capabilities=capabilities,
+            vision=vision,
+            **common,
+        )
+        for profile_id, role, capabilities, vision in specs
+    ]
+    # Ollama's loopback API has no credential. Marking this as present means
+    # "no credential required", not that a secret exists.
+    for profile in profiles:
+        profile.credentials_present = True
+        profile.base_url_configured = True
+    _record_verification_independence(profiles)
     return profiles
 
 

@@ -21,7 +21,7 @@ from webapp.backend.services.ai_invoice_processor import (
 from webapp.backend.services.document_ingestion import DocumentCandidate
 
 
-def _vision_status() -> AIProviderStatus:
+def _vision_status(_context=None) -> AIProviderStatus:
     return AIProviderStatus(
         enabled=True,
         provider="openai",

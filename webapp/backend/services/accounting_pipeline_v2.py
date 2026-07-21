@@ -89,6 +89,25 @@ def decide_row(row: dict[str, Any], *, document_id: str, line_item_id: str, extr
             text=raw_section_header, normalized_text=raw_section_header,
             source_type="line_section_header", extraction_method=extraction_route,
         ))
+    for observed in meta.get("ai_transport_evidence") or []:
+        if not isinstance(observed, dict):
+            continue
+        try:
+            evidence.append(EvidenceReference(
+                document_id=document_id,
+                page=_int(observed.get("page")),
+                text=_text(observed.get("text")) or None,
+                normalized_text=None,
+                bbox=observed.get("bbox") if isinstance(observed.get("bbox"), list) else None,
+                source_type=_text(observed.get("source_type")) or "document_observation",
+                extraction_method="gemini_facts_transport",
+                confidence=(
+                    float(observed.get("confidence"))
+                    if observed.get("confidence") is not None else None
+                ),
+            ))
+        except (TypeError, ValueError):
+            continue
     facts_line = LineItemFacts(line_item_id=line_item_id, raw_activity=raw_activity or None,
         raw_description=raw_description or None, normalized_activity=raw_activity or None,
         normalized_description=normalized_description or None, generated_description=generated_description or None,
@@ -103,6 +122,25 @@ def decide_row(row: dict[str, Any], *, document_id: str, line_item_id: str, extr
         extraction_method="filename_folder_parser_non_authoritative",
         confidence=float(candidate.get("confidence") or 0),
     ) for candidate in metadata.get("candidates") or [] if isinstance(candidate, dict)]
+    for observed in meta.get("ai_document_transport_evidence") or []:
+        if not isinstance(observed, dict):
+            continue
+        try:
+            metadata_evidence.append(EvidenceReference(
+                document_id=document_id,
+                page=_int(observed.get("page")),
+                text=_text(observed.get("text")) or None,
+                normalized_text=None,
+                bbox=observed.get("bbox") if isinstance(observed.get("bbox"), list) else None,
+                source_type=_text(observed.get("source_type")) or "document_observation",
+                extraction_method="gemini_facts_transport",
+                confidence=(
+                    float(observed.get("confidence"))
+                    if observed.get("confidence") is not None else None
+                ),
+            ))
+        except (TypeError, ValueError):
+            continue
     facts = DocumentFacts(document_id=document_id, invoice_id=_text(row.get("Invoice Number")) or line_item_id,
         vendor_candidate=_text(row.get("Vendor")) or None, invoice_number=_text(row.get("Invoice Number")) or None,
         invoice_date=_date(row.get("Invoice Date")), due_date=_date(row.get("Due Date")),

@@ -46,7 +46,7 @@ def test_invalid_economy_vision_result_escalates_to_configured_runtime_model(mon
     monkeypatch.setattr(
         ai_provider,
         "provider_status",
-        lambda: ai_provider.AIProviderStatus(
+        lambda _context=None: ai_provider.AIProviderStatus(
             enabled=True,
             provider="openai",
             model="configured-text",

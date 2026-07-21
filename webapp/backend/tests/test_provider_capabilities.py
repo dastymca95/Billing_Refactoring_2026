@@ -7,7 +7,10 @@ from webapp.backend.services.provider_capabilities import (
 
 
 def _clear_provider_environment(monkeypatch):
-    prefixes = ("AI_", "GEMINI_", "DEEPSEEK_", "ANTHROPIC_")
+    prefixes = (
+        "AI_", "GEMINI_", "DEEPSEEK_", "ANTHROPIC_",
+        "INNER_VIEW_LOCAL_INFERENCE_", "LOCAL_MULTIMODAL_",
+    )
     for key in list(__import__("os").environ):
         if key.startswith(prefixes):
             monkeypatch.delenv(key, raising=False)
