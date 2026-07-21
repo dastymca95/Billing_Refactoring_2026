@@ -99,6 +99,20 @@ def test_ci_vendor_configs_contain_only_minimal_public_safe_metadata() -> None:
             assert forbidden not in serialized
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "docs/architecture/DOCUMENT_LEARNING_EXPERIMENT_PHASE_A_BLOCKED_REPORT.md",
+        "docs/architecture/PHASE_A_CONTROLLED_EXTERNAL_PREFLIGHT_REPORT.md",
+        "docs/architecture/PHASE_A_SUPPLEMENTARY_TRANSPORT_V2.md",
+    ],
+)
+def test_phase_a_documentation_is_valid_utf8_without_mojibake(relative_path: str) -> None:
+    text = (safety.ROOT / relative_path).read_text(encoding="utf-8")
+    for marker in ("â€”", "â€“", "Ã¢", "Â", "\ufffd"):
+        assert marker not in text
+
+
 def test_ci_processor_stubs_are_import_only() -> None:
     if os.environ.get("INNER_VIEW_CI") != "1":
         pytest.skip("CI-only import stubs are intentionally inactive locally")
