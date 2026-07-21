@@ -71,6 +71,12 @@ webapp/frontend/test-results/
 webapp/frontend/playwright-report/
 /tmp_*.png
 /.private/
+# Explicit experiment boundaries. These remain listed even though the legacy
+# /tmp/ rule below also covers them, so a future narrowing cannot expose them.
+/tmp/document-learning-simulation/
+/tmp/provider_probes/
+*.gguf
+*.safetensors
 /tmp/
 
 # Phase PERF-1 — runtime artefacts.
@@ -79,3 +85,4 @@ webapp/frontend/playwright-report/
 # Profile script outputs are under docs/reports/.../phase_perf1/ and
 # are intentionally committed as part of the report.
 webapp_data/cache/ocr/
+/Document Data - Reasoning Training/

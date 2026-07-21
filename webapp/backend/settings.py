@@ -7,6 +7,7 @@ import sys
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Mapping
 
 
 def _find_project_root() -> Path:
@@ -69,7 +70,63 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # Webapp runtime data
-WEBAPP_DATA_ROOT = PROJECT_ROOT / "webapp_data"
+def _resolve_webapp_data_root(environment: Mapping[str, str] | None = None) -> Path:
+    """Resolve an isolated experiment runtime before any store is imported."""
+    env = environment if environment is not None else os.environ
+    configured = str(env.get("INNER_VIEW_WEBAPP_DATA_ROOT") or "").strip()
+    experiment_mode = str(env.get("INNER_VIEW_EXPERIMENT_MODE") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    canonical = (PROJECT_ROOT / "webapp_data").resolve()
+    if not experiment_mode:
+        if configured:
+            raise RuntimeError(
+                "INNER_VIEW_WEBAPP_DATA_ROOT is valid only when "
+                "INNER_VIEW_EXPERIMENT_MODE is explicitly enabled."
+            )
+        return canonical
+
+    if not configured:
+        raise RuntimeError("INNER_VIEW_WEBAPP_DATA_ROOT is required in experiment mode.")
+    candidate = Path(configured).expanduser().resolve()
+    tenant_id = _normalized_tenant_id(env.get("INNER_VIEW_TENANT_ID"))
+    authorized_tenant_id = _normalized_tenant_id(
+        env.get("INNER_VIEW_EXPERIMENT_AUTHORIZED_TENANT_ID")
+    )
+    if not tenant_id or not tenant_id.startswith("exp-"):
+        raise RuntimeError("Experiment mode requires a dedicated exp-* tenant.")
+    if not authorized_tenant_id or not authorized_tenant_id.startswith("exp-"):
+        raise RuntimeError(
+            "INNER_VIEW_EXPERIMENT_AUTHORIZED_TENANT_ID must explicitly identify "
+            "the dedicated experiment tenant."
+        )
+    if tenant_id != authorized_tenant_id:
+        raise RuntimeError("Experiment tenant does not match the authorized tenant.")
+    deployment = str(env.get("INNER_VIEW_DEPLOYMENT_MODE") or "").strip().lower()
+    if deployment not in {"production", "prod"}:
+        raise RuntimeError("Experiment mode requires production identity enforcement.")
+    allowed_roots = [
+        (PROJECT_ROOT / "tmp").resolve(),
+        (PROJECT_ROOT / "webapp_data" / "experiments").resolve(),
+    ]
+    if not any(_is_within(candidate, root) for root in allowed_roots):
+        raise RuntimeError("Experiment runtime must stay under ignored tmp/ or webapp_data/experiments/.")
+    return candidate
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _normalized_tenant_id(value: object) -> str:
+    return str(value or "").strip().casefold()
+
+
+WEBAPP_DATA_ROOT = _resolve_webapp_data_root()
 BATCHES_ROOT = WEBAPP_DATA_ROOT / "batches"
 
 BATCH_ID_PATTERN = re.compile(r"^batch_\d{8}_\d{6}_\d{3}$")
