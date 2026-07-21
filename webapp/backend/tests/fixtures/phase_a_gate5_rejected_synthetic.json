@@ -1,0 +1,49 @@
+{
+  "schema_version": "phase-a-gate5-synthetic/1.0",
+  "documents": [
+    {
+      "document_id": "synthetic-gate5-01",
+      "scenario": "valid_reviewable_then_unauthorized_openai_route",
+      "legacy_disposition": "review_required",
+      "legacy_reason": "processor_failure"
+    },
+    {
+      "document_id": "synthetic-gate5-02",
+      "scenario": "valid_gemini_unresolved_total_mismatch",
+      "legacy_disposition": "review_required",
+      "legacy_reason": "supplementary_visual_evidence_unresolved"
+    },
+    {
+      "document_id": "synthetic-gate5-03",
+      "scenario": "initial_plus_two_supplementary_then_fourth_call",
+      "legacy_disposition": "review_required",
+      "legacy_reason": "processor_failure"
+    },
+    {
+      "document_id": "synthetic-gate5-04",
+      "scenario": "two_unresolved_visual_targets",
+      "legacy_disposition": "review_required",
+      "legacy_reason": "supplementary_visual_evidence_unresolved"
+    },
+    {
+      "document_id": "synthetic-gate5-05",
+      "scenario": "invalid_initial_structured_response",
+      "legacy_disposition": "unsupported",
+      "legacy_reason": "initial_structured_response_invalid"
+    }
+  ],
+  "legacy_observation": {
+    "continued_after_first_block": true,
+    "generic_processor_failure_present": true,
+    "supplementary_over_limit_attempt_present": true,
+    "unauthorized_route_attempt_present": true
+  },
+  "fixed_expected": {
+    "accepted": 0,
+    "exportable": 0,
+    "first_failure_reason": "controlled_provider_route_blocked",
+    "provider_calls": 0,
+    "started_indices": [0],
+    "not_started_indices": [1, 2, 3, 4]
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "schema_version": "phase-a-gate5-clean-offline-synthetic/1.0",
+  "contains_private_values": false,
+  "legacy_observation": {
+    "generic_reason_duplicated": true,
+    "terminal_reconciliation_ran": false,
+    "supplementary_trace_reconciliation_after": "reconciled",
+    "schema_failure_subtype": "strict_internal_contract"
+  },
+  "documents": [
+    {
+      "position": 1,
+      "facts_exist": false,
+      "provenance_exists": false,
+      "input_reason_codes": ["processor_failure", "initial_structured_response_invalid"],
+      "expected_primary_reason": "initial_structured_response_invalid",
+      "expected_disposition": "unsupported",
+      "diagnostic": {
+        "response_character_length": 2060,
+        "response_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "finish_reason": "stop",
+        "output_token_limit_reached": false,
+        "json_parser_error_type": "StrictInternalContractValidationError",
+        "schema_validation_error_path": "strict_internal_contract",
+        "missing_required_field_count": 0,
+        "unknown_field_count": 0
+      }
+    },
+    {
+      "position": 2,
+      "facts_exist": true,
+      "provenance_exists": true,
+      "input_reason_codes": ["processor_failure", "supplementary_visual_evidence_unresolved"],
+      "expected_primary_reason": "supplementary_visual_evidence_unresolved",
+      "expected_disposition": "review_required",
+      "supplementary_reconciliation": {
+        "before": {"reconciled": true},
+        "after": {"reconciled": true},
+        "resolved": false
+      },
+      "supplementary_observation": {"unresolved_flag": true, "contradiction_flag": false}
+    },
+    {
+      "position": 3,
+      "facts_exist": true,
+      "provenance_exists": true,
+      "input_reason_codes": [
+        "processor_failure",
+        "supplementary_request_limit_reached",
+        "supplementary_visual_evidence_contradiction"
+      ],
+      "expected_primary_reason": "supplementary_request_limit_reached",
+      "expected_disposition": "review_required",
+      "supplementary_reconciliation": {
+        "before": {"reconciled": true},
+        "after": {"reconciled": true},
+        "resolved": false
+      },
+      "supplementary_observation": {"unresolved_flag": false, "contradiction_flag": true}
+    },
+    {
+      "position": 4,
+      "facts_exist": true,
+      "provenance_exists": true,
+      "input_reason_codes": ["supplementary_visual_evidence_unresolved"],
+      "expected_primary_reason": "supplementary_visual_evidence_unresolved",
+      "expected_disposition": "review_required",
+      "supplementary_reconciliation": {
+        "before": {"reconciled": true},
+        "after": {"reconciled": true},
+        "resolved": false
+      },
+      "supplementary_observation": {"unresolved_flag": true, "contradiction_flag": false}
+    },
+    {
+      "position": 5,
+      "facts_exist": false,
+      "provenance_exists": false,
+      "input_reason_codes": ["ai_processing_failed", "initial_structured_response_invalid"],
+      "expected_primary_reason": "initial_structured_response_invalid",
+      "expected_disposition": "unsupported",
+      "diagnostic": {
+        "response_character_length": 5176,
+        "response_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+        "finish_reason": "stop",
+        "output_token_limit_reached": false,
+        "json_parser_error_type": "StrictInternalContractValidationError",
+        "schema_validation_error_path": "strict_internal_contract",
+        "missing_required_field_count": 0,
+        "unknown_field_count": 0
+      }
+    }
+  ]
+}
