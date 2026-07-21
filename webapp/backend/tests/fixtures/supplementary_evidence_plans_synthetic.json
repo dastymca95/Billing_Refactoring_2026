@@ -1,0 +1,101 @@
+{
+  "schema_version": "supplementary-evidence-synthetic/1.0",
+  "cases": [
+    {
+      "case_id": "line_items_plus_tax",
+      "target_type": "total_mismatch",
+      "page_count": 1,
+      "page_text": "Description Qty Amount Subtotal Tax Invoice Total",
+      "expected_subtype": "missing_tax_or_fee",
+      "expected_categories": ["totals_footer", "line_item_table", "tax_fee", "page_context"]
+    },
+    {
+      "case_id": "line_items_plus_service_fee",
+      "target_type": "total_mismatch",
+      "page_count": 1,
+      "page_text": "Item Description Amount Subtotal Service Fee Amount Due",
+      "expected_subtype": "missing_tax_or_fee",
+      "expected_categories": ["totals_footer", "line_item_table", "tax_fee", "page_context"]
+    },
+    {
+      "case_id": "line_items_minus_credit",
+      "target_type": "total_mismatch",
+      "page_count": 1,
+      "page_text": "Description Amount Subtotal Credit Discount Total",
+      "expected_subtype": "missing_discount_or_credit",
+      "expected_categories": ["totals_footer", "line_item_table", "credits_payments", "page_context"]
+    },
+    {
+      "case_id": "prior_balance_current_charges",
+      "target_type": "total_mismatch",
+      "page_count": 1,
+      "page_text": "Description Amount Previous Balance Current Charges Amount Due",
+      "expected_subtype": "previous_balance",
+      "expected_categories": ["totals_footer", "line_item_table", "prior_balance", "page_context"]
+    },
+    {
+      "case_id": "payment_after_invoice_total",
+      "target_type": "total_mismatch",
+      "page_count": 1,
+      "page_text": "Item Amount Invoice Total Payment Applied Balance Due",
+      "expected_subtype": "payment_or_deposit",
+      "expected_categories": ["totals_footer", "line_item_table", "credits_payments", "page_context"]
+    },
+    {
+      "case_id": "statement_multiple_invoices",
+      "target_type": "total_mismatch",
+      "page_count": 1,
+      "page_text": "Statement Number Invoice Number Invoice Total Invoice Total Statement Total Amount Due",
+      "expected_subtype": "statement_vs_invoice",
+      "expected_categories": ["totals_footer", "line_item_table", "page_context"]
+    },
+    {
+      "case_id": "omitted_next_page",
+      "target_type": "total_mismatch",
+      "page_count": 2,
+      "page_text": "Description Amount Page 1 of 2 Continued Subtotal",
+      "expected_subtype": "page_continuation",
+      "expected_categories": ["totals_footer", "line_item_table", "page_context", "page_bottom"]
+    },
+    {
+      "case_id": "ambiguous_total_labels",
+      "target_type": "total_mismatch",
+      "page_count": 1,
+      "page_text": "Description Amount Total Invoice Total Amount Due Balance Due",
+      "expected_subtype": "ambiguous_total_label",
+      "expected_categories": ["totals_footer", "line_item_table", "page_context"]
+    },
+    {
+      "case_id": "invoice_account_work_order",
+      "target_type": "invoice_number_ambiguity",
+      "page_count": 1,
+      "page_text": "Vendor Header Invoice Number Account Number Work Order Customer Number",
+      "expected_subtype": "invoice_identity",
+      "expected_categories": ["invoice_identity", "vendor_header_context", "page_context"]
+    },
+    {
+      "case_id": "unreadable_target_crop",
+      "target_type": "invoice_number_ambiguity",
+      "page_count": 1,
+      "page_text": "",
+      "expected_subtype": "invoice_identity",
+      "expected_packet_error": "supplementary_target_label_not_localized"
+    },
+    {
+      "case_id": "crop_missing_context",
+      "target_type": "invoice_number_ambiguity",
+      "page_count": 1,
+      "page_text": "Invoice Number Account Number",
+      "expected_subtype": "invoice_identity",
+      "expected_packet_error": "supplementary_context_thumbnail_missing"
+    },
+    {
+      "case_id": "contradictory_observations",
+      "target_type": "total_mismatch",
+      "page_count": 1,
+      "page_text": "Description Amount Subtotal Invoice Total Amount Due",
+      "expected_subtype": "ambiguous_total_label",
+      "expected_contradiction_review": true
+    }
+  ]
+}
